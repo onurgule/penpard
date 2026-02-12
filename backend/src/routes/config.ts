@@ -293,6 +293,94 @@ router.post('/logo', authenticateToken, logoUpload.single('logo'), (req: AuthReq
 
 
 /**
+ * --- Burp Suite Configuration Endpoints ---
+ */
+
+// Get Burp Config
+router.get('/burp', authenticateToken, (req: AuthRequest, res: Response) => {
+    try {
+        const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('burp_config') as any;
+        let config = {
+            host: '127.0.0.1',
+            port: 9876,
+            useHttps: false,
+        };
+
+        // DB config overrides defaults
+        if (row && row.value) {
+            config = { ...config, ...JSON.parse(row.value) };
+        }
+
+        // Env var override (legacy support)
+        if (process.env.BURP_MCP_URL) {
+            try {
+                const url = new URL(process.env.BURP_MCP_URL);
+                config.host = url.hostname;
+                config.port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 9876);
+                config.useHttps = url.protocol === 'https:';
+            } catch { /* ignore invalid env */ }
+        }
+
+        res.json({ config });
+    } catch (error: any) {
+        res.status(500).json({ error: true, message: 'Failed to get Burp config' });
+    }
+});
+
+// Save Burp Config
+router.post('/burp', authenticateToken, (req: AuthRequest, res: Response) => {
+    try {
+        const { host, port, useHttps } = req.body;
+
+        if (!host || !port) {
+            res.status(400).json({ error: true, message: 'Host and port are required' });
+            return;
+        }
+
+        const config = {
+            host: String(host).trim(),
+            port: Number(port),
+            useHttps: !!useHttps,
+        };
+
+        db.prepare(`
+            INSERT OR REPLACE INTO settings (key, value)
+            VALUES ('burp_config', ?)
+        `).run(JSON.stringify(config));
+
+        res.json({ message: 'Burp Suite configuration saved', config });
+    } catch (error: any) {
+        res.status(500).json({ error: true, message: 'Failed to save Burp config' });
+    }
+});
+
+// Test Burp Connection
+router.post('/burp/test', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const { host, port, useHttps } = req.body;
+        const protocol = useHttps ? 'https' : 'http';
+        const url = `${protocol}://${host}:${port}`;
+
+        const axios = (await import('axios')).default;
+        const response = await axios.get(`${url}/health`, {
+            timeout: 3000,
+            validateStatus: () => true,
+        });
+
+        if (response.status === 200 || response.status !== 404) {
+            res.json({ status: 'online', message: `Burp MCP Connect is reachable at ${url}` });
+        } else {
+            res.json({ status: 'offline', message: `Burp responded with status ${response.status}` });
+        }
+    } catch (e: any) {
+        const msg = e.code === 'ECONNREFUSED' ? 'Connection refused' :
+                    e.code === 'ENOTFOUND' ? 'Host not found' :
+                    e.code === 'ECONNABORTED' ? 'Connection timed out' : e.message;
+        res.json({ status: 'offline', message: msg });
+    }
+});
+
+/**
  * --- MobSF Configuration Endpoints ---
  */
 

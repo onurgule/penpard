@@ -83,8 +83,9 @@ export const useAuthStore = create<AuthState>()(
     )
 );
 
-// Setup axios interceptor for token
+// Setup axios defaults & interceptors
 if (typeof window !== 'undefined') {
+    // Restore token from persisted storage
     const stored = localStorage.getItem('penpard-auth');
     if (stored) {
         try {
@@ -96,4 +97,26 @@ if (typeof window !== 'undefined') {
             // Invalid token data
         }
     }
+
+    // Global response interceptor — redirect to lock screen on auth failures
+    axios.interceptors.response.use(
+        (response) => response,
+        (error) => {
+            const status = error?.response?.status;
+            // 401 = no/missing token, 403 = invalid/expired token
+            if (status === 401 || status === 403) {
+                const url = error?.config?.url || '';
+                // Don't intercept the lock-screen auth request itself
+                if (!url.includes('/auth/verify-key')) {
+                    const state = useAuthStore.getState();
+                    if (state.isAuthenticated) {
+                        state.lock();
+                        // Redirect to lock screen
+                        window.location.href = '/';
+                    }
+                }
+            }
+            return Promise.reject(error);
+        }
+    );
 }

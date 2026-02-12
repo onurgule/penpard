@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
 import { motion } from 'framer-motion';
@@ -25,6 +26,9 @@ interface SystemStatus {
 export default function StatusFooter() {
     const { token, isAuthenticated } = useAuthStore();
     const [status, setStatus] = useState<SystemStatus | null>(null);
+    const router = useRouter();
+
+    const goToSettings = () => router.push('/settings');
 
     // Poll status every 30 seconds
     useEffect(() => {
@@ -60,24 +64,24 @@ export default function StatusFooter() {
             className="fixed bottom-0 left-0 right-0 z-50 bg-black/80 backdrop-blur-md border-t border-white/10 text-[10px] md:text-xs py-1 px-4 flex items-center justify-between font-mono text-gray-400 select-none h-8"
         >
             <div className="flex items-center space-x-6 overflow-x-auto no-scrollbar">
-                {/* LLM Status */}
-                <div className="flex items-center space-x-2 whitespace-nowrap">
+                {/* LLM Status — click to go to Settings */}
+                <div onClick={goToSettings} className="flex items-center space-x-2 whitespace-nowrap cursor-pointer hover:text-white transition-colors" title="Configure LLM in Settings">
                     <div className={`w-2 h-2 rounded-full ${status.llm.configured ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-red-500'}`} />
                     <Zap className="w-3 h-3 text-yellow-500" />
                     <span className="font-semibold text-gray-300">LLM:</span>
                     <span className="text-gray-400">{status.llm.provider ? status.llm.provider.toUpperCase() : 'NONE'}</span>
                 </div>
 
-                {/* Burp Status */}
-                <div className="flex items-center space-x-2 whitespace-nowrap">
+                {/* Burp Status — click to go to Settings */}
+                <div onClick={goToSettings} className="flex items-center space-x-2 whitespace-nowrap cursor-pointer hover:text-white transition-colors" title="Configure Burp Suite in Settings">
                     <div className={`w-2 h-2 rounded-full ${status.burp === 'online' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-red-500'}`} />
                     <Shield className="w-3 h-3 text-orange-500" />
                     <span className="font-semibold text-gray-300">BURP:</span>
                     <span className="uppercase">{status.burp}</span>
                 </div>
 
-                {/* MobSF Status */}
-                <div className="flex items-center space-x-2 whitespace-nowrap">
+                {/* MobSF Status — click to go to Settings */}
+                <div onClick={goToSettings} className="flex items-center space-x-2 whitespace-nowrap cursor-pointer hover:text-white transition-colors" title="Configure MobSF in Settings">
                     <div className={`w-2 h-2 rounded-full ${status.mobsf === 'online' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-red-500'}`} />
                     <Shield className="w-3 h-3 text-cyan-500" />
                     <span className="font-semibold text-gray-300">MOBSF:</span>

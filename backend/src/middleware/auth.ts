@@ -49,7 +49,7 @@ export const authenticateToken = (req: AuthRequest, res: Response, next: NextFun
 };
 
 export const generateToken = (userId: number): string => {
-    return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '24h' });
+    return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
 };
 
 /**

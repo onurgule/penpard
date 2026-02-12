@@ -9,8 +9,22 @@ import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger';
 import { addVulnerability, updateScanStatus } from '../db/init';
 
-// Use localhost for npm, host.docker.internal for Docker
-const BURP_MCP_URL = process.env.BURP_MCP_URL || 'http://localhost:9876';
+// Resolve Burp MCP URL: DB config → env var → default
+function getBurpMcpUrl(): string {
+    try {
+        const { db } = require('../db/init');
+        const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('burp_config') as any;
+        if (row && row.value) {
+            const cfg = JSON.parse(row.value);
+            const protocol = cfg.useHttps ? 'https' : 'http';
+            return `${protocol}://${cfg.host}:${cfg.port}`;
+        }
+    } catch { /* DB not ready yet, use fallback */ }
+    return process.env.BURP_MCP_URL || 'http://localhost:9876';
+}
+
+// Lazy getter — resolves on each use so config changes take effect without restart
+const BURP_MCP_URL_GETTER = { get url() { return getBurpMcpUrl(); } };
 
 interface MCPRequest {
     jsonrpc: '2.0';
@@ -38,12 +52,15 @@ interface ScannerIssue {
 }
 
 export class BurpMCPClient {
-    private baseUrl: string;
-    private messageUrl: string;
+    private get baseUrl(): string {
+        return getBurpMcpUrl();
+    }
+    private get messageUrl(): string {
+        return `${this.baseUrl}/message`;
+    }
 
     constructor() {
-        this.baseUrl = BURP_MCP_URL;
-        this.messageUrl = `${this.baseUrl}/message`;
+        // URL is now resolved dynamically via getter — no static assignment needed
     }
 
     async isAvailable(): Promise<boolean> {

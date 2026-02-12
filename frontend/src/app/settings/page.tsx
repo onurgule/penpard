@@ -21,6 +21,8 @@ import {
     Lock,
     BarChart3,
     BookOpen,
+    Shield,
+    Save,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import toast from 'react-hot-toast';
@@ -60,6 +62,13 @@ export default function SettingsPage() {
     const [servers, setServers] = useState<McpServer[]>([]);
     const [mcpLogs, setMcpLogs] = useState<string[]>([]);
 
+    // Burp Suite Config State
+    const [burpHost, setBurpHost] = useState('127.0.0.1');
+    const [burpPort, setBurpPort] = useState(9876);
+    const [burpUseHttps, setBurpUseHttps] = useState(false);
+    const [burpStatus, setBurpStatus] = useState<'unknown' | 'online' | 'offline' | 'checking'>('unknown');
+    const [burpSaving, setBurpSaving] = useState(false);
+
     // Lock Key Change State
     const [currentKey, setCurrentKey] = useState('');
     const [newKey, setNewKey] = useState('');
@@ -88,6 +97,7 @@ export default function SettingsPage() {
         if (isAuthenticated && token) {
             fetchSettings();
             fetchMcpServers();
+            fetchBurpConfig();
             // Poll logs for demo
             const interval = setInterval(fetchMcpLogs, 3000);
             return () => clearInterval(interval);
@@ -100,6 +110,46 @@ export default function SettingsPage() {
             setConfigs(res.data.configs || []);
         } catch {
             // Backend may not be ready yet
+        }
+    };
+
+    const fetchBurpConfig = async () => {
+        try {
+            const res = await axios.get(`${API_URL}/config/burp`, { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 });
+            if (res.data.config) {
+                setBurpHost(res.data.config.host || '127.0.0.1');
+                setBurpPort(res.data.config.port || 9876);
+                setBurpUseHttps(res.data.config.useHttps || false);
+            }
+        } catch { /* Backend may not be ready */ }
+    };
+
+    const saveBurpConfig = async () => {
+        setBurpSaving(true);
+        try {
+            await axios.post(`${API_URL}/config/burp`, { host: burpHost, port: burpPort, useHttps: burpUseHttps }, { headers: { Authorization: `Bearer ${token}` } });
+            toast.success('Burp Suite configuration saved');
+            testBurpConnection();
+        } catch {
+            toast.error('Failed to save Burp config');
+        } finally {
+            setBurpSaving(false);
+        }
+    };
+
+    const testBurpConnection = async () => {
+        setBurpStatus('checking');
+        try {
+            const res = await axios.post(`${API_URL}/config/burp/test`, { host: burpHost, port: burpPort, useHttps: burpUseHttps }, { headers: { Authorization: `Bearer ${token}` } });
+            setBurpStatus(res.data.status === 'online' ? 'online' : 'offline');
+            if (res.data.status === 'online') {
+                toast.success(res.data.message || 'Burp Suite is online!');
+            } else {
+                toast.error(res.data.message || 'Burp Suite is offline');
+            }
+        } catch {
+            setBurpStatus('offline');
+            toast.error('Connection test failed');
         }
     };
 
@@ -419,8 +469,69 @@ export default function SettingsPage() {
                     </div>
                 </div>
 
-                {/* Right Col: MCP Manager */}
+                {/* Right Col: Burp Suite + MCP Manager */}
                 <div className="space-y-6">
+
+                    {/* Burp Suite Configuration */}
+                    <div>
+                        <div className="flex items-center gap-3 mb-4">
+                            <Shield className="w-6 h-6 text-orange-400" />
+                            <h2 className="text-xl font-bold">Burp Suite Connection</h2>
+                            <div className={`ml-auto px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                                burpStatus === 'online' ? 'bg-green-500/20 text-green-400' :
+                                burpStatus === 'checking' ? 'bg-yellow-500/20 text-yellow-400 animate-pulse' :
+                                burpStatus === 'offline' ? 'bg-red-500/20 text-red-400' :
+                                'bg-slate-700/50 text-slate-400'
+                            }`}>
+                                {burpStatus === 'checking' ? 'Testing...' : burpStatus}
+                            </div>
+                        </div>
+                        <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-5 backdrop-blur-sm">
+                            <p className="text-xs text-slate-500 mb-4">Configure the PenPard MCP Connect extension address. Ensure Burp Suite is running with the extension loaded.</p>
+                            <div className="grid grid-cols-2 gap-3 mb-3">
+                                <div>
+                                    <label className="text-[10px] uppercase font-bold text-slate-500 mb-1 block">Host / IP</label>
+                                    <input
+                                        type="text"
+                                        value={burpHost}
+                                        onChange={e => setBurpHost(e.target.value)}
+                                        placeholder="127.0.0.1"
+                                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all font-mono"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] uppercase font-bold text-slate-500 mb-1 block">Port</label>
+                                    <input
+                                        type="number"
+                                        value={burpPort}
+                                        onChange={e => setBurpPort(Number(e.target.value))}
+                                        placeholder="9876"
+                                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all font-mono"
+                                    />
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-4">
+                                <button
+                                    onClick={saveBurpConfig}
+                                    disabled={burpSaving}
+                                    className="px-4 py-2 bg-orange-500 hover:bg-orange-400 text-black text-xs font-bold rounded-lg transition-all disabled:opacity-50 flex items-center gap-1.5"
+                                >
+                                    <Save className="w-3 h-3" />
+                                    {burpSaving ? 'Saving...' : 'Save & Test'}
+                                </button>
+                                <button
+                                    onClick={testBurpConnection}
+                                    disabled={burpStatus === 'checking'}
+                                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-lg border border-slate-700 transition-all disabled:opacity-50 flex items-center gap-1.5"
+                                >
+                                    <Play className="w-3 h-3" />
+                                    Test Connection
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* MCP Server Hub */}
                     <div className="flex items-center gap-3 mb-4">
                         <Server className="w-6 h-6 text-purple-400" />
                         <h2 className="text-xl font-bold">MCP Server Hub</h2>

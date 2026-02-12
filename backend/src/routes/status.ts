@@ -32,29 +32,30 @@ router.get('/', authenticateToken, async (req: AuthRequest, res: Response) => {
         servers: mcpServers.map(s => ({ name: s.name, status: s.status }))
     };
 
-    // 3. Burp Status
+    // 3. Burp Status — read config from DB, fallback to env, then default
     let burpStatus = 'offline';
     try {
-        // Use localhost for npm, host.docker.internal for Docker
-        const burpUrl = process.env.BURP_MCP_URL || 'http://localhost:9876';
-        // Try to connect to the Burp extension health endpoint (same as burp-mcp.ts)
+        const { db } = require('../db/init');
+        let burpUrl = process.env.BURP_MCP_URL || 'http://localhost:9876';
+
+        const burpRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('burp_config') as any;
+        if (burpRow && burpRow.value) {
+            const cfg = JSON.parse(burpRow.value);
+            const protocol = cfg.useHttps ? 'https' : 'http';
+            burpUrl = `${protocol}://${cfg.host}:${cfg.port}`;
+        }
+
         const response = await axios.get(`${burpUrl}/health`, { 
             timeout: 2000,
             validateStatus: () => true 
         });
-        // 200 means online, other status codes might mean server is up but endpoint issue
-        if (response.status === 200) {
-            burpStatus = 'online';
-        } else if (response.status !== 404) {
-            // If we got a response (even 500), it's online-ish
+        if (response.status === 200 || response.status !== 404) {
             burpStatus = 'online';
         }
     } catch (e: any) {
-        // If connection refused or not found, it's offline
         if (e.code === 'ECONNREFUSED' || e.code === 'ENOTFOUND') {
             burpStatus = 'offline';
         } else if (e.response) {
-            // If we got a response (even error), server is running
             burpStatus = 'online';
         }
     }
