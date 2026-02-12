@@ -1,0 +1,284 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-cyan: #00f0ff;
+  --color-dark: #0a0a0f;
+  --color-dark-lighter: #12121a;
+  --color-dark-card: #1a1a25;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--color-dark);
+  color: #e2e8f0;
+  font-family: 'Inter', system-ui, sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-dark);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Grid Background Pattern */
+.bg-grid {
+  background-image: 
+    linear-gradient(rgba(0, 240, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 240, 255, 0.02) 1px, transparent 1px);
+  background-size: 50px 50px;
+}
+
+/* Glow Effects */
+.glow-cyan {
+  box-shadow: 0 0 20px rgba(0, 240, 255, 0.3);
+}
+
+.glow-cyan-strong {
+  box-shadow: 0 0 40px rgba(0, 240, 255, 0.5);
+}
+
+.text-glow-cyan {
+  text-shadow: 0 0 20px rgba(0, 240, 255, 0.5);
+}
+
+/* Glassmorphism */
+.glass {
+  background: rgba(26, 26, 37, 0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.glass-darker {
+  background: rgba(18, 18, 26, 0.9);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+/* Buttons */
+.btn-primary {
+  @apply px-6 py-3 bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-semibold rounded-lg 
+         transition-all duration-300 hover:from-cyan-400 hover:to-blue-400 
+         hover:shadow-[0_0_30px_rgba(0,240,255,0.4)] active:scale-95;
+}
+
+.btn-secondary {
+  @apply px-6 py-3 bg-dark-800 text-gray-300 font-medium rounded-lg border border-dark-600
+         transition-all duration-300 hover:bg-dark-700 hover:border-cyan-500/30
+         hover:text-white active:scale-95;
+}
+
+.btn-danger {
+  @apply px-6 py-3 bg-red-600/20 text-red-400 font-medium rounded-lg border border-red-500/30
+         transition-all duration-300 hover:bg-red-600/30 hover:border-red-500/50
+         active:scale-95;
+}
+
+/* Cards */
+.card {
+  @apply bg-dark-800/60 backdrop-blur-md rounded-xl border border-dark-600/50 
+         transition-all duration-300;
+}
+
+.card-hover {
+  @apply hover:border-cyan-500/30 hover:shadow-[0_0_30px_rgba(0,240,255,0.1)];
+}
+
+/* Inputs */
+.input-field {
+  @apply w-full px-4 py-3 bg-dark-900/80 border border-dark-600 rounded-lg
+         text-white placeholder-gray-500 transition-all duration-300
+         focus:outline-none focus:border-cyan-500/50 focus:ring-2 focus:ring-cyan-500/20;
+}
+
+/* Scan Line Animation */
+.scan-line {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, #00f0ff, transparent);
+  animation: scan-line 3s linear infinite;
+  pointer-events: none;
+  z-index: 50;
+  opacity: 0.3;
+}
+
+/* Terminal Text Effect */
+.terminal-text {
+  font-family: 'JetBrains Mono', monospace;
+  letter-spacing: 0.05em;
+}
+
+/* Status Indicators */
+.status-online {
+  @apply inline-flex items-center gap-2;
+}
+
+.status-online::before {
+  content: '';
+  @apply w-2 h-2 bg-green-500 rounded-full animate-pulse;
+}
+
+.status-offline::before {
+  @apply bg-red-500;
+}
+
+.status-warning::before {
+  @apply bg-amber-500;
+}
+
+/* Table Styling */
+.table-container {
+  @apply overflow-x-auto rounded-lg border border-dark-600/50;
+}
+
+.data-table {
+  @apply w-full text-left;
+}
+
+.data-table th {
+  @apply px-4 py-3 bg-dark-800 text-gray-400 font-medium text-sm uppercase tracking-wider border-b border-dark-600;
+}
+
+.data-table td {
+  @apply px-4 py-3 border-b border-dark-700/50;
+}
+
+.data-table tr:hover td {
+  @apply bg-dark-700/30;
+}
+
+/* Severity Badges */
+.severity-critical {
+  @apply px-2 py-1 text-xs font-medium rounded bg-red-500/20 text-red-400 border border-red-500/30;
+}
+
+.severity-high {
+  @apply px-2 py-1 text-xs font-medium rounded bg-orange-500/20 text-orange-400 border border-orange-500/30;
+}
+
+.severity-medium {
+  @apply px-2 py-1 text-xs font-medium rounded bg-amber-500/20 text-amber-400 border border-amber-500/30;
+}
+
+.severity-low {
+  @apply px-2 py-1 text-xs font-medium rounded bg-blue-500/20 text-blue-400 border border-blue-500/30;
+}
+
+.severity-info {
+  @apply px-2 py-1 text-xs font-medium rounded bg-gray-500/20 text-gray-400 border border-gray-500/30;
+}
+
+/* Loading Spinner */
+.spinner {
+  @apply w-6 h-6 border-2 border-cyan-500/30 border-t-cyan-500 rounded-full animate-spin;
+}
+
+/* Pulse Ring Animation */
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.9);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1.3);
+    opacity: 0;
+  }
+}
+
+.pulse-ring {
+  position: relative;
+}
+
+.pulse-ring::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid currentColor;
+  animation: pulse-ring 1.5s ease-out infinite;
+}
+
+/* Page Transitions */
+.page-enter {
+  animation: fade-in 0.3s ease-out, slide-up 0.3s ease-out;
+}
+
+/* Responsive utilities */
+@media (max-width: 768px) {
+  .hide-mobile {
+    display: none;
+  }
+}
+
+@media (min-width: 769px) {
+  .hide-desktop {
+    display: none;
+  }
+}
+
+/* Custom Titlebar Styles */
+.titlebar-drag {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* Prevent text selection in titlebar */
+.titlebar-drag * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Hide scrollbar utility */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Keyboard shortcut key badge */
+.kbd {
+  @apply px-2 py-0.5 bg-dark-900/80 border border-dark-600 rounded text-xs font-mono text-gray-400;
+}
+
+/* Tour spotlight mask */
+.tour-spotlight {
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.85);
+}

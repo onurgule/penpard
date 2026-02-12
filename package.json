@@ -1,0 +1,176 @@
+{
+    "name": "penpard",
+    "version": "1.0.1",
+    "description": "PenPard - AI-Powered Penetration Testing Assistant",
+    "author": "PenPard Team <thepenpard@gmail.com>",
+    "license": "GPL-3.0",
+    "homepage": "https://github.com/penpard/penpard",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/penpard/penpard.git"
+    },
+    "bugs": {
+        "url": "https://github.com/penpard/penpard/issues"
+    },
+    "keywords": [
+        "pentesting",
+        "security",
+        "vulnerability-scanner",
+        "ai",
+        "llm",
+        "burp-suite",
+        "owasp",
+        "cybersecurity",
+        "penetration-testing",
+        "mcp"
+    ],
+    "main": "electron/dist/main.js",
+    "scripts": {
+        "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+        "dev:backend": "cd backend && npm run dev",
+        "dev:frontend": "cd frontend && npm run dev",
+        "dev:electron": "npm run build:electron && concurrently \"npm run dev:frontend\" \"electron .\"",
+        "build": "npm run build:backend && npm run build:frontend && npm run build:electron",
+        "build:backend": "cd backend && npm run build",
+        "build:frontend": "cd frontend && cross-env BUILD_MODE=electron npm run build",
+        "build:electron": "tsc -p electron/tsconfig.json",
+        "build:prod": "npm run build:backend && npm run build:frontend && npm run build:electron",
+        "pack:win": "npm run build:prod && electron-builder --win --x64",
+        "pack:mac": "npm run build:prod && electron-builder --mac --x64 --arm64",
+        "pack:linux": "npm run build:prod && electron-builder --linux --x64",
+        "pack:all": "npm run build:prod && electron-builder --win --mac --linux",
+        "hashes": "node scripts/calculate-hashes.js",
+        "postinstall": "cd frontend && npm install && cd ../backend && npm install",
+        "cli": "cd backend && npm run cli --"
+    },
+    "build": {
+        "appId": "com.penpard.security",
+        "productName": "PenPard",
+        "copyright": "Copyright © 2026 PenPard",
+        "directories": {
+            "output": "dist",
+            "buildResources": "electron/assets"
+        },
+        "files": [
+            "electron/dist/**/*",
+            "frontend/out/**/*",
+            "backend/dist/**/*",
+            "backend/package.json",
+            "backend/node_modules/**/*",
+            "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+            "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+            "!**/node_modules/.bin"
+        ],
+        "extraResources": [
+            {
+                "from": "data",
+                "to": "data"
+            },
+            {
+                "from": "backend/dist",
+                "to": "backend/dist"
+            },
+            {
+                "from": "backend/package.json",
+                "to": "backend/package.json"
+            },
+            {
+                "from": "backend/node_modules",
+                "to": "backend/node_modules"
+            }
+        ],
+        "asarUnpack": [
+            "node_modules/**/*"
+        ],
+        "win": {
+            "target": [
+                {
+                    "target": "nsis",
+                    "arch": [
+                        "x64"
+                    ]
+                }
+            ],
+            "icon": "electron/assets/icon.ico"
+        },
+        "nsis": {
+            "oneClick": false,
+            "allowToChangeInstallationDirectory": true,
+            "installerIcon": "electron/assets/icon.ico",
+            "uninstallerIcon": "electron/assets/icon.ico",
+            "installerHeaderIcon": "electron/assets/icon.ico",
+            "createDesktopShortcut": true,
+            "createStartMenuShortcut": true,
+            "shortcutName": "PenPard"
+        },
+        "mac": {
+            "target": [
+                {
+                    "target": "dmg",
+                    "arch": [
+                        "x64",
+                        "arm64"
+                    ]
+                }
+            ],
+            "icon": "electron/assets/icon.icns",
+            "category": "public.app-category.developer-tools",
+            "hardenedRuntime": true,
+            "gatekeeperAssess": false,
+            "entitlements": "electron/entitlements.mac.plist",
+            "entitlementsInherit": "electron/entitlements.mac.plist",
+            "type": "distribution"
+        },
+        "dmg": {
+            "artifactName": "${productName}-${version}-${arch}.dmg",
+            "title": "${productName}",
+            "icon": "electron/assets/icon.icns"
+        },
+        "linux": {
+            "target": [
+                {
+                    "target": "AppImage",
+                    "arch": [
+                        "x64"
+                    ]
+                },
+                {
+                    "target": "deb",
+                    "arch": [
+                        "x64"
+                    ]
+                }
+            ],
+            "icon": "electron/assets",
+            "category": "Development",
+            "maintainer": "PenPard Team",
+            "vendor": "PenPard",
+            "synopsis": "AI-Powered Security Scanner",
+            "description": "PenPard is an AI-powered security scanner for penetration testers and security professionals."
+        }
+    },
+    "devDependencies": {
+        "@types/node": "^20.11.0",
+        "concurrently": "^8.2.0",
+        "cross-env": "^7.0.3",
+        "electron": "^36.0.0",
+        "electron-builder": "^26.7.0",
+        "@electron/rebuild": "^4.0.0",
+        "png-to-ico": "^3.0.1",
+        "tsx": "^4.21.0",
+        "typescript": "^5.9.3",
+        "wait-on": "^7.2.0"
+    },
+    "dependencies": {
+        "electron-updater": "^6.1.0"
+    },
+    "overrides": {
+        "glob": "^13.0.0",
+        "rimraf": "^6.0.0",
+        "@electron/asar": "^4.0.0",
+        "global-agent": "^4.1.0",
+        "roarr": "^7.21.0",
+        "cacache": "^20.0.0",
+        "lodash.isequal": "npm:fast-deep-equal@^3.1.3"
+    }
+}

@@ -1,0 +1,73 @@
+# PenPard Ignore Patterns
+
+# Dependencies
+node_modules/
+
+# Build output
+.next/
+dist/
+build/
+out/
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.production
+.env.*.local
+
+# Database
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db-journal
+**/data/*.db
+**/data/*.db-shm
+**/data/*.db-wal
+**/data/*.db-journal
+
+# Logs
+*.log
+logs/
+
+# Python
+*.pyc
+__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Generated files
+*.pdf
+uploads/
+
+# Generated scan artifacts
+backend/reports/
+backend/screenshots/
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# SQLite (extra safety)
+*.sqlite
+*.sqlite3
+
+# Gradle (Burp extension)
+.gradle/
+burp-extension/build/
+
+# Electron
+release/

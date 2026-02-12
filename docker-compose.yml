@@ -1,0 +1,44 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:4000/api
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    networks:
+      - penpard-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    environment:
+      - NODE_ENV=development
+      - JWT_SECRET=${JWT_SECRET:-change-this-to-a-random-secret-key}
+      - DATABASE_PATH=/app/data/penpard.db
+      - BURP_MCP_URL=${BURP_MCP_URL:-http://host.docker.internal:9876}
+      - MOBSF_API_URL=${MOBSF_API_URL:-http://host.docker.internal:8000}
+      - MOBSF_API_KEY=${MOBSF_API_KEY:-}
+    volumes:
+      - ./backend/src:/app/src
+      - ./backend/package.json:/app/package.json
+      - ./backend/data:/app/data
+      - ./agents:/app/agents
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - penpard-network
+
+networks:
+  penpard-network:
+    driver: bridge
