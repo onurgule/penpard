@@ -35,7 +35,7 @@
   <tr>
     <td align="center" width="320">
       <h4>Emrecan Gerede</h4>
-      <h5><a href="https://github.com/darkk9712">@dark9712</a></h5>
+      <h5><a href="https://github.com/emrecangerede">@emrecangerede</a></h5>
       <a href="https://linkedin.com/in/emrecangerede"><img src="https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn"/></a>
       <br/><br/>
       <img src="https://img.shields.io/badge/OSCP-Certified-ED1C24?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0wIDE4Yy00LjQxIDAtOC0zLjU5LTgtOHMzLjU5LTggOC04IDggMy41OSA4IDgtMy41OSA4LTggNHoiLz48L3N2Zz4=&logoColor=white" alt="OSCP"/>
@@ -43,7 +43,7 @@
     </td>
     <td align="center" width="320">
       <h4>Onur Osman Güle</h4>
-      <h5><a href="https://github.com/darkk9712">@onurgule</a></h5>
+      <h5><a href="https://github.com/onurgule">@onurgule</a></h5>
       <a href="https://linkedin.com/in/onurgule"><img src="https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn"/></a>
       <br/><br/>
       <img src="https://img.shields.io/badge/OSCP-Certified-ED1C24?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0wIDE4Yy00LjQxIDAtOC0zLjU5LTgtOHMzLjU5LTggOC04IDggMy41OSA4IDgtMy41OSA4LTggNHoiLz48L3N2Zz4=&logoColor=white" alt="OSCP"/>
