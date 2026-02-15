@@ -13,7 +13,7 @@ import { BurpMCPClient } from '../services/burp-mcp';
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
 import { updateScanStatus, addVulnerability, db } from '../db/init';
-import { logger } from '../utils/logger';
+import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import fs from 'fs';
@@ -23,11 +23,17 @@ type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'compl
 interface ScanConfig {
     rateLimit: number;
     maxIterations?: number;
+    /** Max planning rounds. 0 or undefined = no fixed limit (model decides when to finish). */
+    maxPlanRounds?: number;
     useNuclei: boolean;
     useFfuf: boolean;
     idorUsers: any[];
     parallelAgents?: number;
     customSystemPrompt?: string;
+    /** Optional Cookie header for authenticated testing (e.g. after Google login). If not set, agent may use get_session_cookies from Burp proxy history. */
+    sessionCookies?: string;
+    /** Raw HTTP request from Burp "Send to PenPard" — agent must test this request with its exact headers and body first. */
+    initialRequest?: string;
 }
 
 interface ToolCall {
@@ -97,23 +103,27 @@ When asked to REPLAN, review all findings so far and create the next 5-step plan
    Args: { "count": 20 }
    View recent USER proxy traffic (excludes PenPard agent requests) to discover endpoints, API calls, and hidden parameters.
 
-4. get_sitemap
+4. get_session_cookies
+   Args: { "host": "example.com" }
+   Get the Cookie header from the most recent USER request to that host in Burp proxy history. Use for authenticated testing when the user logged in via browser (e.g. Google OAuth). Include the returned Cookie in every send_http_request to the target.
+
+5. get_sitemap
    Args: {}
    Get the full sitemap from Burp - shows all discovered URLs and endpoints.
 
-5. spider_url
+6. spider_url
    Args: { "url": "full_url" }
    Crawl a URL to discover all linked pages, forms, and endpoints.
 
-6. check_authorization
+7. check_authorization
    Args: { "original_request": "...", "modified_headers": {...} }
    Test authorization bypass by replaying a request with different auth tokens.
 
-7. generate_payloads
+8. generate_payloads
    Args: { "type": "xss|sqli|lfi|cmdi|ssrf|idor", "context": "html|attribute|js|url|header" }
    Generate context-aware payloads for a specific vulnerability type.
 
-8. extract_links
+9. extract_links
    Args: { "url": "full_url" }
    Extract all links, forms, and resources from a page.
 
@@ -338,7 +348,8 @@ export class OrchestratorAgent {
     // Planning state
     private currentPlan: AttackPlan | null = null;
     private planRound: number = 0;
-    private maxPlanRounds: number = 10;
+    /** 0 = no fixed limit (model decides); otherwise max planning rounds. */
+    private maxPlanRounds: number = 0;
     private discoveredEndpoints: Set<string> = new Set();
     private testedParameters: Map<string, Set<string>> = new Map(); // endpoint → set of tested vuln types
     private stepResults: { step: PlanStep; findings: any[]; toolResults: string[] }[] = [];
@@ -372,6 +383,9 @@ export class OrchestratorAgent {
         this.config = config;
         this.burp = burp;
         this.maxIterations = config.maxIterations ?? 50;
+        // maxPlanRounds: 0 or undefined = no fixed limit (model decides)
+        const requested = config.maxPlanRounds ?? 0;
+        this.maxPlanRounds = requested > 0 ? requested : 0;
     }
 
     /**
@@ -503,6 +517,7 @@ ${vulns}
             await this.phaseReporting();
 
         } catch (error: any) {
+            this.phase = 'failed';
             this.log('error', `Critical Failure: ${error.message}`);
             updateScanStatus(this.scanId, 'failed', error.message);
         } finally {
@@ -563,16 +578,50 @@ ${vulns}
             }
             this.log('system', '✓ LLM: Connected');
 
-            // Build system prompt if not already set
+            // Build system prompt if not already set (includes initialRequest headers)
             if (this.conversationHistory.length === 0) {
                 const promptTemplate = await this.loadPromptTemplate();
                 const accountsJson = JSON.stringify(this.config.idorUsers || [], null, 2);
-                const basePrompt = promptTemplate
+                let sysPrompt = promptTemplate
                     .replace('{TARGET_WEBSITE}', this.targetUrl)
                     .replace('{TARGET_WEBSITE_ACCOUNTS}', accountsJson);
 
-                this.systemPromptContent = basePrompt;
-                this.conversationHistory.push({ role: 'system', content: basePrompt });
+                // Inject initialRequest structured data into system prompt (same as phaseInit)
+                if (this.config.initialRequest?.trim()) {
+                    const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
+                    if (parsed) {
+                        const headersBlock = Object.entries(parsed.headers)
+                            .filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
+                            .map(([k, v]) => `    "${k}": "${v}"`)
+                            .join(',\n');
+                        sysPrompt += `\n\n═══════════════════════════════════════════════════════════════\n  SEND TO PENPARD — REQUEST FROM BURP (CRITICAL)\n═══════════════════════════════════════════════════════════════\n\nYou received a complete HTTP request from the user via Burp. STRICT RULES:\n\n1. Every send_http_request MUST include ALL headers listed below. Do NOT omit any. Do NOT add new headers. Copy them exactly.\n2. Only PARAMETRIC testing: change parameter values in the URL query string or body. Do NOT touch headers unless the user explicitly asks.\n3. The request has cookies and auth tokens — these are essential for authenticated testing.\n\nBASE REQUEST:\n  Method: ${parsed.method}\n  URL: ${parsed.url}\n  Headers (INCLUDE ALL OF THESE IN EVERY REQUEST):\n${headersBlock}\n  Body: ${parsed.body || '(none)'}\n\nWhen calling send_http_request, use:\n  { "method": "${parsed.method}", "url": "<url with modified params>", "headers": { ALL HEADERS ABOVE }, "body": "${parsed.body || ''}" }\n`;
+                    }
+                }
+
+                this.systemPromptContent = sysPrompt;
+                this.conversationHistory.push({ role: 'system', content: sysPrompt });
+            }
+
+            // Also inject initialRequest as structured user message for continuation context
+            if (this.config.initialRequest?.trim()) {
+                const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
+                if (parsed) {
+                    const headersJson = JSON.stringify(
+                        Object.fromEntries(
+                            Object.entries(parsed.headers).filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
+                        ),
+                        null, 2
+                    );
+                    this.conversationHistory.push({
+                        role: 'user',
+                        content: `REMINDER — The original request from Burp (Send to PenPard) is still active. You MUST include ALL these headers in every send_http_request:\n\nMethod: ${parsed.method}\nURL: ${parsed.url}\nHeaders (JSON — pass this entire object):\n${headersJson}\nBody: ${parsed.body || '(none)'}\n\nDo NOT send requests without these headers. The user's session cookies and auth tokens are required.`
+                    });
+                    this.conversationHistory.push({
+                        role: 'assistant',
+                        content: `Understood. I will continue including all ${Object.keys(parsed.headers).length} headers (Cookie, auth tokens, User-Agent, etc.) in every request.`
+                    });
+                    this.log('system', `✓ Burp request headers re-injected for continuation (${Object.keys(parsed.headers).length} headers)`);
+                }
             }
 
             // Inject continuation instruction as operator command
@@ -822,6 +871,49 @@ Proceed with testing.`
         }
         this.log('system', '✓ LLM: Connected');
 
+        // Resolve session cookies and auth for authenticated testing (from operator input or proxy history, newest to oldest)
+        let sessionCookieHeader = '';
+        let sessionAuthHeader = '';
+        if (this.config.sessionCookies?.trim()) {
+            const raw = this.config.sessionCookies.trim();
+            sessionCookieHeader = raw.replace(/^Cookie:\s*/i, '').trim();
+            this.log('system', '✓ Using operator-provided session cookies for authenticated requests');
+        } else {
+            try {
+                const host = new URL(this.targetUrl).hostname;
+                // First try get_cookies_and_auth_for_host (newest to oldest) for planning-phase discovery
+                const historyResult = await this.burp.callTool('get_cookies_and_auth_for_host', { host, maxItems: 50 });
+                const entries = Array.isArray(historyResult?.entries) ? historyResult.entries : [];
+                const firstWithSession = entries.find((e: any) => (e?.cookie && e.cookie.trim()) || (e?.authorization && e.authorization.trim()));
+                if (firstWithSession) {
+                    if (firstWithSession.cookie && String(firstWithSession.cookie).trim()) {
+                        sessionCookieHeader = String(firstWithSession.cookie).trim();
+                    }
+                    if (firstWithSession.authorization && String(firstWithSession.authorization).trim()) {
+                        sessionAuthHeader = String(firstWithSession.authorization).trim();
+                    }
+                    if (sessionCookieHeader || sessionAuthHeader) {
+                        this.log('system', `✓ Using cookie/auth from Burp proxy history (newest→oldest) for ${host}`);
+                    }
+                }
+                // Fallback: single most recent request
+                if (!sessionCookieHeader && !sessionAuthHeader) {
+                    const result = await this.burp.callTool('get_session_cookies', { host });
+                    const cookie = result?.cookieHeader;
+                    if (cookie && typeof cookie === 'string' && cookie.trim()) {
+                        sessionCookieHeader = cookie.trim();
+                        this.log('system', `✓ Using session cookies from Burp proxy history (last user request to ${host})`);
+                    }
+                }
+            } catch (e) {
+                // Burp may be unavailable or tool not supported; continue without cookies
+            }
+        }
+        const hasSession = !!(sessionCookieHeader || sessionAuthHeader);
+        const sessionCookiesBlock = hasSession
+            ? `\n\n═══════════════════════════════════════════════════════════════\n  SESSION COOKIES / AUTH FROM PROXY HISTORY (authenticated testing)\n═══════════════════════════════════════════════════════════════\n\nYou MUST send requests to the target domain WITH these headers so tests run in the user's session. Include them in EVERY send_http_request to the target host.\n\n${sessionCookieHeader ? `Cookie: ${sessionCookieHeader}\n\n` : ''}${sessionAuthHeader ? `Authorization: ${sessionAuthHeader}\n\n` : ''}In send_http_request always set headers to include the Cookie and/or Authorization above. Do not omit them. Test with the user's authenticated session.\n`
+            : `\n\n═══════════════════════════════════════════════════════════════\n  SESSION COOKIES\n═══════════════════════════════════════════════════════════════\n\nNone found for target. For authenticated testing: have the user browse the site (through Burp) and log in first; PenPard will use get_session_cookies or get_cookies_and_auth_for_host. Then include that Cookie/Authorization in every send_http_request.\n`;
+
         // Build system prompt
         const promptTemplate = await this.loadPromptTemplate();
         const accountsJson = JSON.stringify(this.config.idorUsers || [], null, 2);
@@ -835,6 +927,18 @@ Proceed with testing.`
             systemPrompt = `⚠️ THIS IS THE MOST IMPORTANT — OPERATOR SCAN INSTRUCTIONS (follow these above all else):\n${this.config.customSystemPrompt}\n\n---\n\n${basePrompt}`;
         } else {
             systemPrompt = basePrompt;
+        }
+        systemPrompt += sessionCookiesBlock;
+
+        if (this.config.initialRequest?.trim()) {
+            const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
+            if (parsed) {
+                const headersBlock = Object.entries(parsed.headers)
+                    .filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
+                    .map(([k, v]) => `    "${k}": "${v}"`)
+                    .join(',\n');
+                systemPrompt += `\n\n═══════════════════════════════════════════════════════════════\n  SEND TO PENPARD — REQUEST FROM BURP (CRITICAL)\n═══════════════════════════════════════════════════════════════\n\nYou received a complete HTTP request from the user via Burp. STRICT RULES:\n\n1. Every send_http_request MUST include ALL headers listed below. Do NOT omit any. Do NOT add new headers. Copy them exactly.\n2. Only PARAMETRIC testing: change parameter values in the URL query string or body. Do NOT touch headers unless the user explicitly asks.\n3. The request has cookies and auth tokens — these are essential for authenticated testing.\n\nBASE REQUEST:\n  Method: ${parsed.method}\n  URL: ${parsed.url}\n  Headers (INCLUDE ALL OF THESE IN EVERY REQUEST):\n${headersBlock}\n  Body: ${parsed.body || '(none)'}\n\nWhen calling send_http_request, use:\n  { "method": "${parsed.method}", "url": "<url with modified params>", "headers": { ALL HEADERS ABOVE }, "body": "${parsed.body || ''}" }\n`;
+            }
         }
 
         this.systemPromptContent = systemPrompt;
@@ -911,6 +1015,65 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
 
             this.log('system', `✓ Operator instructions processed: "${instr.substring(0, 100)}${instr.length > 100 ? '...' : ''}"`);
         }
+
+        // Request sent from Burp "Send to PenPard" — parse and inject structured data
+        if (this.config.initialRequest?.trim()) {
+            const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
+            if (parsed) {
+                const headersJson = JSON.stringify(
+                    Object.fromEntries(
+                        Object.entries(parsed.headers).filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
+                    ),
+                    null, 2
+                );
+                this.conversationHistory.push({
+                    role: 'user',
+                    content: `CRITICAL — Request from Burp (Send to PenPard).
+
+PLANNING PHASE: Before testing, analyze this request:
+- Look at the cookies and auth tokens — note which ones are session tokens
+- Identify all parameters in the URL query string and body
+- Plan which parameters to test for which vulnerability types (SQLi, XSS, IDOR, etc.)
+
+RULES:
+1. Include ALL headers below in EVERY send_http_request call. Copy them exactly — do not omit Cookie, User-Agent, Authorization, or any other header. The user's session depends on these.
+2. Only modify PARAMETER VALUES (query string, body fields). Headers stay unchanged.
+3. If the user later says "test the Host header" or similar, only then may you modify that specific header.
+
+BASE REQUEST:
+Method: ${parsed.method}
+URL: ${parsed.url}
+Headers (JSON — pass this entire object in every send_http_request):
+${headersJson}
+Body: ${parsed.body || '(none)'}
+
+Example call:
+{
+  "tool": "send_http_request",
+  "args": {
+    "method": "${parsed.method}",
+    "url": "${parsed.url}",
+    "headers": ${headersJson},
+    "body": "${parsed.body || ''}"
+  }
+}
+
+Start by sending the original request as-is to get a baseline response, then begin parametric testing.`
+                });
+                this.conversationHistory.push({
+                    role: 'assistant',
+                    content: `Understood. I will:\n1. Include ALL ${Object.keys(parsed.headers).length} headers in every request (Cookie, User-Agent, auth tokens, etc.)\n2. Only modify parameter values for testing — headers stay exactly as provided\n3. Start with a baseline request, then test each parameter for vulnerabilities\n\nLet me begin by analyzing the request and planning my tests.`
+                });
+                this.log('system', `✓ Burp request parsed — ${parsed.method} ${parsed.url.substring(0, 80)} — ${Object.keys(parsed.headers).length} headers preserved`);
+            } else {
+                // Fallback: could not parse, inject raw
+                this.conversationHistory.push({
+                    role: 'user',
+                    content: `Request from Burp (Send to PenPard). Test this request. Raw:\n\n${this.config.initialRequest.trim()}`
+                });
+                this.log('system', '⚠ Could not parse Burp request — injected raw');
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -924,7 +1087,7 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
 
         let totalActions = 0;
 
-        while (this.isRunning && this.planRound < this.maxPlanRounds && totalActions < this.maxIterations) {
+        while (this.isRunning && (this.maxPlanRounds === 0 || this.planRound < this.maxPlanRounds) && totalActions < this.maxIterations) {
             // Handle pause
             while (this.isPaused && this.isRunning) {
                 if (this.humanCommandQueue.length > 0) {
@@ -939,7 +1102,9 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
             this.planRound++;
             this.phase = 'planning';
             this.log('system', `\n╔══════════════════════════════════════╗`);
-            this.log('system', `║  PLANNING ROUND ${this.planRound}/${this.maxPlanRounds}              ║`);
+            this.log('system', this.maxPlanRounds > 0
+                ? `║  PLANNING ROUND ${this.planRound}/${this.maxPlanRounds}              ║`
+                : `║  PLANNING ROUND ${this.planRound} (model decides)     ║`);
             this.log('system', `╚══════════════════════════════════════╝`);
 
             const plan = await this.createPlan();
@@ -1086,7 +1251,7 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
             }
         }
 
-        if (this.planRound >= this.maxPlanRounds) {
+        if (this.maxPlanRounds > 0 && this.planRound >= this.maxPlanRounds) {
             this.log('system', `Reached max plan rounds (${this.maxPlanRounds}).`);
         }
     }
@@ -1409,6 +1574,15 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
                     // Always exclude PenPard agent requests — only show user's real traffic
                     return await this.burp.callTool('get_proxy_history', { ...toolCall.args, excludePenPard: true });
 
+                case 'get_session_cookies':
+                    return await this.burp.callTool('get_session_cookies', { host: toolCall.args?.host || new URL(this.targetUrl).hostname });
+
+                case 'get_cookies_and_auth_for_host':
+                    return await this.burp.callTool('get_cookies_and_auth_for_host', {
+                        host: toolCall.args?.host || new URL(this.targetUrl).hostname,
+                        maxItems: toolCall.args?.maxItems ?? 50
+                    });
+
                 case 'send_to_scanner':
                     return await this.burp.callTool('send_to_scanner', toolCall.args);
 
@@ -1430,9 +1604,12 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
                 case 'analyze_response':
                     return { status: 'Analysis requested - handled by LLM' };
 
+                case 'none':
+                    return { status: 'No tool call (step complete)' };
+
                 default:
                     this.log('error', `Unknown tool: ${toolCall.tool}`);
-                    return { error: `Unknown tool: ${toolCall.tool}. Available: send_http_request, get_proxy_history, send_to_scanner, get_sitemap, spider_url, check_authorization, generate_payloads, extract_links` };
+                    return { error: `Unknown tool: ${toolCall.tool}. Available: send_http_request, get_proxy_history, get_session_cookies, get_cookies_and_auth_for_host, send_to_scanner, get_sitemap, spider_url, check_authorization, generate_payloads, extract_links` };
             }
         } catch (e: any) {
             this.log('error', `Tool error: ${e.message}`);
@@ -1534,6 +1711,62 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
         }
 
         return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  RAW HTTP REQUEST PARSER
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Parse a raw HTTP request string (from Burp "Send to PenPard") into structured components.
+     * Returns { method, url, headers, body } or null if parsing fails.
+     */
+    private parseRawHttpRequest(raw: string): { method: string; url: string; headers: Record<string, string>; body: string } | null {
+        try {
+            // Normalize line endings
+            const normalized = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+            const headerBodySplit = normalized.indexOf('\n\n');
+            const headerSection = headerBodySplit >= 0 ? normalized.substring(0, headerBodySplit) : normalized;
+            const body = headerBodySplit >= 0 ? normalized.substring(headerBodySplit + 2).trim() : '';
+
+            const lines = headerSection.split('\n');
+            if (lines.length < 1) return null;
+
+            // Parse request line: GET /path?query HTTP/1.1
+            const requestLine = lines[0].trim();
+            const parts = requestLine.split(/\s+/);
+            if (parts.length < 2) return null;
+            const method = parts[0].toUpperCase();
+            const pathAndQuery = parts[1]; // e.g. /hafifmuzik/mobile/video/likestatus?idlist=...
+
+            // Parse headers
+            const headers: Record<string, string> = {};
+            let host = '';
+            for (let i = 1; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line) continue;
+                const colonIdx = line.indexOf(':');
+                if (colonIdx <= 0) continue;
+                const name = line.substring(0, colonIdx).trim();
+                const value = line.substring(colonIdx + 1).trim();
+                headers[name] = value;
+                if (name.toLowerCase() === 'host') {
+                    host = value;
+                }
+            }
+
+            if (!host) return null;
+
+            // Determine scheme (assume https unless port is 80 or explicit http)
+            const isHttp = host.endsWith(':80') || host.startsWith('http://');
+            const scheme = isHttp ? 'http' : 'https';
+            const cleanHost = host.replace(/^https?:\/\//, '');
+            const url = `${scheme}://${cleanHost}${pathAndQuery}`;
+
+            return { method, url, headers, body };
+        } catch (e) {
+            return null;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2050,7 +2283,7 @@ I will create a focused attack plan targeting ONLY the specified scope. Starting
     }
 
     private log(type: string, message: string) {
-        const timestamp = new Date().toISOString();
+        const timestamp = formatLogTimestamp();
         const line = `[${timestamp}] [${type.toUpperCase()}] ${message}`;
         this.logs.push(line);
         logger.info(message, { scanId: this.scanId, type });

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
 import { Eye, EyeOff, Lock, AlertTriangle } from 'lucide-react';
@@ -9,11 +9,13 @@ import toast from 'react-hot-toast';
 
 export default function LockScreenPage() {
     const router = useRouter();
-    const { unlock, isLoading, error, isAuthenticated } = useAuthStore();
+    const { unlock, isLoading, error, isAuthenticated, getSavedKey, clearSavedKey } = useAuthStore();
 
     const [key, setKey] = useState('');
     const [showKey, setShowKey] = useState(false);
+    const [rememberKey, setRememberKey] = useState(false);
     const [typingPhase, setTypingPhase] = useState(0);
+    const autoUnlockAttempted = useRef(false);
 
     // Redirect if already authenticated
     useEffect(() => {
@@ -21,6 +23,22 @@ export default function LockScreenPage() {
             router.push('/dashboard');
         }
     }, [isAuthenticated, router]);
+
+    // Auto-unlock with saved key on load (so user does not have to type every time)
+    useEffect(() => {
+        if (isAuthenticated || autoUnlockAttempted.current) return;
+        const saved = getSavedKey();
+        if (saved) {
+            autoUnlockAttempted.current = true;
+            setKey(saved);
+            setRememberKey(true);
+            unlock(saved).then(() => router.push('/dashboard')).catch(() => {
+                setKey('');
+                clearSavedKey();
+                autoUnlockAttempted.current = false;
+            });
+        }
+    }, [isAuthenticated, getSavedKey, unlock, clearSavedKey, router]);
 
     // Typing animation for tagline
     useEffect(() => {
@@ -45,8 +63,10 @@ export default function LockScreenPage() {
             return;
         }
 
+        if (!rememberKey && getSavedKey()) clearSavedKey();
+
         try {
-            await unlock(key);
+            await unlock(key, { rememberKey });
             toast.success('Access granted');
             router.push('/dashboard');
         } catch (err) {
@@ -138,6 +158,16 @@ export default function LockScreenPage() {
                                 </button>
                             </div>
                         </div>
+
+                        <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={rememberKey}
+                                onChange={(e) => setRememberKey(e.target.checked)}
+                                className="rounded border-dark-600 bg-dark-700 text-cyan-500 focus:ring-cyan-500"
+                            />
+                            <span className="text-gray-400 text-sm">Save key (don’t ask again on next start)</span>
+                        </label>
 
                         <motion.button
                             type="submit"

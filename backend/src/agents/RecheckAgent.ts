@@ -7,7 +7,7 @@
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmQueue } from '../services/LLMQueue';
 import { SharedContext, SharedVulnerability } from './SharedContext';
-import { logger } from '../utils/logger';
+import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 
 interface SuspectedVulnerability {
@@ -444,7 +444,8 @@ export class RecheckAgent {
     }
 
     private log(message: string): void {
-        const line = `[${new Date().toISOString()}] [RECHECK] ${message}`;
+        const timestamp = formatLogTimestamp();
+        const line = `[${timestamp}] [RECHECK] ${message}`;
         this.logs.push(line);
         logger.info(message, { agentId: this.id, scanId: this.scanId });
         this.context.emit('worker:log', { workerId: this.id, message: line });

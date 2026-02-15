@@ -214,6 +214,13 @@ export async function initDatabase(): Promise<void> {
     }
   }
 
+  // Migration: scans.initial_request (Send to PenPard raw request for continue-scan)
+  const scanCols = db.prepare('PRAGMA table_info(scans)').all() as { name: string }[];
+  if (!scanCols.some((c) => c.name === 'initial_request')) {
+    db.exec('ALTER TABLE scans ADD COLUMN initial_request TEXT');
+    logger.info('Added scans.initial_request column');
+  }
+
   logger.info('Database initialized successfully');
 }
 
@@ -249,6 +256,17 @@ export const updateScanStatus = (id: string, status: string, errorMessage?: stri
     `).run(status, errorMessage || null, id);
   }
   return db.prepare('UPDATE scans SET status = ? WHERE id = ?').run(status, id);
+};
+
+export const setScanInitialRequest = (scanId: string, rawRequest: string | null) => {
+  return db.prepare('UPDATE scans SET initial_request = ? WHERE id = ?').run(rawRequest ?? null, scanId);
+};
+
+/** Permanently delete scans by id; only deletes rows where user_id matches (CASCADE removes related data). */
+export const deleteScans = (scanIds: string[], userId: number) => {
+  if (!scanIds.length) return { changes: 0 };
+  const placeholders = scanIds.map(() => '?').join(',');
+  return db.prepare(`DELETE FROM scans WHERE user_id = ? AND id IN (${placeholders})`).run(userId, ...scanIds);
 };
 
 export const getVulnerabilitiesByScan = (scanId: string) => {

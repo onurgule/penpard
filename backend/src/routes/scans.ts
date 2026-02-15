@@ -9,6 +9,8 @@ import {
     createScan,
     getScan,
     updateScanStatus,
+    setScanInitialRequest,
+    deleteScans,
     getVulnerabilitiesByScan,
     getUserWhitelists,
     saveScanLogs,
@@ -24,6 +26,7 @@ import { OrchestratorAgent } from '../agents/OrchestratorAgent';
 import { AgentPool } from '../agents/AgentPool';
 import { llmProvider } from '../services/LLMProviderService';
 import { activityMonitor } from '../services/ActivityMonitorService';
+import { takePendingRequest } from './penpard';
 
 export const activeAgents = new Map<string, OrchestratorAgent>();
 export const activePools = new Map<string, AgentPool>();
@@ -122,10 +125,27 @@ router.get('/', authenticateToken, (req: AuthRequest, res: Response) => {
     }
 });
 
+// Permanently delete selected scans (user's scans only; CASCADE removes related data)
+router.post('/delete', authenticateToken, (req: AuthRequest, res: Response) => {
+    try {
+        const user = req.user!;
+        const { ids } = req.body;
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ error: true, message: 'ids array is required and must not be empty' });
+        }
+        const safeIds = ids.filter((id: unknown) => typeof id === 'string' && id.length > 0);
+        const result = deleteScans(safeIds, user.id);
+        return res.json({ deleted: result.changes, message: `${result.changes} scan(s) permanently deleted` });
+    } catch (error: any) {
+        logger.error('Delete scans error', { error: error.message });
+        res.status(500).json({ error: true, message: 'Failed to delete scans' });
+    }
+});
+
 // Initiate web scan
 router.post('/web', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
-        const { url, rateLimit, useNuclei, useFfuf, idorUsers, parallelAgents, scanInstructions } = req.body;
+        const { url, rateLimit, useNuclei, useFfuf, idorUsers, parallelAgents, scanInstructions, sessionCookies, iterations, maxPlanRounds: reqMaxPlanRounds } = req.body;
         const user = req.user!;
 
         if (!url) {
@@ -163,13 +183,20 @@ router.post('/web', authenticateToken, async (req: AuthRequest, res: Response) =
 
         logApiUsage('/api/scans/web', user.id, { target: targetUrl });
 
+        const maxIterations = Number(iterations) || 50;
+        const maxPlanRounds = reqMaxPlanRounds === undefined || reqMaxPlanRounds === null || reqMaxPlanRounds === ''
+            ? 0
+            : Math.max(0, Math.min(99, Number(reqMaxPlanRounds)));
         const scanConfig = {
             rateLimit: Number(rateLimit) || 5,
             useNuclei: !!useNuclei,
             useFfuf: !!useFfuf,
             idorUsers: idorUsers || [],
             parallelAgents: Number(parallelAgents) || 1, // 1 = single agent, >1 = multi-agent pool
+            maxIterations,
+            maxPlanRounds,
             customSystemPrompt: scanInstructions || undefined,
+            sessionCookies: typeof sessionCookies === 'string' ? sessionCookies.trim() || undefined : undefined,
         };
 
         // Start scan asynchronously
@@ -223,6 +250,79 @@ router.post('/mobile', authenticateToken, upload.single('apk'), async (req: Auth
     } catch (error: any) {
         logger.error('Mobile scan error', { error: error.message });
         res.status(500).json({ error: true, message: 'Failed to start analysis' });
+    }
+});
+
+// Start scan from Burp "Send to PenPard" (pending request)
+router.post('/from-burp', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const {
+            pendingId,
+            scanInstructions,
+            iterations,
+            rateLimit: reqRateLimit,
+            parallelAgents: reqParallelAgents,
+            maxPlanRounds: reqMaxPlanRounds,
+        } = req.body;
+        const user = req.user!;
+        if (!pendingId) {
+            return res.status(400).json({ error: true, message: 'pendingId is required' });
+        }
+        const entry = takePendingRequest(pendingId);
+        if (!entry) {
+            return res.status(404).json({ error: true, message: 'Pending request not found or already used' });
+        }
+        let targetUrl: string;
+        try {
+            targetUrl = new URL(entry.url.startsWith('http') ? entry.url : `https://${entry.url}`).toString();
+        } catch {
+            return res.status(400).json({ error: true, message: 'Invalid URL in request' });
+        }
+        const whitelists = getUserWhitelists(user.id);
+        if (!isWhitelisted(targetUrl, whitelists)) {
+            return res.status(403).json({
+                error: true,
+                message: 'Target URL not in your whitelist. Contact admin.'
+            });
+        }
+        const scanId = uuidv4();
+        createScan({
+            id: scanId,
+            userId: user.id,
+            type: 'web',
+            target: targetUrl,
+        });
+        setScanInitialRequest(scanId, entry.rawRequest);
+        logApiUsage('/api/scans/from-burp', user.id, { target: targetUrl });
+        const rateLimit = Number(reqRateLimit) || 5;
+        const parallelAgents = Math.max(1, Math.min(10, Number(reqParallelAgents) || 1));
+        const maxIterations = Number(iterations) || 50;
+        const maxPlanRounds = reqMaxPlanRounds === undefined || reqMaxPlanRounds === null || reqMaxPlanRounds === ''
+            ? 0
+            : Math.max(0, Math.min(99, Number(reqMaxPlanRounds)));
+        const scanConfig = {
+            rateLimit,
+            useNuclei: false,
+            useFfuf: false,
+            idorUsers: [] as any[],
+            parallelAgents,
+            maxIterations,
+            maxPlanRounds,
+            customSystemPrompt: scanInstructions || undefined,
+            sessionCookies: undefined as string | undefined,
+            initialRequest: entry.rawRequest,
+        };
+        startWebScan(scanId, targetUrl, scanConfig).catch(err => {
+            logger.error('From-Burp scan failed', { scanId, error: err.message });
+            updateScanStatus(scanId, 'failed', err.message);
+        });
+        return res.json({
+            scanId,
+            message: 'Scan started from Burp request',
+        });
+    } catch (error: any) {
+        logger.error('From-burp scan error', { error: error.message });
+        res.status(500).json({ error: true, message: 'Failed to start scan' });
     }
 });
 
@@ -568,13 +668,15 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
             return;
         }
 
-        // Create a new agent for continuation
+        // Create a new agent for continuation (include original Burp request if scan was started from Send to PenPard)
+        const initialRequest = (scan.initial_request && String(scan.initial_request).trim()) ? String(scan.initial_request).trim() : undefined;
         const agentConfig = {
             rateLimit: 5,
             useNuclei: false,
             useFfuf: false,
             idorUsers: [],
             customSystemPrompt: instruction,
+            initialRequest,
         };
 
         const agent = new OrchestratorAgent(id, scan.target, agentConfig, burpMCP);
@@ -904,9 +1006,13 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
                 // Single agent mode (original behavior)
                 const agentConfig = {
                     rateLimit: config.rateLimit || 5,
+                    maxIterations: config.maxIterations,
+                    maxPlanRounds: config.maxPlanRounds,
                     useNuclei: config.useNuclei || false,
                     useFfuf: config.useFfuf || false,
-                    idorUsers: config.idorUsers || []
+                    idorUsers: config.idorUsers || [],
+                    sessionCookies: config.sessionCookies,
+                    initialRequest: config.initialRequest,
                 };
 
                 const agent = new OrchestratorAgent(scanId, targetUrl, agentConfig, burpMCP);

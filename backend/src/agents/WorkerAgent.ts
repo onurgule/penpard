@@ -6,7 +6,7 @@
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmQueue } from '../services/LLMQueue';
 import { SharedContext, DiscoveredEndpoint, SharedVulnerability, AgentMessage } from './SharedContext';
-import { logger } from '../utils/logger';
+import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 
 export type WorkerRole = 'crawler' | 'scanner' | 'fuzzer' | 'analyzer';
@@ -421,7 +421,8 @@ Now execute your task and respond in the specified JSON format.`;
     }
 
     private log(message: string): void {
-        const line = `[${new Date().toISOString()}] [${this.id}] ${message}`;
+        const timestamp = formatLogTimestamp();
+        const line = `[${timestamp}] [${this.id}] ${message}`;
         this.logs.push(line);
         logger.info(message, { workerId: this.id, role: this.role });
 

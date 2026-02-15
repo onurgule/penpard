@@ -3,14 +3,18 @@ import { persist } from 'zustand/middleware';
 import axios from 'axios';
 import { API_URL } from '@/lib/api-config';
 
+const SAVED_KEY_STORAGE = 'penpard-saved-key';
+
 interface AuthState {
     isAuthenticated: boolean;
     isLoading: boolean;
     error: string | null;
     token: string | null;
-    unlock: (key: string) => Promise<void>;
+    unlock: (key: string, options?: { rememberKey?: boolean }) => Promise<void>;
     lock: () => void;
     changeKey: (currentKey: string, newKey: string) => Promise<void>;
+    getSavedKey: () => string | null;
+    clearSavedKey: () => void;
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -21,7 +25,7 @@ export const useAuthStore = create<AuthState>()(
             error: null,
             token: null,
 
-            unlock: async (key: string) => {
+            unlock: async (key: string, options?: { rememberKey?: boolean }) => {
                 set({ isLoading: true, error: null });
                 try {
                     const response = await axios.post(`${API_URL}/auth/verify-key`, { key });
@@ -29,6 +33,10 @@ export const useAuthStore = create<AuthState>()(
                     const { token } = response.data;
 
                     axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+
+                    if (options?.rememberKey && typeof window !== 'undefined') {
+                        localStorage.setItem(SAVED_KEY_STORAGE, key);
+                    }
 
                     set({
                         token,
@@ -54,6 +62,15 @@ export const useAuthStore = create<AuthState>()(
                     isAuthenticated: false,
                     error: null,
                 });
+            },
+
+            getSavedKey: () => {
+                if (typeof window === 'undefined') return null;
+                return localStorage.getItem(SAVED_KEY_STORAGE);
+            },
+
+            clearSavedKey: () => {
+                if (typeof window !== 'undefined') localStorage.removeItem(SAVED_KEY_STORAGE);
             },
 
             changeKey: async (currentKey: string, newKey: string) => {

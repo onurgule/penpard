@@ -10,6 +10,7 @@ import burp.api.montoya.proxy.http.ProxyRequestToBeSentAction
 import burp.api.montoya.proxy.http.InterceptedRequest
 import net.penpard.mcp.server.McpServer
 import net.penpard.mcp.ui.PenpardTab
+import net.penpard.mcp.ui.SendToPenPardContextMenu
 import net.penpard.mcp.server.AuthSession
 import kotlinx.serialization.json.*
 import kotlinx.serialization.decodeFromString
@@ -77,6 +78,9 @@ class PenpardMcpExtension : BurpExtension {
         // Register UI Tab
         val tab = PenpardTab(api, restartServerCallback)
         api.userInterface().registerSuiteTab("PenPard", tab.getUiComponent())
+
+        // Context menu: Send to PenPard (sends selected request to backend pending queue)
+        api.userInterface().registerContextMenuItemsProvider(SendToPenPardContextMenu(api))
         
         // Register unload handler
         api.extension().registerUnloadingHandler {

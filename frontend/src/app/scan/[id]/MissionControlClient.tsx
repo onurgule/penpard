@@ -116,6 +116,17 @@ export default function MissionControlClient() {
     // Track whether historical data has been loaded (for completed scans)
     const historyLoadedRef = useRef(false);
 
+    function formatLogTime(ts: string): string {
+        try {
+            const d = new Date(ts);
+            return !isNaN(d.getTime())
+                ? d.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                : '00:00:00';
+        } catch {
+            return '00:00:00';
+        }
+    }
+
     useEffect(() => {
         if (!isAuthenticated || !scanId) return;
 
@@ -195,11 +206,20 @@ export default function MissionControlClient() {
             // Append new logs (only if there are actually new ones)
             if (data.logs && data.logs.length > 0 && data.logsCount > logIndexRef.current) {
                 const newLogs = data.logs.map((msg: string) => {
-                    // Parse the log message - format: [timestamp] [TYPE] message
+                    // Parse the log message - format: [timestamp] [TYPE] message (e.g. [2026-02-16T00:24:54] [SYSTEM] ...)
+                    const tsMatch = msg.match(/^\[([\dT:-]+)\]\s*\[/);
+                    let timestamp: string;
+                    if (tsMatch) {
+                        const parsed = tsMatch[1];
+                        const d = new Date(parsed);
+                        timestamp = !isNaN(d.getTime()) ? parsed : new Date().toISOString();
+                    } else {
+                        timestamp = new Date().toISOString();
+                    }
                     const typeMatch = msg.match(/\[([A-Z]+)\]/);
                     const type = typeMatch ? typeMatch[1].toLowerCase() : 'agent';
                     return {
-                        timestamp: new Date().toISOString(),
+                        timestamp,
                         type,
                         message: msg
                     };
@@ -569,7 +589,7 @@ User Question: ${userQuestion}`;
                                 <div className="text-slate-600 italic">Waiting for agent output...</div>
                             ) : logs.map((log, i) => (
                                 <div key={i} className="flex gap-2 hover:bg-white/5 px-1 py-0.5 rounded transition-colors break-words">
-                                    <span className="text-slate-600 flex-shrink-0 select-none">[{log.timestamp.split('T')[1]?.split('.')[0] || '00:00:00'}]</span>
+                                    <span className="text-slate-600 flex-shrink-0 select-none">[{formatLogTime(log.timestamp)}]</span>
                                     <span className={
                                         log.type === 'error' ? 'text-red-400' :
                                             log.type === 'human' ? 'text-cyan-400' :

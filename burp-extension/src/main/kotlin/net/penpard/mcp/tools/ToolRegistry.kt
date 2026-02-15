@@ -70,6 +70,12 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
             addTool(this, "get_proxy_history", "Get Proxy history. Use excludePenPard=true to see only user requests, includeDetails=true for request/response details.", 
                 params("count" to "integer?", "offset" to "integer?", "urlRegex" to "string?", "excludePenPard" to "boolean?", "includeDetails" to "boolean?"))
             
+            addTool(this, "get_session_cookies", "Get Cookie header from the most recent USER request to the given host (from Burp proxy history). Use for authenticated testing when the user has logged in via browser/Burp (e.g. Google OAuth). Excludes PenPard agent requests.", 
+                params("host" to "string"))
+            
+            addTool(this, "get_cookies_and_auth_for_host", "Get Cookie and Authorization headers from proxy history for a host, newest to oldest. Use before test to discover session/auth for target domain. Excludes PenPard requests.", 
+                params("host" to "string", "maxItems" to "integer?"))
+            
             addTool(this, "get_sitemap", "Get Sitemap tree urls", 
                 params("prefix" to "string?"))
             
@@ -99,7 +105,7 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                 params("request" to "string", "sessions" to "string (JSON Array: [{name:'User1', headers:'Cookie: ...'}])", "host" to "string", "port" to "integer", "useHttps" to "boolean"))
             
             // --- 6. ACTIVITY MONITORING ---
-            addTool(this, "get_user_activity", "Analyze recent user activity from proxy history (excludes PenPard agent requests). Detects SQLi, XSS, LFI testing patterns.", 
+            addTool(this, "get_user_activity", "Analyze recent USER-only activity for Smart Assist. Requests with X-PenPard-Agent header are always excluded — assist only on real user traffic. Detects SQLi, XSS, LFI patterns.", 
                 params("count" to "integer?", "sinceMinutes" to "integer?"))
 
             // --- 7. CONFIGURATION ---
@@ -153,6 +159,8 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                 
                 // Recon
                 "get_proxy_history" -> getProxyHistory(args)
+                "get_session_cookies" -> getSessionCookies(args)
+                "get_cookies_and_auth_for_host" -> getCookiesAndAuthForHost(args)
                 "get_sitemap" -> getSitemap(args)
                 "get_scanner_issues" -> getScannerIssues(args)
                 "get_scope" -> getScope()
@@ -548,10 +556,13 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                 rawRequest.append("X-PenPard-Agent: $penpardSource\r\n")
             }
             
-            // Add custom headers
+            // Add custom headers (skip Host/Connection — already set above; skip X-PenPard-Agent — injected above)
             if (headersJson != null && headersJson is JsonObject) {
                 headersJson.jsonObject.forEach { (key, value) ->
-                    rawRequest.append("$key: ${value.jsonPrimitive.content}\r\n")
+                    val lk = key.lowercase()
+                    if (lk != "host" && lk != "x-penpard-agent") {
+                        rawRequest.append("$key: ${value.jsonPrimitive.content}\r\n")
+                    }
                 }
             }
             
@@ -569,11 +580,10 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
             // Otherwise, api.http().sendRequest() only appears in "Extensions" or "Logger".
             
             if (useProxy) {
-                // Raw socket to proxy - HttpURLConnection DECODES the URL and sends unencoded payloads!
-                // We must send our rawRequest (with properly encoded path) through raw socket.
+                // Raw socket to Burp Proxy (configurable in PenPard tab) so requests appear in Proxy History.
                 try {
-                    val proxyHost = "127.0.0.1"
-                    val proxyPort = 8080
+                    val proxyHost = server.upstreamProxyHost
+                    val proxyPort = server.upstreamProxyPort
                     val proxySocket = Socket(proxyHost, proxyPort)
                     proxySocket.soTimeout = 30000
                     val out: OutputStream = proxySocket.getOutputStream()
@@ -661,6 +671,7 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
         val host = args?.get("host")?.jsonPrimitive?.content ?: return err("Missing host")
         val port = args?.get("port")?.jsonPrimitive?.intOrNull ?: 443
         val secure = args?.get("useHttps")?.jsonPrimitive?.booleanOrNull ?: true
+        val useProxy = args?.get("use_proxy")?.jsonPrimitive?.booleanOrNull ?: true
         val rawRequestBody = unescapeRequest(args?.get("request")?.jsonPrimitive?.content ?: return err("Missing request"))
         
         // Inject PenPard Agent header if present
@@ -675,6 +686,67 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
         } else rawRequestBody
         
         return try {
+            // Route through Burp Proxy so requests appear in Proxy History
+            if (useProxy) {
+                try {
+                    val proxyHost = server.upstreamProxyHost
+                    val proxyPort = server.upstreamProxyPort
+                    val proxySocket = Socket(proxyHost, proxyPort)
+                    proxySocket.soTimeout = 30000
+                    val out: OutputStream = proxySocket.getOutputStream()
+                    val inp = proxySocket.getInputStream()
+                    if (secure) {
+                        // HTTPS: CONNECT tunnel, then TLS, then send raw request
+                        val connectReq = "CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\nConnection: close\r\n\r\n"
+                        out.write(connectReq.toByteArray(StandardCharsets.UTF_8))
+                        out.flush()
+                        val connectResp = readUntilDoubleNewline(inp)
+                        if (!String(connectResp).contains("200")) {
+                            proxySocket.close()
+                            throw Exception("Proxy CONNECT failed")
+                        }
+                        val sslSocket = sslContext.socketFactory.createSocket(proxySocket, host, port, true)
+                        sslSocket.soTimeout = 30000
+                        val sslOut = sslSocket.getOutputStream()
+                        val sslIn = sslSocket.getInputStream()
+                        sslOut.write(requestBody.toByteArray(StandardCharsets.UTF_8))
+                        sslOut.flush()
+                        val responseBytes = sslIn.readBytes()
+                        sslSocket.close()
+                        val (status, body) = parseHttpResponse(responseBytes)
+                        val result = buildJsonObject {
+                            put("statusCode", status)
+                            put("body_length", body.size)
+                            put("body_preview", String(body.take(2000).toByteArray()))
+                            put("note", "Routed via Proxy (raw socket)")
+                        }
+                        return jsonResult(result)
+                    } else {
+                        // HTTP: Send full absolute URL to proxy
+                        val path = requestBody.substringBefore(" HTTP/").substringAfter(" ").trim()
+                        val fullUrl = if (port == 80) "http://$host$path" else "http://$host:$port$path"
+                        val method = requestBody.substringBefore(" ").trim()
+                        val proxyReq = requestBody.replace("$method $path ", "$method $fullUrl ")
+                        out.write(proxyReq.toByteArray(StandardCharsets.UTF_8))
+                        out.flush()
+                        val responseBytes = inp.readBytes()
+                        proxySocket.close()
+                        val (status, body) = parseHttpResponse(responseBytes)
+                        val result = buildJsonObject {
+                            put("statusCode", status)
+                            put("body_length", body.size)
+                            put("body_preview", String(body.take(2000).toByteArray()))
+                            put("note", "Routed via Proxy (raw socket)")
+                        }
+                        return jsonResult(result)
+                    }
+                } catch (e: Exception) {
+                    api.logging().logToError("Raw request proxy routing failed: ${e.message}, falling back to direct API")
+                    // Fallback to direct API below
+                }
+            }
+
+            // FALLBACK: Direct API (only appears in Extensions/Logger, not Proxy History)
             val service = HttpService.httpService(host, port, secure)
             val httpReq = HttpRequest.httpRequest(service, requestBody)
             
@@ -732,9 +804,8 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
             history = history.filter { pat.matcher(it.finalRequest().url()).find() }
         }
         
-        // Filter out PenPard agent requests if requested (shows only user's own requests)
         if (excludePenPard) {
-            history = history.filter { !it.finalRequest().hasHeader("X-PenPard-Agent") }
+            history = history.filter { !isPenPardHistoryItem(it) }
         }
         
         val list = history.takeLast(count).reversed()
@@ -747,7 +818,7 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                         put("method", item.finalRequest().method())
                         put("status", item.response()?.statusCode() ?: 0)
                         put("time", item.time().toString())
-                        put("isPenPard", item.finalRequest().hasHeader("X-PenPard-Agent"))
+                        put("isPenPard", isPenPardHistoryItem(item))
                         
                         if (includeDetails) {
                             // Request details
@@ -782,6 +853,70 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
             put("totalHistory", api.proxy().history().size)
         }
         return jsonResult(result)
+    }
+
+    /**
+     * Returns the Cookie header from the most recent user (non-PenPard) request to the given host.
+     * Use when the user has logged in via browser through Burp (e.g. Google OAuth) so the agent
+     * can send authenticated requests with the same session.
+     */
+    private fun getSessionCookies(args: JsonObject?): JsonElement {
+        val host = args?.get("host")?.jsonPrimitive?.content ?: return err("Missing host")
+        val hostLower = host.lowercase().removePrefix("www.")
+        var history = api.proxy().history()
+        history = history.filter { !isPenPardHistoryItem(it) }
+        history = history.filter { item ->
+            val url = item.finalRequest().url().lowercase()
+            url.contains(hostLower) || url.contains("www.$hostLower")
+        }
+        val latest = history.lastOrNull() ?: return jsonResult(buildJsonObject {
+            put("cookieHeader", "")
+            put("note", "No user requests found for host: $host. Log in via browser through Burp first, then retry.")
+        })
+        val cookieHeader = latest.finalRequest().headers()
+            .firstOrNull { it.name().equals("Cookie", true) }
+            ?.value() ?: ""
+        return jsonResult(buildJsonObject {
+            put("cookieHeader", cookieHeader)
+            put("fromUrl", latest.finalRequest().url())
+            if (cookieHeader.isEmpty()) put("note", "Latest request to host had no Cookie header.")
+        })
+    }
+
+    /**
+     * Returns Cookie and Authorization headers from proxy history for the given host,
+     * newest to oldest (last N user requests). Used at planning phase to discover session/auth.
+     */
+    private fun getCookiesAndAuthForHost(args: JsonObject?): JsonElement {
+        val host = args?.get("host")?.jsonPrimitive?.content ?: return err("Missing host")
+        val maxItems = args?.get("maxItems")?.jsonPrimitive?.intOrNull ?: 50
+        val hostLower = host.lowercase().removePrefix("www.")
+        var history = api.proxy().history()
+        history = history.filter { !isPenPardHistoryItem(it) }
+        history = history.filter { item ->
+            val url = item.finalRequest().url().lowercase()
+            url.contains(hostLower) || url.contains("www.$hostLower")
+        }
+        val newestFirst = history.takeLast(maxItems).reversed()
+        val entries = buildJsonArray {
+            newestFirst.forEach { item ->
+                val req = item.finalRequest()
+                val cookie = req.headers().firstOrNull { it.name().equals("Cookie", true) }?.value() ?: ""
+                val auth = req.headers().firstOrNull { it.name().equals("Authorization", true) }?.value() ?: ""
+                if (cookie.isNotEmpty() || auth.isNotEmpty()) {
+                    add(buildJsonObject {
+                        put("cookie", cookie)
+                        put("authorization", auth)
+                        put("fromUrl", req.url())
+                    })
+                }
+            }
+        }
+        return jsonResult(buildJsonObject {
+            put("entries", entries)
+            put("count", entries.size)
+            put("host", host)
+        })
     }
 
     private fun getSitemap(args: JsonObject?): JsonElement {
@@ -846,12 +981,24 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
 
     // --- ACTIVITY MONITORING ---
     
+    /**
+     * True if this proxy history entry is a PenPard agent request. The proxy handler strips
+     * X-PenPard-Agent before saving, so we identify by annotation notes ("[PenPard] Agent Request").
+     * Use this for filtering; do not rely on request header in history.
+     */
+    private fun isPenPardHistoryItem(item: burp.api.montoya.proxy.ProxyHttpRequestResponse): Boolean {
+        return item.annotations().notes()?.contains("PenPard") == true
+    }
+    
+    /**
+     * Analyze only USER traffic for Smart Assist. PenPard agent requests (annotated in history) are
+     * always excluded — no point assisting on our own requests, and it reduces noise/load.
+     */
     private fun getUserActivity(args: JsonObject?): JsonElement {
         val count = args?.get("count")?.jsonPrimitive?.intOrNull ?: 50
         
-        // Get proxy history, excluding PenPard agent requests
         val allHistory = api.proxy().history()
-        val userHistory = allHistory.filter { !it.finalRequest().hasHeader("X-PenPard-Agent") }
+        val userHistory = allHistory.filter { !isPenPardHistoryItem(it) }
         val recent = userHistory.takeLast(count)
         
         if (recent.isEmpty()) {

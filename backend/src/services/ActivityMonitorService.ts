@@ -12,6 +12,9 @@
  * 4. Frontend polls for suggestions and shows alerts
  */
 
+/** Set to true to enable Smart Assist (pause scan → monitor user traffic → suggest assist). */
+const ASSIST_ENABLED = false;
+
 import { BurpMCPClient } from './burp-mcp';
 import { logger } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
@@ -79,6 +82,10 @@ export class ActivityMonitorService {
     }
 
     async start(): Promise<boolean> {
+        if (!ASSIST_ENABLED) {
+            logger.info('[ActivityMonitor] Assist disabled in code (ASSIST_ENABLED = false)');
+            return true;
+        }
         if (this.isRunning) {
             logger.info('[ActivityMonitor] Already running');
             return true;
@@ -153,7 +160,8 @@ export class ActivityMonitorService {
         if (!this.isRunning) return;
 
         try {
-            // Call the Burp extension's get_user_activity tool
+            // get_user_activity returns only USER traffic (Burp excludes X-PenPard-Agent requests).
+            // Assist is for user's manual testing only — we never suggest assist on agent requests.
             const result = await this.burp.callTool('get_user_activity', {
                 count: 50,
                 sinceMinutes: 5

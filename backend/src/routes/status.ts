@@ -46,18 +46,17 @@ router.get('/', authenticateToken, async (req: AuthRequest, res: Response) => {
         }
 
         const response = await axios.get(`${burpUrl}/health`, { 
-            timeout: 2000,
+            timeout: 5000,
             validateStatus: () => true 
         });
-        if (response.status === 200 || response.status !== 404) {
+        if (response.status === 200) {
             burpStatus = 'online';
         }
     } catch (e: any) {
         if (e.code === 'ECONNREFUSED' || e.code === 'ENOTFOUND') {
             burpStatus = 'offline';
-        } else if (e.response) {
-            burpStatus = 'online';
         }
+        // timeout or other errors: leave as offline
     }
 
     // 4. Nuclei Status

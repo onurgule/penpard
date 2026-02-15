@@ -36,6 +36,10 @@ class PenpardTab(
     private val authCheckBox = JCheckBox("Enable Authentication Header")
     private val headerNameField = JTextField("X-PenPard-Auth", 15)
     private val headerValueField = JTextField("", 15)
+
+    // Send to PenPard (context menu)
+    private val backendUrlField = JTextField("http://127.0.0.1:4000", 25)
+    private val sendTokenField = JTextField("", 20)
     
     // Session Components
     private val sessionsModel = DefaultTableModel(arrayOf("Name", "Headers"), 0)
@@ -114,8 +118,28 @@ class PenpardTab(
         gbc.gridx = 1
         panel.add(proxyPortField, gbc)
 
-        // Authentication
+        // Send to PenPard (right-click context menu)
         gbc.gridx = 0
+        gbc.gridy++
+        gbc.gridwidth = 2
+        panel.add(JSeparator(), gbc)
+        gbc.gridy++
+        val sendLabel = JLabel("Send to PenPard (context menu)")
+        sendLabel.font = sendLabel.font.deriveFont(java.awt.Font.BOLD)
+        panel.add(sendLabel, gbc)
+        gbc.gridy++
+        gbc.gridwidth = 1
+        panel.add(JLabel("PenPard backend URL:"), gbc)
+        gbc.gridx = 1
+        panel.add(backendUrlField, gbc)
+        gbc.gridx = 0
+        gbc.gridy++
+        panel.add(JLabel("Token (optional):"), gbc)
+        gbc.gridx = 1
+        panel.add(sendTokenField, gbc)
+        gbc.gridx = 0
+
+        // Authentication
         gbc.gridy++
         gbc.gridwidth = 2
         panel.add(JSeparator(), gbc)
@@ -226,7 +250,9 @@ class PenpardTab(
         
         proxyHostField.text = prefs.getString("mcp_proxy_host") ?: "127.0.0.1"
         proxyPortField.text = prefs.getString("mcp_proxy_port") ?: "8080"
-        
+        backendUrlField.text = prefs.getString("penpard_backend_url") ?: "http://127.0.0.1:4000"
+        sendTokenField.text = prefs.getString("penpard_send_token") ?: ""
+
         val isLegacy = prefs.getBoolean("mcp_legacy_sse") ?: false
         if (isLegacy) legacyRadioButton.isSelected = true else streamableRadioButton.isSelected = true
         
@@ -255,7 +281,9 @@ class PenpardTab(
         
         prefs.setString("mcp_proxy_host", proxyHostField.text)
         prefs.setString("mcp_proxy_port", proxyPortField.text)
-        
+        prefs.setString("penpard_backend_url", backendUrlField.text)
+        prefs.setString("penpard_send_token", sendTokenField.text)
+
         // Save Sessions
         val sessions = mutableListOf<Map<String, String>>()
         for (i in 0 until sessionsModel.rowCount) {

@@ -19,6 +19,25 @@ import {
 import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
 
+const SCAN_OPTIONS_KEY = 'penpard-scan-options';
+
+function getLastScanOptions() {
+    if (typeof window === 'undefined') return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+    try {
+        const s = localStorage.getItem(SCAN_OPTIONS_KEY);
+        if (!s) return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+        const o = JSON.parse(s);
+        return {
+            iterations: Math.max(10, Math.min(500, Number(o.iterations) || 50)),
+            parallelAgents: Math.max(1, Math.min(10, Number(o.parallelAgents) || 1)),
+            rateLimit: Number(o.rateLimit) || 5,
+            maxPlanRounds: Math.max(0, Math.min(99, Number(o.maxPlanRounds) ?? 0)),
+        };
+    } catch {
+        return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+    }
+}
+
 export default function DashboardPage() {
     const router = useRouter();
     const { isAuthenticated, lock } = useAuthStore();
@@ -30,6 +49,15 @@ export default function DashboardPage() {
         reportsGenerated: 0
     });
     const [totalTokens, setTotalTokens] = useState(0);
+    const [pendingFromBurp, setPendingFromBurp] = useState<{ pendingId: string; url: string; createdAt: number }[]>([]);
+    const [startingPendingId, setStartingPendingId] = useState<string | null>(null);
+    const [burpStartModal, setBurpStartModal] = useState<{ pendingId: string; url: string } | null>(null);
+    const [burpOptions, setBurpOptions] = useState({
+        iterations: 50,
+        parallelAgents: 1,
+        rateLimit: 5,
+        maxPlanRounds: 0,
+    });
 
     useEffect(() => {
         if (!isAuthenticated) {
@@ -71,6 +99,15 @@ export default function DashboardPage() {
                     setTotalTokens(tokenData.totals?.total_tokens || 0);
                 }
 
+                // Pending requests from Burp (Send to PenPard)
+                const pendingRes = await fetch(`${API_URL}/penpard/pending`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (pendingRes.ok) {
+                    const pendingData = await pendingRes.json();
+                    setPendingFromBurp(pendingData.pending || []);
+                }
+
             } catch {
                 // Backend may not be ready yet
             }
@@ -86,6 +123,51 @@ export default function DashboardPage() {
     const handleLock = () => {
         lock();
         router.push('/');
+    };
+
+    const openBurpStartModal = (p: { pendingId: string; url: string }) => {
+        setBurpStartModal(p);
+        setBurpOptions(getLastScanOptions());
+    };
+
+    const handleStartFromBurp = async () => {
+        if (!burpStartModal) return;
+        const token = useAuthStore.getState().token;
+        if (!token) return;
+        const { pendingId } = burpStartModal;
+        setStartingPendingId(pendingId);
+        try {
+            const res = await fetch(`${API_URL}/scans/from-burp`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                body: JSON.stringify({
+                    pendingId,
+                    iterations: burpOptions.iterations,
+                    parallelAgents: burpOptions.parallelAgents,
+                    rateLimit: burpOptions.rateLimit,
+                    maxPlanRounds: burpOptions.maxPlanRounds,
+                }),
+            });
+            const data = await res.json();
+            if (data.scanId) {
+                try {
+                    localStorage.setItem(SCAN_OPTIONS_KEY, JSON.stringify({
+                        iterations: burpOptions.iterations,
+                        parallelAgents: burpOptions.parallelAgents,
+                        rateLimit: burpOptions.rateLimit,
+                        maxPlanRounds: burpOptions.maxPlanRounds,
+                    }));
+                } catch { /* ignore */ }
+                setBurpStartModal(null);
+                window.location.href = `/scan/${data.scanId}`;
+                return;
+            }
+            alert(data.message || 'Failed to start scan');
+        } catch (e: any) {
+            alert(e?.message || 'Failed to start scan');
+        } finally {
+            setStartingPendingId(null);
+        }
     };
 
     return (
@@ -132,7 +214,127 @@ export default function DashboardPage() {
                         Welcome back
                     </h2>
                     <p className="text-gray-400">Select a scan type to begin vulnerability analysis</p>
+                    <p className="text-gray-500 text-sm mt-2">
+                        For authenticated testing: browse the target through Burp and log in first; PenPard will use cookies from proxy history.
+                    </p>
                 </div>
+
+                {/* From Burp — pending requests (Send to PenPard) */}
+                {pendingFromBurp.length > 0 && (
+                    <motion.div
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="card p-6 mb-8 border border-cyan-500/30"
+                    >
+                        <h3 className="text-lg font-bold text-white mb-1 flex items-center gap-2">
+                            <Activity className="w-5 h-5 text-cyan-400" />
+                            Requests from Burp
+                        </h3>
+                        <p className="text-gray-400 text-sm mb-4">
+                            Right-clicked &quot;Send to PenPard&quot; in Burp. Start a test for one of these requests (same headers and body).
+                        </p>
+                        <ul className="space-y-3">
+                            {pendingFromBurp.map((p) => (
+                                <li key={p.pendingId} className="flex items-center justify-between gap-4 py-2 border-b border-dark-600 last:border-0">
+                                    <span className="text-gray-300 font-mono text-sm truncate flex-1" title={p.url}>{p.url}</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => openBurpStartModal(p)}
+                                        disabled={startingPendingId !== null}
+                                        className="px-4 py-2 rounded-lg bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30 border border-cyan-500/50 disabled:opacity-50 text-sm font-medium whitespace-nowrap"
+                                    >
+                                        Start test
+                                    </button>
+                                </li>
+                            ))}
+                        </ul>
+                    </motion.div>
+                )}
+
+                {/* Start from Burp — options modal */}
+                {burpStartModal && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70" onClick={() => !startingPendingId && setBurpStartModal(null)}>
+                        <motion.div
+                            initial={{ opacity: 0, scale: 0.95 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            onClick={(e) => e.stopPropagation()}
+                            className="card p-6 w-full max-w-md border border-cyan-500/30"
+                        >
+                            <h3 className="text-lg font-bold text-white mb-1">Scan options</h3>
+                            <p className="text-gray-400 font-mono text-sm truncate mb-4" title={burpStartModal.url}>{burpStartModal.url}</p>
+                            <div className="space-y-4 mb-6">
+                                <div>
+                                    <label className="block text-gray-400 text-sm mb-1">Iterations (max actions)</label>
+                                    <input
+                                        type="number"
+                                        min={10}
+                                        max={500}
+                                        value={burpOptions.iterations}
+                                        onChange={(e) => setBurpOptions(o => ({ ...o, iterations: Number(e.target.value) || 50 }))}
+                                        className="input-field w-full"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-gray-400 text-sm mb-1">Agent count</label>
+                                    <select
+                                        value={burpOptions.parallelAgents}
+                                        onChange={(e) => setBurpOptions(o => ({ ...o, parallelAgents: Number(e.target.value) }))}
+                                        className="input-field w-full"
+                                    >
+                                        {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+                                            <option key={n} value={n}>{n} agent{n > 1 ? 's' : ''}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-gray-400 text-sm mb-1">Rate limit (req/sec)</label>
+                                    <div className="flex gap-2">
+                                        {[2, 5, 15].map((r) => (
+                                            <button
+                                                key={r}
+                                                type="button"
+                                                onClick={() => setBurpOptions(o => ({ ...o, rateLimit: r }))}
+                                                className={`px-3 py-1.5 rounded text-sm ${burpOptions.rateLimit === r ? 'bg-cyan-500 text-white' : 'bg-dark-700 text-gray-400'}`}
+                                            >
+                                                {r}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div>
+                                    <label className="block text-gray-400 text-sm mb-1">Planning rounds</label>
+                                    <input
+                                        type="number"
+                                        min={0}
+                                        max={99}
+                                        value={burpOptions.maxPlanRounds}
+                                        onChange={(e) => setBurpOptions(o => ({ ...o, maxPlanRounds: Number(e.target.value) || 0 }))}
+                                        className="input-field w-full"
+                                    />
+                                    <p className="text-gray-500 text-xs mt-1">0 = default (model decides when to finish)</p>
+                                </div>
+                            </div>
+                            <div className="flex gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => setBurpStartModal(null)}
+                                    disabled={!!startingPendingId}
+                                    className="flex-1 px-4 py-2 rounded-lg bg-dark-700 text-gray-400 hover:bg-dark-600 disabled:opacity-50"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleStartFromBurp}
+                                    disabled={!!startingPendingId}
+                                    className="flex-1 px-4 py-2 rounded-lg bg-cyan-500 text-white hover:bg-cyan-400 disabled:opacity-50"
+                                >
+                                    {startingPendingId === burpStartModal.pendingId ? 'Starting…' : 'Start test'}
+                                </button>
+                            </div>
+                        </motion.div>
+                    </div>
+                )}
 
                 {/* Scan Options */}
                 <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">

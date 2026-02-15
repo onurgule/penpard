@@ -15,7 +15,8 @@ import {
     Clock,
     Globe,
     Smartphone,
-    Filter
+    Filter,
+    Trash2,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import axios from 'axios';
@@ -40,6 +41,8 @@ export default function ReportsPage() {
     const [filter, setFilter] = useState<'all' | 'completed' | 'running'>('all');
     const [reportModalOpen, setReportModalOpen] = useState(false);
     const [selectedScanId, setSelectedScanId] = useState<string>('');
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [deleting, setDeleting] = useState(false);
 
     useEffect(() => {
         if (isAuthenticated && token) {
@@ -72,6 +75,39 @@ export default function ReportsPage() {
         if (filter === 'running') return s.status === 'running' || s.status === 'queued';
         return true;
     });
+
+    const toggleSelect = (id: string) => {
+        setSelectedIds(prev => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    };
+
+    const selectAllFiltered = () => {
+        const ids = filteredScans.map(s => s.id);
+        if (selectedIds.size === ids.length) setSelectedIds(new Set());
+        else setSelectedIds(new Set(ids));
+    };
+
+    const handleDeleteSelected = async () => {
+        if (selectedIds.size === 0) return;
+        if (!confirm(`Permanently delete ${selectedIds.size} scan(s)? This cannot be undone.`)) return;
+        setDeleting(true);
+        try {
+            const res = await axios.post(`${API_URL}/scans/delete`, { ids: [...selectedIds] }, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            setSelectedIds(new Set());
+            await fetchScans();
+            toast.success(res.data?.message || 'Scans deleted');
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to delete scans');
+        } finally {
+            setDeleting(false);
+        }
+    };
 
     const getStatusIcon = (status: string) => {
         switch (status) {
@@ -108,7 +144,7 @@ export default function ReportsPage() {
 
             <main className="max-w-7xl mx-auto px-4 py-8">
                 {/* Filter Bar */}
-                <div className="flex items-center gap-4 mb-6">
+                <div className="flex items-center gap-4 mb-6 flex-wrap">
                     <Filter className="w-4 h-4 text-slate-400" />
                     <div className="flex gap-2">
                         {['all', 'completed', 'running'].map(f => (
@@ -124,7 +160,29 @@ export default function ReportsPage() {
                             </button>
                         ))}
                     </div>
-                    <span className="text-slate-500 text-sm ml-auto">{filteredScans.length} scans</span>
+                    <span className="text-slate-500 text-sm">{filteredScans.length} scans</span>
+                    {filteredScans.length > 0 && (
+                        <>
+                            <label className="flex items-center gap-2 text-slate-400 text-sm cursor-pointer ml-auto">
+                                <input
+                                    type="checkbox"
+                                    checked={selectedIds.size === filteredScans.length && filteredScans.length > 0}
+                                    onChange={selectAllFiltered}
+                                    className="rounded border-slate-600 bg-slate-800 text-cyan-500"
+                                />
+                                Select all
+                            </label>
+                            <button
+                                type="button"
+                                onClick={handleDeleteSelected}
+                                disabled={selectedIds.size === 0 || deleting}
+                                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/20 text-red-400 hover:bg-red-500/30 border border-red-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                <Trash2 className="w-4 h-4" />
+                                {deleting ? 'Deleting…' : `Delete selected (${selectedIds.size})`}
+                            </button>
+                        </>
+                    )}
                 </div>
 
                 {/* Scan List */}
@@ -150,6 +208,14 @@ export default function ReportsPage() {
                             >
                                 <div className="flex items-start justify-between">
                                     <div className="flex items-start gap-4">
+                                        <label className="flex items-center pt-3 cursor-pointer shrink-0">
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedIds.has(scan.id)}
+                                                onChange={() => toggleSelect(scan.id)}
+                                                className="rounded border-slate-600 bg-slate-800 text-cyan-500 w-4 h-4"
+                                            />
+                                        </label>
                                         <div className={`p-3 rounded-lg ${scan.type === 'web' ? 'bg-blue-500/10 text-blue-400' : 'bg-purple-500/10 text-purple-400'}`}>
                                             {scan.type === 'web' ? <Globe className="w-5 h-5" /> : <Smartphone className="w-5 h-5" />}
                                         </div>

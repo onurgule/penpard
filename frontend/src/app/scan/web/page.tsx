@@ -23,6 +23,25 @@ import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
 
+const SCAN_OPTIONS_KEY = 'penpard-scan-options';
+
+function getDefaultScanOptions() {
+    if (typeof window === 'undefined') return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+    try {
+        const s = localStorage.getItem(SCAN_OPTIONS_KEY);
+        if (!s) return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+        const o = JSON.parse(s);
+        return {
+            iterations: Math.max(10, Math.min(500, Number(o.iterations) || 50)),
+            parallelAgents: Math.max(1, Math.min(10, Number(o.parallelAgents) || 1)),
+            rateLimit: Number(o.rateLimit) || 5,
+            maxPlanRounds: Math.max(0, Math.min(99, Number(o.maxPlanRounds) ?? 0)),
+        };
+    } catch {
+        return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+    }
+}
+
 interface ScanStatus {
     id: string | null;
     status: 'idle' | 'validating' | 'scanning' | 'analyzing' | 'complete' | 'error';
@@ -37,8 +56,11 @@ export default function WebScanPage() {
 
     const [targetUrl, setTargetUrl] = useState('');
     const [scanInstructions, setScanInstructions] = useState('');
-    const [rateLimit, setRateLimit] = useState(5);
-    const [parallelAgents, setParallelAgents] = useState(1); // 1 = single agent, >1 = multi-agent pool
+    const [sessionCookies, setSessionCookies] = useState('');
+    const [rateLimit, setRateLimit] = useState(() => getDefaultScanOptions().rateLimit);
+    const [parallelAgents, setParallelAgents] = useState(() => getDefaultScanOptions().parallelAgents);
+    const [iterations, setIterations] = useState(() => getDefaultScanOptions().iterations);
+    const [maxPlanRounds, setMaxPlanRounds] = useState(() => getDefaultScanOptions().maxPlanRounds);
     const [userAccounts, setUserAccounts] = useState([{ username: '', password: '', role: 'user' }]);
     const [reportModalOpen, setReportModalOpen] = useState(false);
     const [externalTools, setExternalTools] = useState({
@@ -95,15 +117,29 @@ export default function WebScanPage() {
 
         try {
             // Start the scan
-            const response = await axios.post(`${API_URL}/scans/web`, {
+            const payload = {
                 url: fullUrl,
                 rateLimit,
                 parallelAgents,
+                iterations,
+                maxPlanRounds,
                 useNuclei: externalTools.nuclei,
                 useFfuf: externalTools.ffuf,
                 idorUsers: userAccounts.filter(u => u.username && u.password),
                 scanInstructions: scanInstructions.trim() || undefined,
-            }, {
+                sessionCookies: sessionCookies.trim() || undefined,
+            };
+            if (typeof window !== 'undefined') {
+                try {
+                    localStorage.setItem(SCAN_OPTIONS_KEY, JSON.stringify({
+                        iterations,
+                        parallelAgents,
+                        rateLimit,
+                        maxPlanRounds,
+                    }));
+                } catch { /* ignore */ }
+            }
+            const response = await axios.post(`${API_URL}/scans/web`, payload, {
                 headers: { Authorization: `Bearer ${useAuthStore.getState().token}` }
             });
 
@@ -303,6 +339,24 @@ export default function WebScanPage() {
                             className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-lg text-white text-sm placeholder-gray-600 focus:outline-none focus:border-cyan-500/50 transition-colors disabled:opacity-50 resize-y"
                         />
                     </div>
+
+                    {/* Authenticated testing tip */}
+                    <div className="mt-4 p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-sm text-gray-300">
+                        <strong className="text-cyan-400">Authenticated test:</strong> Browse the target in your browser through Burp and log in first; PenPard will use cookies from proxy history for authenticated requests. You can also paste a Cookie header below.
+                    </div>
+
+                    {/* Session cookies (authenticated testing, e.g. Google login) */}
+                    <div className="mt-4">
+                        <label className="block text-gray-400 text-sm mb-2">Session cookies <span className="text-gray-600">(optional)</span></label>
+                        <textarea
+                            value={sessionCookies}
+                            onChange={(e) => setSessionCookies(e.target.value)}
+                            placeholder='Paste Cookie header from browser/Burp after logging in (e.g. Google). Or leave empty: agent will use cookies from Burp proxy history (newest first).'
+                            disabled={isScanning}
+                            rows={2}
+                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-lg text-white text-sm placeholder-gray-600 focus:outline-none focus:border-cyan-500/50 transition-colors disabled:opacity-50 resize-y font-mono"
+                        />
+                    </div>
                 </motion.div>
 
                 {/* Advanced Configuration */}
@@ -412,6 +466,38 @@ export default function WebScanPage() {
                                     : `${parallelAgents} agents scanning in parallel (faster but uses more resources)`
                                 }
                             </p>
+                        </div>
+
+                        {/* Iterations (max actions) */}
+                        <div>
+                            <label className="block text-gray-400 text-sm mb-2">
+                                Iterations (max actions): <span className="text-cyan-400 font-bold">{iterations}</span>
+                            </label>
+                            <input
+                                type="number"
+                                min={10}
+                                max={500}
+                                value={iterations}
+                                onChange={(e) => setIterations(Math.max(10, Math.min(500, Number(e.target.value) || 50)))}
+                                className="input-field w-full max-w-[120px]"
+                            />
+                            <p className="text-gray-500 text-xs mt-1">Max tool/action steps per scan (10–500).</p>
+                        </div>
+
+                        {/* Planning rounds */}
+                        <div>
+                            <label className="block text-gray-400 text-sm mb-2">
+                                Planning rounds: <span className="text-cyan-400 font-bold">{maxPlanRounds === 0 ? 'Default (model decides)' : maxPlanRounds}</span>
+                            </label>
+                            <input
+                                type="number"
+                                min={0}
+                                max={99}
+                                value={maxPlanRounds}
+                                onChange={(e) => setMaxPlanRounds(Math.max(0, Math.min(99, Number(e.target.value) ?? 0)))}
+                                className="input-field w-full max-w-[120px]"
+                            />
+                            <p className="text-gray-500 text-xs mt-1">0 = model decides when to finish; 1–99 = fixed number of planning rounds.</p>
                         </div>
 
                         {/* User Accounts */}

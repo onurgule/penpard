@@ -39,6 +39,13 @@ export const logger = winston.createLogger({
     ],
 });
 
+/** Format current time for agent logs using system/local timezone (LOG_TZ or TZ env, else OS default). */
+export function formatLogTimestamp(): string {
+    const now = new Date();
+    const tz = process.env.LOG_TZ || process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return now.toLocaleString('sv-SE', { hour12: false, timeZone: tz }).replace(' ', 'T');
+}
+
 // Log API usage for analytics
 export const logApiUsage = (endpoint: string, userId: number, metadata?: any) => {
     const usageLog = path.join(logsDir, 'api-usage.log');

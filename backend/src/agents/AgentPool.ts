@@ -8,7 +8,7 @@ import { SharedContext } from './SharedContext';
 import { WorkerAgent, WorkerRole } from './WorkerAgent';
 import { RecheckAgent } from './RecheckAgent';
 import { addVulnerability, updateScanStatus } from '../db/init';
-import { logger } from '../utils/logger';
+import { logger, formatLogTimestamp } from '../utils/logger';
 
 export interface PoolConfig {
     crawlerCount: number;
@@ -319,7 +319,8 @@ export class AgentPool {
     }
 
     private log(message: string): void {
-        const line = `[${new Date().toISOString()}] [POOL] ${message}`;
+        const timestamp = formatLogTimestamp();
+        const line = `[${timestamp}] [POOL] ${message}`;
         this.logs.push(line);
         logger.info(message, { scanId: this.scanId, component: 'AgentPool' });
     }
