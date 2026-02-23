@@ -556,17 +556,18 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                 rawRequest.append("X-PenPard-Agent: $penpardSource\r\n")
             }
             
-            // Add custom headers (skip Host/Connection — already set above; skip X-PenPard-Agent — injected above)
+            // Add custom headers (skip Host/Connection — already set above; skip X-PenPard-Agent — injected above;
+            // skip Content-Length — we compute it from body when body is present to avoid duplicates)
             if (headersJson != null && headersJson is JsonObject) {
                 headersJson.jsonObject.forEach { (key, value) ->
                     val lk = key.lowercase()
-                    if (lk != "host" && lk != "x-penpard-agent") {
+                    if (lk != "host" && lk != "x-penpard-agent" && lk != "content-length") {
                         rawRequest.append("$key: ${value.jsonPrimitive.content}\r\n")
                     }
                 }
             }
             
-            // Add body if present
+            // Add body if present (Content-Length computed here to avoid duplicate when headers already had it)
             if (body.isNotEmpty()) {
                 rawRequest.append("Content-Length: ${body.length}\r\n")
                 rawRequest.append("\r\n")
