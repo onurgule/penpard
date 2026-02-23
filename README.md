@@ -4,7 +4,7 @@
   <strong>Your AI co-pilot for web and mobile security testing.</strong><br/>
   Autonomous LLM agents + Burp Suite integration + real-time vulnerability discovery.<br/>
   <em>Use in your browser or install as a desktop app — Windows, macOS, Linux.</em><br/>
-  <strong>100% free and open source. No subscriptions, no hidden fees, no limits.</strong><br/>
+  <strong>100% personal use free and source-available. No subscriptions, no hidden fees, no limits.</strong><br/>
   Cannot replace pentesters!
 </p>
 
@@ -171,7 +171,7 @@ PenPard gives you **full transparency**:
 
 | | Traditional Scanners | ChatGPT / AI Wrappers | Commercial AI Platforms | **PenPard** |
 |---|---|---|---|---|
-| **Cost** | $500-5,000/yr | API costs only | $50,000-200,000/yr | **Free & open source** |
+| **Cost** | $500-5,000/yr | API costs only | $50,000-200,000/yr | **Personal Use Free & Source-Available** |
 | **Actually executes attacks** | Yes (rule-based) | No (suggestions only) | Yes | **Yes (via Burp Suite)** |
 | **AI reasoning** | No | Yes (but no execution) | Yes | **Yes** |
 | **False positive reduction** | Moderate | Very poor | Good | **Recheck Agent validates every finding** |
@@ -707,11 +707,33 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed contribution guidelines.
 
 ---
 
-## 📜 License
+## Licensing
 
-PenPard is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file for details.
+This repository uses a "Personal Use Free, Commercial Use Paid" model.
 
-This means you are free to use, modify, and distribute this software, as long as any derivative works are also distributed under the same license.
+- Personal use is free.
+- Commercial use (including use inside any organization or company) requires a paid commercial license.
+
+The source code in this repository is licensed under the PolyForm Noncommercial License 1.0.0 by default (see `LICENSE`). This license does not grant permission for commercial use.
+
+Commercial use of PenPard is strictly prohibited without a separate paid commercial license from the project maintainers. Any use by or for an organization, company, or for-profit entity (including internal use, consulting, client work, or integration into products or services) requires a commercial license. To request a license, contact: licensing@penpard.com.
+
+General inquiries: info@penpard.com  
+Security reports: security@penpard.com (please do not open public issues for security vulnerabilities)
+
+## What is considered commercial use?
+
+Commercial use includes, but is not limited to:
+
+- Use by or for any organization, company, or for-profit entity (including internal use)
+- Use in consulting, pentest services, MSP, or any service delivered to third parties
+- Use to produce deliverables for clients
+- Integration into products or services, redistribution, packaging
+- Use in CI/CD, SOC, AppSec pipelines, or other business operations
+
+To request a commercial license: `docs/commercial-license.md` or `COMMERCIAL-LICENSE-REQUEST.md`
+
+Note: Since commercial use is restricted, this project is not OSI Open Source. It is best described as source-available.
 
 ---
 

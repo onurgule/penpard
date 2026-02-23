@@ -169,4 +169,33 @@ Please don't submit AI-generated code without reviewing and testing it first.
 
 ---
 
+## 1) CLA required
+
+By submitting a pull request, you agree to the terms in `CLA.md`.
+We require CLA acceptance for all contributions.
+
+## 2) Licensing compatibility
+
+Contributions must be compatible with this repository's licensing model:
+- Default license: PolyForm Noncommercial 1.0.0 (`LICENSE`)
+- Commercial licensing rights: granted to the Maintainers via the CLA
+
+## 3) Security
+
+Do not report security vulnerabilities via public GitHub issues.
+Please report them to: security@penpard.com
+
+## 4) Contact
+
+Commercial licensing: licensing@penpard.com  
+General: info@penpard.com
+
+## 5) Contribution guidelines
+
+- Keep PRs small and focused
+- Ensure tests and linters pass
+- Provide clear descriptions and screenshots for UI changes
+
+---
+
 Thank you for contributing to PenPard! Together we're making security testing smarter and more accessible.

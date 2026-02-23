@@ -1,0 +1,20 @@
+name: CLA
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cla-assistant/cla-assistant-lite@v2
+        with:
+          path-to-document: "CLA.md"
+          remote-organization-name: "penpard"
+          remote-repository-name: "penpard"
+          branch: "main"

@@ -1,5 +1,16 @@
 # Security Policy
 
+Do not report security vulnerabilities via public GitHub issues.
+
+Please report security issues to:
+security@penpard.com
+
+Include:
+- Steps to reproduce
+- Impact
+- Affected component and version
+- Proof of concept if available
+
 ## Supported Versions
 
 | Version | Supported          |
@@ -14,7 +25,7 @@ We take security seriously. If you discover a security vulnerability in PenPard,
 ### How to Report
 
 1. **DO NOT** open a public GitHub issue for security vulnerabilities.
-2. Email us at **thepenpard@gmail.com** with:
+2. Email us at **security@penpard.com** with:
    - A description of the vulnerability
    - Steps to reproduce the issue
    - Potential impact assessment
