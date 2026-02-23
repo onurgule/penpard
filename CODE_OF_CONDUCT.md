@@ -28,7 +28,7 @@ This Code of Conduct applies within all project spaces, including GitHub issues,
 
 Project maintainers are responsible for clarifying and enforcing standards of acceptable behavior. They may remove, edit, or reject comments, commits, code, issues, and other contributions that do not align with this Code of Conduct.
 
-Instances of unacceptable behavior may be reported by contacting the project team at **thepenpard@gmail.com**. All reports will be reviewed and handled appropriately.
+Instances of unacceptable behavior may be reported by contacting the project team at **info@penpard.com**. All reports will be reviewed and handled appropriately.
 
 ## Attribution
 

@@ -2,8 +2,8 @@
     "name": "penpard",
     "version": "1.0.1",
     "description": "PenPard - AI-Powered Penetration Testing Assistant",
-    "author": "PenPard Team <thepenpard@gmail.com>",
-    "license": "GPL-3.0",
+    "author": "PenPard Team <info@penpard.com>",
+    "license": "PolyForm Noncommercial License 1.0.0",
     "homepage": "https://github.com/penpard/penpard",
     "repository": {
         "type": "git",
