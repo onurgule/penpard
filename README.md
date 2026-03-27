@@ -288,6 +288,16 @@ For full-site scans (no specific instructions), the agent follows the standard m
   <em>Burp Suite Proxy History — AI agent requests appear as "[PenPard] Agent Request" in the Notes column. You can see the exact payloads, responses, and parameters the AI is testing. Meanwhile, you can continue manual testing side-by-side — your requests and the AI's requests flow through the same proxy, giving you full visibility.</em>
 </p>
 
+### "Send to PenPard" Workflow (Focused Testing)
+
+PenPard allows you to send specific, raw HTTP requests directly from Burp Suite to the AI for highly targeted vulnerability analysis, without losing any session context or authorization headers.
+
+**How to use:**
+1. **In Burp Suite:** Right-click any HTTP request (in Proxy, Repeater, or Target tab) and select **"Send to PenPard"**.
+2. **In PenPard Dashboard:** A new *"Requests from Burp"* modal will instantly appear.
+3. **Configure & Start:** Click **"Start test"**. Here, you can define specific AI iterations and optionally provide the backend **Source Code** (via ZIP, Git, or Native Directory Picker) for deep Source-Aware analysis.
+4. **Execution:** The AI Orchestrator Agent will lock onto this exact HTTP request. It strictly preserves all your original headers, cookies, and tokens, performing deep parametric testing and business-logic fuzzing solely on the injection points you provided!
+
 ### Multi-Provider LLM Support
 - **OpenAI** (GPT-4o, GPT-4.1, GPT-5.1, o-series)
 - **Azure OpenAI** (enterprise deployments)
