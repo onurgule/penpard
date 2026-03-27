@@ -22,6 +22,34 @@ import {
 import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
+import SourceModeSelector, { SourceMode } from '@/components/SourceModeSelector';
+import SourceProviderInput, { SourceType } from '@/components/SourceProviderInput';
+import { FolderOpen } from 'lucide-react';
+
+const SOURCE_ANALYSIS_MODES: SourceMode[] = [
+    {
+        id: 'version_aware',
+        title: 'Version Aware',
+        description: [
+            'Lightweight source intelligence',
+            'Dependency/version/CVE-aware testing',
+            'Lower token cost',
+        ],
+        tokenCost: 'low',
+        icon: 'zap',
+    },
+    {
+        id: 'full_source_aware',
+        title: 'Full Source Aware',
+        description: [
+            'Deep code understanding',
+            'Function/endpoint/flow-aware testing',
+            'Higher token cost, richer analysis',
+        ],
+        tokenCost: 'high',
+        icon: 'brain',
+    },
+];
 
 const SCAN_OPTIONS_KEY = 'penpard-scan-options';
 
@@ -62,6 +90,12 @@ export default function WebScanPage() {
     const [iterations, setIterations] = useState(() => getDefaultScanOptions().iterations);
     const [maxPlanRounds, setMaxPlanRounds] = useState(() => getDefaultScanOptions().maxPlanRounds);
     const [userAccounts, setUserAccounts] = useState([{ username: '', password: '', role: 'user' }]);
+    const [sourcePackagePath, setSourcePackagePath] = useState('');
+    const [sourceAnalysisMode, setSourceAnalysisMode] = useState<string | null>(null);
+    const [sourceType, setSourceType] = useState<SourceType>('local');
+    const [zipFile, setZipFile] = useState<File | null>(null);
+    const [gitUrl, setGitUrl] = useState('');
+    const [gitToken, setGitToken] = useState('');
     const [reportModalOpen, setReportModalOpen] = useState(false);
     const [externalTools, setExternalTools] = useState({
         nuclei: false,
@@ -117,18 +151,35 @@ export default function WebScanPage() {
 
         try {
             // Start the scan
-            const payload = {
-                url: fullUrl,
-                rateLimit,
-                parallelAgents,
-                iterations,
-                maxPlanRounds,
-                useNuclei: externalTools.nuclei,
-                useFfuf: externalTools.ffuf,
-                idorUsers: userAccounts.filter(u => u.username && u.password),
-                scanInstructions: scanInstructions.trim() || undefined,
-                sessionCookies: sessionCookies.trim() || undefined,
-            };
+            const formData = new FormData();
+            formData.append('url', fullUrl);
+            formData.append('rateLimit', String(rateLimit));
+            formData.append('parallelAgents', String(parallelAgents));
+            formData.append('iterations', String(iterations));
+            formData.append('maxPlanRounds', String(maxPlanRounds));
+            formData.append('useNuclei', String(externalTools.nuclei));
+            formData.append('useFfuf', String(externalTools.ffuf));
+            formData.append('idorUsers', JSON.stringify(userAccounts.filter(u => u.username && u.password)));
+            if (scanInstructions.trim()) formData.append('scanInstructions', scanInstructions.trim());
+            if (sessionCookies.trim()) formData.append('sessionCookies', sessionCookies.trim());
+
+            const wantsSource = (sourceType === 'local' && sourcePackagePath.trim()) || 
+                                (sourceType === 'zip' && zipFile) || 
+                                (sourceType === 'git' && gitUrl.trim());
+
+            if (wantsSource && sourceAnalysisMode) {
+                formData.append('sourceAnalysisMode', sourceAnalysisMode);
+                formData.append('sourceType', sourceType);
+                if (sourceType === 'local') {
+                    formData.append('sourcePackagePath', sourcePackagePath.trim());
+                } else if (sourceType === 'zip' && zipFile) {
+                    formData.append('sourceZip', zipFile);
+                } else if (sourceType === 'git') {
+                    formData.append('sourceGitUrl', gitUrl.trim());
+                    if (gitToken.trim()) formData.append('sourceGitToken', gitToken.trim());
+                }
+            }
+
             if (typeof window !== 'undefined') {
                 try {
                     localStorage.setItem(SCAN_OPTIONS_KEY, JSON.stringify({
@@ -139,8 +190,11 @@ export default function WebScanPage() {
                     }));
                 } catch { /* ignore */ }
             }
-            const response = await axios.post(`${API_URL}/scans/web`, payload, {
-                headers: { Authorization: `Bearer ${useAuthStore.getState().token}` }
+            const response = await axios.post(`${API_URL}/scans/web`, formData, {
+                headers: { 
+                    Authorization: `Bearer ${useAuthStore.getState().token}`,
+                    'Content-Type': 'multipart/form-data'
+                }
             });
 
             const { scanId } = response.data;
@@ -589,6 +643,50 @@ export default function WebScanPage() {
                                     <span className="text-white">FFUF Fuzzing</span>
                                 </label>
                             </div>
+                        </div>
+
+                        {/* Source Package / Source Analysis */}
+                        <div className="border-t border-dark-600 pt-6">
+                            <h4 className="text-white font-medium mb-4 flex items-center gap-2">
+                                <FolderOpen className="w-4 h-4 text-cyan-400" />
+                                Source-Aware Scanning
+                                <span className="text-gray-600 text-xs font-normal">(optional)</span>
+                            </h4>
+
+                            <div className="mb-4">
+                                <SourceProviderInput
+                                    sourceType={sourceType} setSourceType={setSourceType}
+                                    localPath={sourcePackagePath} setLocalPath={(val) => {
+                                        setSourcePackagePath(val);
+                                        if (!val.trim() && sourceType === 'local') setSourceAnalysisMode(null);
+                                    }}
+                                    zipFile={zipFile} setZipFile={(val) => {
+                                        setZipFile(val);
+                                        if (!val && sourceType === 'zip') setSourceAnalysisMode(null);
+                                    }}
+                                    gitUrl={gitUrl} setGitUrl={(val) => {
+                                        setGitUrl(val);
+                                        if (!val.trim() && sourceType === 'git') setSourceAnalysisMode(null);
+                                    }}
+                                    gitToken={gitToken} setGitToken={setGitToken}
+                                    disabled={isScanning}
+                                />
+                            </div>
+
+                            {((sourceType === 'local' && sourcePackagePath.trim()) || (sourceType === 'zip' && zipFile) || (sourceType === 'git' && gitUrl.trim())) && (
+                                <motion.div
+                                    initial={{ opacity: 0, height: 0 }}
+                                    animate={{ opacity: 1, height: 'auto' }}
+                                    transition={{ duration: 0.2 }}
+                                >
+                                    <SourceModeSelector
+                                        modes={SOURCE_ANALYSIS_MODES}
+                                        selected={sourceAnalysisMode}
+                                        onSelect={setSourceAnalysisMode}
+                                        disabled={isScanning}
+                                    />
+                                </motion.div>
+                            )}
                         </div>
                     </motion.div>
                 )}

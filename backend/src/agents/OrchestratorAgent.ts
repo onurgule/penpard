@@ -18,6 +18,8 @@ import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import fs from 'fs';
 import { mindsetService, MindsetTTP } from '../services/mindset-service';
+import { analyzeSource, buildAgentContextBlock } from '../services/source-analysis/SourceAnalysisService';
+import { SourceAnalysisMode } from '../services/source-analysis/SourceAnalysisMode';
 
 type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
 
@@ -37,6 +39,10 @@ interface ScanConfig {
     initialRequest?: string;
     /** Enable mindset library — load learned TTPs from past report analyses into planning. Default true. */
     useMindsetLibrary?: boolean;
+    /** Path to selected source package/project for source-aware scanning. */
+    sourcePackagePath?: string;
+    /** Source analysis mode: 'version_aware' or 'full_source_aware'. */
+    sourceAnalysisMode?: string;
 }
 
 interface ToolCall {
@@ -897,6 +903,24 @@ Proceed with testing.`
             }
         }
 
+        // Run source analysis if configured
+        let sourceContextBlock = '';
+        if (this.config.sourcePackagePath && this.config.sourceAnalysisMode) {
+            try {
+                const mode = this.config.sourceAnalysisMode as SourceAnalysisMode;
+                this.log('system', `🔬 Source Analysis: Running ${mode} analysis on ${this.config.sourcePackagePath}...`);
+                const sourceResult = await analyzeSource(this.scanId, this.config.sourcePackagePath, mode);
+                sourceContextBlock = buildAgentContextBlock(sourceResult);
+                this.log('system', `✓ Source Analysis complete: ${sourceResult.framework}, ${sourceResult.dependencies.length} deps, ${sourceResult.cves.length} CVEs`);
+                if (mode === SourceAnalysisMode.FULL_SOURCE_AWARE) {
+                    const full = sourceResult as any;
+                    this.log('system', `  Modules: ${full.modules?.length || 0}, Functions: ${full.functions?.length || 0}, Endpoints: ${full.endpoints?.length || 0}, Security Flows: ${full.securityFlows?.length || 0}`);
+                }
+            } catch (e: any) {
+                this.log('error', `Source analysis failed: ${e.message} — continuing without source context`);
+            }
+        }
+
         // Resolve session cookies and auth for authenticated testing (from operator input or proxy history, newest to oldest)
         let sessionCookieHeader = '';
         let sessionAuthHeader = '';
@@ -955,6 +979,10 @@ Proceed with testing.`
             systemPrompt = basePrompt;
         }
         systemPrompt += sessionCookiesBlock;
+
+        if (sourceContextBlock) {
+            systemPrompt += sourceContextBlock;
+        }
 
         if (this.config.initialRequest?.trim()) {
             const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());

@@ -227,6 +227,7 @@ With token usage tracking built in, you always know exactly what you're spending
 
 ### AI-Powered Scanning
 - **Orchestrator Agent** — LLM-driven scan lifecycle: reconnaissance, planning, testing, reporting
+- **Source-Aware Scanning (New in v1.1.0)** — Upload full codebase context (2GB+ ZIP, Git Repo with Private Tokens, or Native Local Directory Picker for Win/Mac/Linux). Includes `VersionAware` and `FullSourceAware` AI engines that analyze the app's backend source code to find hidden endpoints and vulnerabilities. Extends to Burp Suite requests and generates Docx/PPTX reports enriched with exact code evidence.
 - **Agent Pool** — Parallel scanning with specialized workers (crawler, scanner, fuzzer, analyzer)
 - **Recheck Agent** — Validates findings with additional payloads to reduce false positives
 - **Smart Assist** — Detects your manual testing patterns and offers to help automatically

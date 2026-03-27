@@ -13,6 +13,8 @@ import {
 import fs from 'fs';
 import path from 'path';
 import { logger } from '../utils/logger';
+import { SourceAnalysisResult } from './source-analysis/SourceAnalysisMode';
+import { buildSourceReportSections } from './source-analysis/SourceReportEnricher';
 
 const REPORTS_DIR = path.join(__dirname, '../../reports');
 
@@ -71,6 +73,7 @@ function calcDuration(start: string, end: string): string {
 interface DocxOptions {
     llmEnhanced?: boolean;
     enhancedDescriptions?: Map<number, string>;
+    sourceAnalysis?: SourceAnalysisResult | null;
 }
 
 export async function generateDocxReport(
@@ -256,8 +259,11 @@ export async function generateDocxReport(
                     new Paragraph({ spacing: { after: 200 } }),
                     ...createRemediationPriority(sorted),
 
+                    // ── Source Intelligence (conditional) ──
+                    ...createSourceIntelligenceSection(options.sourceAnalysis),
+
                     // ── Disclaimer ──
-                    new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun({ text: '6. Disclaimer', bold: true })] }),
+                    new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun({ text: `${options.sourceAnalysis ? '7' : '6'}. Disclaimer`, bold: true })] }),
                     new Paragraph({ spacing: { after: 200 } }),
                     new Paragraph({
                         children: [new TextRun({
@@ -479,6 +485,78 @@ function createRemediationPriority(vulns: Vulnerability[]): Paragraph[] {
                 ],
             }));
         }
+        parts.push(new Paragraph({ spacing: { after: 200 } }));
+    }
+
+    return parts;
+}
+
+function createSourceIntelligenceSection(sourceAnalysis?: SourceAnalysisResult | null): (Paragraph | Table)[] {
+    if (!sourceAnalysis) return [];
+
+    const sections = buildSourceReportSections(sourceAnalysis);
+    const parts: (Paragraph | Table)[] = [];
+    const sectionNum = '6';
+
+    parts.push(new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        children: [new TextRun({ text: `${sectionNum}. ${sections.title}`, bold: true })],
+    }));
+    parts.push(new Paragraph({ spacing: { after: 200 } }));
+
+    for (const sub of sections.subsections) {
+        parts.push(new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: sub.heading, bold: true, color: '00B5D4' })],
+        }));
+
+        if (sub.paragraphs) {
+            for (const para of sub.paragraphs) {
+                parts.push(new Paragraph({
+                    children: [new TextRun({ text: para, size: 20 })],
+                }));
+            }
+        }
+
+        if (sub.table) {
+            const tableRows: TableRow[] = [
+                new TableRow({
+                    tableHeader: true,
+                    children: sub.table.headers.map(h =>
+                        new TableCell({
+                            shading: { type: ShadingType.SOLID, color: '00B5D4' },
+                            children: [new Paragraph({
+                                children: [new TextRun({ text: h, bold: true, color: 'FFFFFF', size: 18, font: 'Calibri' })],
+                            })],
+                        })
+                    ),
+                }),
+                ...sub.table.rows.slice(0, 40).map((row, ri) =>
+                    new TableRow({
+                        children: row.map(cell =>
+                            new TableCell({
+                                shading: ri % 2 === 0 ? { type: ShadingType.SOLID, color: 'F8F8FA' } : undefined,
+                                children: [new Paragraph({
+                                    children: [new TextRun({ text: (cell || '-').slice(0, 80), size: 16, font: 'Calibri' })],
+                                })],
+                            })
+                        ),
+                    })
+                ),
+            ];
+
+            parts.push(new Table({
+                width: { size: 100, type: WidthType.PERCENTAGE },
+                rows: tableRows,
+            }));
+
+            if (sub.table.rows.length > 40) {
+                parts.push(new Paragraph({
+                    children: [new TextRun({ text: `... and ${sub.table.rows.length - 40} more rows`, size: 18, color: '888888', italics: true })],
+                }));
+            }
+        }
+
         parts.push(new Paragraph({ spacing: { after: 200 } }));
     }
 

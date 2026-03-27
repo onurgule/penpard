@@ -1,8 +1,8 @@
 {
   "name": "penpard-frontend",
-  "version": "1.0.0",
-    "license": "PolyForm Noncommercial License 1.0.0",
-    "private": true,
+  "version": "1.1.0",
+  "license": "PolyForm Noncommercial License 1.0.0",
+  "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",

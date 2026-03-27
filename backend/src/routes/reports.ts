@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
-import { db, getScan, getVulnerabilitiesByScan } from '../db/init';
+import { db, getScan, getVulnerabilitiesByScan, getSourceAnalysisResult } from '../db/init';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
 import { logger } from '../utils/logger';
 import { generatePdfReport } from '../services/report';
@@ -75,7 +75,8 @@ router.get('/:scanId', authenticateToken, async (req: AuthRequest, res: Response
         }
 
         const vulnerabilities = getVulnerabilitiesByScan(scanId);
-        const reportPath = await generatePdfReport(scan, vulnerabilities);
+        const sourceAnalysis = getSourceAnalysisResult(scanId);
+        const reportPath = await generatePdfReport(scan, vulnerabilities, sourceAnalysis);
 
         // Save report record
         db.prepare(`
@@ -128,6 +129,7 @@ router.get('/:scanId/download', authenticateToken, async (req: AuthRequest, res:
         }
 
         const vulnerabilities = getVulnerabilitiesByScan(scanId);
+        const sourceAnalysis = getSourceAnalysisResult(scanId);
 
         // ── LLM Enhancement (if mode === 'llm') ──
         let enhancedDescriptions: Map<number, string> | undefined;
@@ -162,6 +164,7 @@ router.get('/:scanId/download', authenticateToken, async (req: AuthRequest, res:
                 reportPath = await generateDocxReport(scan, vulnerabilities, {
                     llmEnhanced: mode === 'llm',
                     enhancedDescriptions,
+                    sourceAnalysis,
                 });
                 filename = `PenPard-Report-${scanId}.docx`;
                 contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -171,6 +174,7 @@ router.get('/:scanId/download', authenticateToken, async (req: AuthRequest, res:
                 reportPath = await generatePptxReport(scan, vulnerabilities, {
                     llmEnhanced: mode === 'llm',
                     enhancedDescriptions,
+                    sourceAnalysis,
                 });
                 filename = `PenPard-Report-${scanId}.pptx`;
                 contentType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
@@ -187,7 +191,7 @@ router.get('/:scanId/download', authenticateToken, async (req: AuthRequest, res:
                     }
                 }
 
-                reportPath = await generatePdfReport(scan, vulnerabilities);
+                reportPath = await generatePdfReport(scan, vulnerabilities, sourceAnalysis);
                 filename = `PenPard-Report-${scanId}.pdf`;
                 contentType = 'application/pdf';
 

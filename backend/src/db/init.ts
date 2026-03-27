@@ -382,6 +382,20 @@ export async function initDatabase(): Promise<void> {
     logger.info('Added scans.initial_request column');
   }
 
+  // Migration: source analysis columns
+  if (!scanCols.some((c) => c.name === 'source_package_path')) {
+    db.exec('ALTER TABLE scans ADD COLUMN source_package_path TEXT');
+    logger.info('Added scans.source_package_path column');
+  }
+  if (!scanCols.some((c) => c.name === 'source_analysis_mode')) {
+    db.exec('ALTER TABLE scans ADD COLUMN source_analysis_mode TEXT');
+    logger.info('Added scans.source_analysis_mode column');
+  }
+  if (!scanCols.some((c) => c.name === 'source_analysis_result_json')) {
+    db.exec('ALTER TABLE scans ADD COLUMN source_analysis_result_json TEXT');
+    logger.info('Added scans.source_analysis_result_json column');
+  }
+
   logger.info('Database initialized successfully');
 }
 
@@ -398,11 +412,14 @@ export const getUserWhitelists = (userId: number) => {
   return db.prepare('SELECT * FROM whitelists WHERE user_id = ?').all(userId) as any[];
 };
 
-export const createScan = (data: { id: string; userId: number; type: string; target: string }) => {
+export const createScan = (data: {
+  id: string; userId: number; type: string; target: string;
+  sourcePackagePath?: string; sourceAnalysisMode?: string;
+}) => {
   return db.prepare(`
-    INSERT INTO scans (id, user_id, type, target, status)
-    VALUES (?, ?, ?, ?, 'queued')
-  `).run(data.id, data.userId, data.type, data.target);
+    INSERT INTO scans (id, user_id, type, target, status, source_package_path, source_analysis_mode)
+    VALUES (?, ?, ?, ?, 'queued', ?, ?)
+  `).run(data.id, data.userId, data.type, data.target, data.sourcePackagePath ?? null, data.sourceAnalysisMode ?? null);
 };
 
 export const getScan = (id: string) => {
@@ -421,6 +438,16 @@ export const updateScanStatus = (id: string, status: string, errorMessage?: stri
 
 export const setScanInitialRequest = (scanId: string, rawRequest: string | null) => {
   return db.prepare('UPDATE scans SET initial_request = ? WHERE id = ?').run(rawRequest ?? null, scanId);
+};
+
+export const saveSourceAnalysisResult = (scanId: string, resultJson: string) => {
+  return db.prepare('UPDATE scans SET source_analysis_result_json = ? WHERE id = ?').run(resultJson, scanId);
+};
+
+export const getSourceAnalysisResult = (scanId: string): any | null => {
+  const row = db.prepare('SELECT source_analysis_result_json FROM scans WHERE id = ?').get(scanId) as any;
+  if (!row?.source_analysis_result_json) return null;
+  try { return JSON.parse(row.source_analysis_result_json); } catch { return null; }
 };
 
 /** Permanently delete scans by id; only deletes rows where user_id matches (CASCADE removes related data). */

@@ -18,6 +18,34 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
+import SourceProviderInput, { SourceType } from '@/components/SourceProviderInput';
+import SourceModeSelector, { SourceMode } from '@/components/SourceModeSelector';
+import { FolderOpen } from 'lucide-react';
+
+const SOURCE_ANALYSIS_MODES: SourceMode[] = [
+    {
+        id: 'version_aware',
+        title: 'Version Aware',
+        description: [
+            'Lightweight source intelligence',
+            'Dependency/version/CVE-aware testing',
+            'Lower token cost',
+        ],
+        tokenCost: 'low',
+        icon: 'zap',
+    },
+    {
+        id: 'full_source_aware',
+        title: 'Full Source Aware',
+        description: [
+            'Deep code understanding',
+            'Function/endpoint/flow-aware testing',
+            'Higher token cost, richer analysis',
+        ],
+        tokenCost: 'high',
+        icon: 'brain',
+    },
+];
 
 const SCAN_OPTIONS_KEY = 'penpard-scan-options';
 
@@ -58,6 +86,14 @@ export default function DashboardPage() {
         rateLimit: 5,
         maxPlanRounds: 0,
     });
+    
+    // Source analysis states for burp requests
+    const [sourceAnalysisMode, setSourceAnalysisMode] = useState<string | null>(null);
+    const [sourceType, setSourceType] = useState<SourceType>('local');
+    const [sourcePackagePath, setSourcePackagePath] = useState('');
+    const [zipFile, setZipFile] = useState<File | null>(null);
+    const [gitUrl, setGitUrl] = useState('');
+    const [gitToken, setGitToken] = useState('');
 
     useEffect(() => {
         if (!isAuthenticated) {
@@ -137,16 +173,34 @@ export default function DashboardPage() {
         const { pendingId } = burpStartModal;
         setStartingPendingId(pendingId);
         try {
+            const formData = new FormData();
+            formData.append('pendingId', pendingId);
+            formData.append('iterations', String(burpOptions.iterations));
+            formData.append('parallelAgents', String(burpOptions.parallelAgents));
+            formData.append('rateLimit', String(burpOptions.rateLimit));
+            formData.append('maxPlanRounds', String(burpOptions.maxPlanRounds));
+
+            const wantsSource = (sourceType === 'local' && sourcePackagePath.trim()) || 
+                                (sourceType === 'zip' && zipFile) || 
+                                (sourceType === 'git' && gitUrl.trim());
+
+            if (wantsSource && sourceAnalysisMode) {
+                formData.append('sourceAnalysisMode', sourceAnalysisMode);
+                formData.append('sourceType', sourceType);
+                if (sourceType === 'local') {
+                    formData.append('sourcePackagePath', sourcePackagePath.trim());
+                } else if (sourceType === 'zip' && zipFile) {
+                    formData.append('sourceZip', zipFile);
+                } else if (sourceType === 'git') {
+                    formData.append('sourceGitUrl', gitUrl.trim());
+                    if (gitToken.trim()) formData.append('sourceGitToken', gitToken.trim());
+                }
+            }
+
             const res = await fetch(`${API_URL}/scans/from-burp`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                body: JSON.stringify({
-                    pendingId,
-                    iterations: burpOptions.iterations,
-                    parallelAgents: burpOptions.parallelAgents,
-                    rateLimit: burpOptions.rateLimit,
-                    maxPlanRounds: burpOptions.maxPlanRounds,
-                }),
+                headers: { 'Authorization': `Bearer ${token}` }, // FormData sets boundary automagically
+                body: formData,
             });
             const data = await res.json();
             if (data.scanId) {
@@ -258,7 +312,7 @@ export default function DashboardPage() {
                             initial={{ opacity: 0, scale: 0.95 }}
                             animate={{ opacity: 1, scale: 1 }}
                             onClick={(e) => e.stopPropagation()}
-                            className="card p-6 w-full max-w-md border border-cyan-500/30"
+                            className="card p-6 w-full max-w-2xl border border-cyan-500/30 max-h-[90vh] overflow-y-auto"
                         >
                             <h3 className="text-lg font-bold text-white mb-1">Scan options</h3>
                             <p className="text-gray-400 font-mono text-sm truncate mb-4" title={burpStartModal.url}>{burpStartModal.url}</p>
@@ -314,6 +368,44 @@ export default function DashboardPage() {
                                     <p className="text-gray-500 text-xs mt-1">0 = default (model decides when to finish)</p>
                                 </div>
                             </div>
+
+                            {/* Source Aware Additions */}
+                            <div className="border-t border-dark-600/50 pt-4 mt-2 mb-6">
+                                <h4 className="text-white font-medium mb-3 flex items-center gap-2 text-sm">
+                                    <FolderOpen className="w-4 h-4 text-cyan-400" />
+                                    Source-Aware Scanning <span className="text-gray-600 font-normal">(optional)</span>
+                                </h4>
+                                <div className="mb-3">
+                                    <SourceProviderInput
+                                        sourceType={sourceType} setSourceType={setSourceType}
+                                        localPath={sourcePackagePath} setLocalPath={(val) => {
+                                            setSourcePackagePath(val);
+                                            if (!val.trim() && sourceType === 'local') setSourceAnalysisMode(null);
+                                        }}
+                                        zipFile={zipFile} setZipFile={(val) => {
+                                            setZipFile(val);
+                                            if (!val && sourceType === 'zip') setSourceAnalysisMode(null);
+                                        }}
+                                        gitUrl={gitUrl} setGitUrl={(val) => {
+                                            setGitUrl(val);
+                                            if (!val.trim() && sourceType === 'git') setSourceAnalysisMode(null);
+                                        }}
+                                        gitToken={gitToken} setGitToken={setGitToken}
+                                        disabled={!!startingPendingId}
+                                    />
+                                </div>
+                                {((sourceType === 'local' && sourcePackagePath.trim()) || (sourceType === 'zip' && zipFile) || (sourceType === 'git' && gitUrl.trim())) && (
+                                    <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }}>
+                                        <SourceModeSelector
+                                            modes={SOURCE_ANALYSIS_MODES}
+                                            selected={sourceAnalysisMode}
+                                            onSelect={setSourceAnalysisMode}
+                                            disabled={!!startingPendingId}
+                                        />
+                                    </motion.div>
+                                )}
+                            </div>
+
                             <div className="flex gap-3">
                                 <button
                                     type="button"

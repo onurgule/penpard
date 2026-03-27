@@ -27,6 +27,7 @@ import { AgentPool } from '../agents/AgentPool';
 import { llmProvider } from '../services/LLMProviderService';
 import { activityMonitor } from '../services/ActivityMonitorService';
 import { takePendingRequest } from './penpard';
+import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
 
 export const activeAgents = new Map<string, OrchestratorAgent>();
 export const activePools = new Map<string, AgentPool>();
@@ -53,13 +54,13 @@ const storage = multer.diskStorage({
 const upload = multer({
     storage,
     fileFilter: (req, file, cb) => {
-        if (file.originalname.endsWith('.apk')) {
+        const name = file.originalname.toLowerCase();
+        if (name.endsWith('.apk') || name.endsWith('.zip')) {
             cb(null, true);
         } else {
-            cb(new Error('Only APK files allowed'));
+            cb(new Error('Only APK and ZIP files are allowed'));
         }
-    },
-    limits: { fileSize: 100 * 1024 * 1024 }, // 100MB max
+    }
 });
 
 // Get dashboard stats (Must be defined before /:id)
@@ -143,10 +144,26 @@ router.post('/delete', authenticateToken, (req: AuthRequest, res: Response) => {
 });
 
 // Initiate web scan
-router.post('/web', authenticateToken, async (req: AuthRequest, res: Response) => {
+router.get('/system/select-directory', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
-        const { url, rateLimit, useNuclei, useFfuf, idorUsers, parallelAgents, scanInstructions, sessionCookies, iterations, maxPlanRounds: reqMaxPlanRounds } = req.body;
+        const path = await selectLocalDirectory();
+        res.json({ path });
+    } catch (error: any) {
+        logger.error('Failed to open directory picker', { error: error.message });
+        res.status(500).json({ error: true, message: error.message || 'Failed to open directory picker on the server' });
+    }
+});
+
+router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: AuthRequest, res: Response) => {
+    try {
+        let { url, rateLimit, useNuclei, useFfuf, idorUsers, parallelAgents, scanInstructions, sessionCookies, iterations, maxPlanRounds: reqMaxPlanRounds, sourcePackagePath, sourceAnalysisMode, sourceType, sourceGitUrl, sourceGitToken } = req.body;
         const user = req.user!;
+
+        if (typeof idorUsers === 'string') {
+            try { idorUsers = JSON.parse(idorUsers); } catch { idorUsers = []; }
+        }
+        useNuclei = useNuclei === 'true' || useNuclei === true;
+        useFfuf = useFfuf === 'true' || useFfuf === true;
 
         if (!url) {
             res.status(400).json({ error: true, message: 'URL is required' });
@@ -172,13 +189,40 @@ router.post('/web', authenticateToken, async (req: AuthRequest, res: Response) =
             return;
         }
 
+        // Validate source analysis mode if provided
+        const validModes = ['version_aware', 'full_source_aware'];
+        const resolvedSourceMode = sourceAnalysisMode && validModes.includes(sourceAnalysisMode) ? sourceAnalysisMode : undefined;
+
         // Create scan record
         const scanId = uuidv4();
+        
+        let finalSourcePath: string | undefined = undefined;
+        try {
+            if (sourceType === 'zip' && req.file) {
+                const destDir = path.join(uploadsDir, 'source-zips', scanId);
+                logger.info(`Extracting ZIP source to ${destDir}`);
+                finalSourcePath = await extractZipArchive(req.file.path, destDir);
+                try { fs.unlinkSync(req.file.path); } catch { }
+            } else if (sourceType === 'git' && sourceGitUrl) {
+                const destDir = path.join(uploadsDir, 'source-repos', scanId);
+                logger.info(`Cloning Git source to ${destDir}`);
+                finalSourcePath = await cloneGitRepository(sourceGitUrl, sourceGitToken, destDir);
+            } else if ((!sourceType || sourceType === 'local') && sourcePackagePath) {
+                finalSourcePath = String(sourcePackagePath).trim();
+            }
+        } catch (sourceErr: any) {
+            logger.warn(`Failed to process source code input: ${sourceErr.message}`);
+            res.status(400).json({ error: true, message: `Source code processing failed: ${sourceErr.message}` });
+            return;
+        }
+
         createScan({
             id: scanId,
             userId: user.id,
             type: 'web',
             target: targetUrl,
+            sourcePackagePath: finalSourcePath,
+            sourceAnalysisMode: resolvedSourceMode,
         });
 
         logApiUsage('/api/scans/web', user.id, { target: targetUrl });
@@ -192,11 +236,13 @@ router.post('/web', authenticateToken, async (req: AuthRequest, res: Response) =
             useNuclei: !!useNuclei,
             useFfuf: !!useFfuf,
             idorUsers: idorUsers || [],
-            parallelAgents: Number(parallelAgents) || 1, // 1 = single agent, >1 = multi-agent pool
+            parallelAgents: Number(parallelAgents) || 1,
             maxIterations,
             maxPlanRounds,
             customSystemPrompt: scanInstructions || undefined,
             sessionCookies: typeof sessionCookies === 'string' ? sessionCookies.trim() || undefined : undefined,
+            sourcePackagePath: finalSourcePath,
+            sourceAnalysisMode: resolvedSourceMode,
         };
 
         // Start scan asynchronously
@@ -254,15 +300,16 @@ router.post('/mobile', authenticateToken, upload.single('apk'), async (req: Auth
 });
 
 // Start scan from Burp "Send to PenPard" (pending request)
-router.post('/from-burp', authenticateToken, async (req: AuthRequest, res: Response) => {
+router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (req: AuthRequest, res: Response) => {
     try {
-        const {
+        let {
             pendingId,
             scanInstructions,
             iterations,
             rateLimit: reqRateLimit,
             parallelAgents: reqParallelAgents,
             maxPlanRounds: reqMaxPlanRounds,
+            sourceType, sourcePackagePath, sourceAnalysisMode, sourceGitUrl, sourceGitToken
         } = req.body;
         const user = req.user!;
         if (!pendingId) {
@@ -285,12 +332,37 @@ router.post('/from-burp', authenticateToken, async (req: AuthRequest, res: Respo
                 message: 'Target URL not in your whitelist. Contact admin.'
             });
         }
+        const validModes = ['version_aware', 'full_source_aware'];
+        const resolvedSourceMode = sourceAnalysisMode && validModes.includes(sourceAnalysisMode) ? sourceAnalysisMode : undefined;
+
         const scanId = uuidv4();
+        
+        let finalSourcePath: string | undefined = undefined;
+        try {
+            if (sourceType === 'zip' && req.file) {
+                const destDir = path.join(uploadsDir, 'source-zips', scanId);
+                logger.info(`Extracting ZIP source to ${destDir}`);
+                finalSourcePath = await extractZipArchive(req.file.path, destDir);
+                try { fs.unlinkSync(req.file.path); } catch { }
+            } else if (sourceType === 'git' && sourceGitUrl) {
+                const destDir = path.join(uploadsDir, 'source-repos', scanId);
+                logger.info(`Cloning Git source to ${destDir}`);
+                finalSourcePath = await cloneGitRepository(sourceGitUrl, sourceGitToken, destDir);
+            } else if ((!sourceType || sourceType === 'local') && sourcePackagePath) {
+                finalSourcePath = String(sourcePackagePath).trim();
+            }
+        } catch (sourceErr: any) {
+            logger.warn(`Failed to process source code input: ${sourceErr.message}`);
+            return res.status(400).json({ error: true, message: `Source code processing failed: ${sourceErr.message}` });
+        }
+
         createScan({
             id: scanId,
             userId: user.id,
             type: 'web',
             target: targetUrl,
+            sourcePackagePath: finalSourcePath,
+            sourceAnalysisMode: resolvedSourceMode,
         });
         setScanInitialRequest(scanId, entry.rawRequest);
         logApiUsage('/api/scans/from-burp', user.id, { target: targetUrl });
@@ -311,6 +383,8 @@ router.post('/from-burp', authenticateToken, async (req: AuthRequest, res: Respo
             customSystemPrompt: scanInstructions || undefined,
             sessionCookies: undefined as string | undefined,
             initialRequest: entry.rawRequest,
+            sourcePackagePath: finalSourcePath,
+            sourceAnalysisMode: resolvedSourceMode,
         };
         startWebScan(scanId, targetUrl, scanConfig).catch(err => {
             logger.error('From-Burp scan failed', { scanId, error: err.message });
@@ -354,6 +428,8 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
             createdAt: scan.created_at,
             completedAt: scan.completed_at,
             message: scan.error_message,
+            sourcePackagePath: scan.source_package_path || null,
+            sourceAnalysisMode: scan.source_analysis_mode || null,
             vulnerabilities: vulnerabilities.map(v => ({
                 id: v.id,
                 name: v.name,
@@ -1013,6 +1089,8 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
                     idorUsers: config.idorUsers || [],
                     sessionCookies: config.sessionCookies,
                     initialRequest: config.initialRequest,
+                    sourcePackagePath: config.sourcePackagePath,
+                    sourceAnalysisMode: config.sourceAnalysisMode,
                 };
 
                 const agent = new OrchestratorAgent(scanId, targetUrl, agentConfig, burpMCP);

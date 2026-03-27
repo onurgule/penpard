@@ -3,6 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import { logger } from '../utils/logger';
 import { llmProvider, GenerationRequest } from './LLMProviderService';
+import { SourceAnalysisResult } from './source-analysis/SourceAnalysisMode';
+import { buildSourceReportSections, ReportSection } from './source-analysis/SourceReportEnricher';
 
 const REPORTS_DIR = path.join(__dirname, '../../reports');
 const LOGOS_DIR = path.join(__dirname, '../../uploads/logos');
@@ -574,12 +576,14 @@ class ReportBuilder {
     private scan: Scan;
     private vulns: Vulnerability[];
     private annotations: Map<number, HighlightResult>;
+    private sourceAnalysis: SourceAnalysisResult | null;
 
-    constructor(doc: PDFDocument, scan: Scan, vulns: Vulnerability[], annotations?: Map<number, HighlightResult>) {
+    constructor(doc: PDFDocument, scan: Scan, vulns: Vulnerability[], annotations?: Map<number, HighlightResult>, sourceAnalysis?: SourceAnalysisResult | null) {
         this.doc = doc;
         this.scan = scan;
         this.vulns = vulns;
         this.annotations = annotations || new Map();
+        this.sourceAnalysis = sourceAnalysis || null;
     }
 
     async init() {
@@ -1190,15 +1194,21 @@ class ReportBuilder {
         this.drawSectionTitle('Table of Contents');
         this.gap(5);
 
-        const tocItems = [
+        const tocItems: string[][] = [
             ['1', 'Executive Summary'],
             ['2', 'Scope & Methodology'],
             ['3', 'Risk Overview'],
             ['4', 'Findings Summary'],
             ['5', 'Detailed Findings'],
             ['6', 'Remediation Priority'],
-            ['7', 'Disclaimer'],
         ];
+        if (this.sourceAnalysis) {
+            const sectionTitle = this.sourceAnalysis.mode === 'full_source_aware' ? 'Source-Aware Analysis' : 'Source Intelligence';
+            tocItems.push(['7', sectionTitle]);
+            tocItems.push(['8', 'Disclaimer']);
+        } else {
+            tocItems.push(['7', 'Disclaimer']);
+        }
 
         for (const [num, title] of tocItems) {
             this.page.drawText(`${num}.`, { x: MARGIN + 10, y: this.yPos, size: 12, font: this.fontBold, color: C.primary });
@@ -1607,11 +1617,78 @@ class ReportBuilder {
         }
     }
 
+    buildSourceIntelligence() {
+        if (!this.sourceAnalysis) return;
+
+        const sections = buildSourceReportSections(this.sourceAnalysis);
+
+        this.newPage();
+        this.drawPageHeader();
+        this.drawSectionTitle(`7. ${sections.title}`);
+
+        for (const sub of sections.subsections) {
+            this.ensureSpace(50);
+            this.drawSubsectionTitle(sub.heading);
+
+            if (sub.paragraphs) {
+                for (const para of sub.paragraphs) {
+                    this.ensureSpace(16);
+                    this.drawWrapped(para, { size: 9, lineHeight: 13, maxChars: 90, maxLines: 6 });
+                    this.gap(4);
+                }
+            }
+
+            if (sub.table) {
+                this.gap(4);
+                const { headers, rows } = sub.table;
+                const colCount = headers.length;
+                const colW = Math.floor((PAGE_W - MARGIN * 2) / colCount);
+
+                this.ensureSpace(20);
+                for (let ci = 0; ci < colCount; ci++) {
+                    this.page.drawText(truncate(headers[ci], Math.floor(colW / 5.5)), {
+                        x: MARGIN + ci * colW,
+                        y: this.yPos,
+                        size: 8,
+                        font: this.fontBold,
+                        color: C.primary,
+                    });
+                }
+                this.yPos -= 14;
+                this.drawLine({ color: C.primary });
+                this.gap(4);
+
+                for (const row of rows.slice(0, 25)) {
+                    this.ensureSpace(14);
+                    for (let ci = 0; ci < colCount && ci < row.length; ci++) {
+                        this.page.drawText(truncate(row[ci] || '-', Math.floor(colW / 5.5)), {
+                            x: MARGIN + ci * colW,
+                            y: this.yPos,
+                            size: 7,
+                            font: this.fontRegular,
+                            color: C.text,
+                        });
+                    }
+                    this.yPos -= 12;
+                }
+
+                if (rows.length > 25) {
+                    this.ensureSpace(14);
+                    this.drawWrapped(`... and ${rows.length - 25} more rows`, { size: 7, color: C.textMuted });
+                }
+                this.gap(8);
+            }
+
+            this.gap(6);
+        }
+    }
+
     buildDisclaimer() {
         this.newPage();
         this.drawPageHeader();
 
-        this.drawSectionTitle('7. Disclaimer');
+        const sectionNum = this.sourceAnalysis ? '8' : '7';
+        this.drawSectionTitle(`${sectionNum}. Disclaimer`);
         this.gap(5);
 
         const disclaimerParagraphs = [
@@ -1652,6 +1729,7 @@ class ReportBuilder {
         this.buildFindingsSummary();
         await this.buildDetailedFindings();
         this.buildRemediationPriority();
+        this.buildSourceIntelligence();
         this.buildDisclaimer();
 
         // Add page numbers to all pages (after all pages are created)
@@ -1667,7 +1745,8 @@ class ReportBuilder {
 
 export async function generatePdfReport(
     scan: Scan,
-    vulnerabilities: Vulnerability[]
+    vulnerabilities: Vulnerability[],
+    sourceAnalysis?: SourceAnalysisResult | null,
 ): Promise<string> {
     logger.info('Generating PDF report', { scanId: scan.id, vulnCount: vulnerabilities.length });
 
@@ -1692,7 +1771,7 @@ export async function generatePdfReport(
     pdfDoc.setProducer('PenPard Report Engine');
     pdfDoc.setCreationDate(new Date());
 
-    const builder = new ReportBuilder(pdfDoc, scan, vulnerabilities, annotations);
+    const builder = new ReportBuilder(pdfDoc, scan, vulnerabilities, annotations, sourceAnalysis);
     const pdfBytes = await builder.build();
 
     const reportPath = path.join(REPORTS_DIR, `report-${scan.id}.pdf`);

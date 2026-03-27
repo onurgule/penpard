@@ -8,6 +8,8 @@ import PptxGenJS from 'pptxgenjs';
 import fs from 'fs';
 import path from 'path';
 import { logger } from '../utils/logger';
+import { SourceAnalysisResult } from './source-analysis/SourceAnalysisMode';
+import { buildSourceReportSections } from './source-analysis/SourceReportEnricher';
 
 const REPORTS_DIR = path.join(__dirname, '../../reports');
 
@@ -76,6 +78,7 @@ function calcDuration(start: string, end: string): string {
 interface PptxOptions {
     llmEnhanced?: boolean;
     enhancedDescriptions?: Map<number, string>;
+    sourceAnalysis?: SourceAnalysisResult | null;
 }
 
 export async function generatePptxReport(
@@ -418,6 +421,65 @@ export async function generatePptxReport(
             py += 0.3;
         }
         py += 0.15;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  SOURCE INTELLIGENCE SLIDES
+    // ═══════════════════════════════════════════════════════
+    if (options.sourceAnalysis) {
+        const sections = buildSourceReportSections(options.sourceAnalysis);
+
+        const siSlide = pptx.addSlide();
+        siSlide.background = { color: COLORS.bg };
+        addSlideHeader(siSlide, sections.title);
+
+        let yOffset = 1.4;
+        for (const sub of sections.subsections.slice(0, 6)) {
+            if (yOffset > 6.2) {
+                const nextSlide = pptx.addSlide();
+                nextSlide.background = { color: COLORS.bg };
+                addSlideHeader(nextSlide, `${sections.title} (cont.)`);
+                yOffset = 1.4;
+            }
+
+            siSlide.addText(sub.heading, {
+                x: 0.5, y: yOffset, w: 12, h: 0.35,
+                fontSize: 14, bold: true, color: COLORS.primary, fontFace: 'Calibri',
+            });
+            yOffset += 0.4;
+
+            if (sub.paragraphs) {
+                const text = sub.paragraphs.slice(0, 4).join('\n');
+                siSlide.addText(text.slice(0, 400), {
+                    x: 0.5, y: yOffset, w: 12, h: 0.6,
+                    fontSize: 10, color: COLORS.textLight, fontFace: 'Calibri', valign: 'top',
+                });
+                yOffset += 0.7;
+            }
+
+            if (sub.table && sub.table.rows.length > 0) {
+                const tableRows = [
+                    sub.table.headers.map(h => ({
+                        text: h, options: { bold: true, fontSize: 8, color: 'FFFFFF', fill: { color: COLORS.primary } },
+                    })),
+                    ...sub.table.rows.slice(0, 8).map((row, ri) =>
+                        row.map(cell => ({
+                            text: (cell || '-').slice(0, 30),
+                            options: { fontSize: 7, color: COLORS.white, fill: { color: ri % 2 === 0 ? COLORS.bgAlt : COLORS.bg } },
+                        }))
+                    ),
+                ];
+
+                const colW = 12 / sub.table.headers.length;
+                siSlide.addTable(tableRows as any, {
+                    x: 0.4, y: yOffset, w: 12.2,
+                    colW: Array(sub.table.headers.length).fill(colW),
+                    border: { type: 'solid', pt: 0.5, color: '333344' },
+                    autoPage: false,
+                });
+                yOffset += 0.3 * (Math.min(sub.table.rows.length, 8) + 1) + 0.3;
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════
