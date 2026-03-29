@@ -103,6 +103,11 @@ export default function WebScanPage() {
     });
     const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'agent', content: string }[]>([]);
     const [chatInput, setChatInput] = useState('');
+    const [extractedEndpoints, setExtractedEndpoints] = useState<any[] | null>(null);
+    const [isExtracting, setIsExtracting] = useState(false);
+    const [selectedEndpointKeys, setSelectedEndpointKeys] = useState<Set<string>>(new Set());
+    const [isDeepScanning, setIsDeepScanning] = useState(false);
+    const [endpointFilter, setEndpointFilter] = useState<'all' | 'static' | 'ai'>('all');
 
     const [scanStatus, setScanStatus] = useState<ScanStatus>({
         id: null,
@@ -125,6 +130,97 @@ export default function WebScanPage() {
             return true;
         } catch {
             return false;
+        }
+    };
+
+    const handleExtractEndpoints = async () => {
+        setIsExtracting(true);
+        setExtractedEndpoints(null);
+
+        const formData = new FormData();
+        formData.append('sourceType', sourceType);
+        if (sourceType === 'local') {
+            formData.append('sourcePackagePath', String(sourcePackagePath).trim());
+        } else if (sourceType === 'zip' && zipFile) {
+            formData.append('sourceZip', zipFile);
+        } else if (sourceType === 'git') {
+            formData.append('sourceGitUrl', String(gitUrl).trim());
+            if (gitToken?.trim()) formData.append('sourceGitToken', String(gitToken).trim());
+        }
+
+        try {
+            const res = await fetch(`${API_URL}/scans/extract-endpoints`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${useAuthStore.getState().token}` },
+                body: formData,
+            });
+            const data = await res.json();
+            if (data.endpoints) {
+                const tagged = data.endpoints.map((ep: any) => ({ ...ep, source: 'static' }));
+                setExtractedEndpoints(tagged);
+                setSelectedEndpointKeys(new Set(tagged.map((ep: any) => `${ep.method}:${ep.path}`)));
+                setEndpointFilter('all');
+                toast.success(`Extracted ${tagged.length} backend endpoints`);
+            } else {
+                toast.error(data.message || 'Failed to extract endpoints');
+            }
+        } catch (e: any) {
+            toast.error(e.message || 'Error executing request');
+        } finally {
+            setIsExtracting(false);
+        }
+    };
+
+    const handleDeepScanAI = async () => {
+        if (!extractedEndpoints) return;
+        setIsDeepScanning(true);
+
+        const formData = new FormData();
+        formData.append('sourceType', sourceType);
+        if (sourceType === 'local') {
+            formData.append('sourcePackagePath', String(sourcePackagePath).trim());
+        } else if (sourceType === 'zip' && zipFile) {
+            formData.append('sourceZip', zipFile);
+        } else if (sourceType === 'git') {
+            formData.append('sourceGitUrl', String(gitUrl).trim());
+            if (gitToken?.trim()) formData.append('sourceGitToken', String(gitToken).trim());
+        }
+        formData.append('existingRoutes', JSON.stringify(extractedEndpoints));
+
+        try {
+            const res = await fetch(`${API_URL}/scans/extract-endpoints-ai`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${useAuthStore.getState().token}` },
+                body: formData,
+            });
+            const data = await res.json();
+            if (data.endpoints && data.endpoints.length > 0) {
+                const taggedAi = data.endpoints.map((ep: any) => ({ ...ep, source: 'ai' }));
+                // Deduplicate AI results against existing endpoints
+                const existingKeys = new Set(extractedEndpoints.map((ep: any) => `${ep.method}:${ep.path}`));
+                const uniqueAi = taggedAi.filter((ep: any) => {
+                    const key = `${ep.method}:${ep.path}`;
+                    if (existingKeys.has(key)) return false;
+                    existingKeys.add(key);
+                    return true;
+                });
+                if (uniqueAi.length > 0) {
+                    const merged = [...extractedEndpoints, ...uniqueAi];
+                    setExtractedEndpoints(merged);
+                    const newKeys = new Set(selectedEndpointKeys);
+                    uniqueAi.forEach((ep: any) => newKeys.add(`${ep.method}:${ep.path}`));
+                    setSelectedEndpointKeys(newKeys);
+                    toast.success(`AI discovered ${uniqueAi.length} additional dynamic route${uniqueAi.length !== 1 ? 's' : ''}`);
+                } else {
+                    toast.success('AI analysis complete — all found routes were already in the list');
+                }
+            } else {
+                toast.success('AI analysis complete — no additional dynamic routes found');
+            }
+        } catch (e: any) {
+            toast.error(e.message || 'AI deep scan failed');
+        } finally {
+            setIsDeepScanning(false);
         }
     };
 
@@ -178,6 +274,12 @@ export default function WebScanPage() {
                     formData.append('sourceGitUrl', gitUrl.trim());
                     if (gitToken.trim()) formData.append('sourceGitToken', gitToken.trim());
                 }
+            }
+
+            // Pass selected endpoints to the scan
+            if (extractedEndpoints && selectedEndpointKeys.size > 0) {
+                const selected = extractedEndpoints.filter(ep => selectedEndpointKeys.has(`${ep.method}:${ep.path}`));
+                formData.append('targetEndpoints', JSON.stringify(selected));
             }
 
             if (typeof window !== 'undefined') {
@@ -685,6 +787,137 @@ export default function WebScanPage() {
                                         onSelect={setSourceAnalysisMode}
                                         disabled={isScanning}
                                     />
+                                    
+                                    <div className="mt-6 flex flex-col gap-4">
+                                        {!extractedEndpoints && (
+                                            <button
+                                                type="button"
+                                                onClick={handleExtractEndpoints}
+                                                disabled={isExtracting || isScanning}
+                                                className="btn btn-secondary w-full sm:w-auto"
+                                            >
+                                                {isExtracting ? (
+                                                    <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin text-cyan-400" /> Analyzing Source Code...</span>
+                                                ) : (
+                                                    <span className="flex items-center gap-2"><Search className="w-4 h-4 text-cyan-400" /> Extract Endpoints from Codebase</span>
+                                                )}
+                                            </button>
+                                        )}
+                                                                      {extractedEndpoints && (
+                                            <div className="bg-dark-800 rounded-lg border border-dark-600 p-4">
+                                                {/* Header — outside scroll */}
+                                                <div className="flex justify-between items-center mb-3 pb-2 border-b border-dark-700">
+                                                    <h4 className="text-sm font-semibold text-white">Extracted Routes <span className="text-cyan-400 ml-1">{selectedEndpointKeys.size}/{extractedEndpoints.length} selected</span></h4>
+                                                    <div className="flex items-center gap-3">
+                                                        {endpointFilter === 'all' && (
+                                                            <>
+                                                                <button type="button" onClick={() => setSelectedEndpointKeys(new Set(extractedEndpoints.map(ep => `${ep.method}:${ep.path}`)))} className="text-xs text-cyan-400 hover:text-white">All</button>
+                                                                <button type="button" onClick={() => setSelectedEndpointKeys(new Set())} className="text-xs text-gray-400 hover:text-white">None</button>
+                                                            </>
+                                                        )}
+                                                        <button type="button" onClick={() => { setExtractedEndpoints(null); setSelectedEndpointKeys(new Set()); setEndpointFilter('all'); }} className="text-xs text-gray-500 hover:text-white">Clear</button>
+                                                    </div>
+                                                </div>
+                                                {/* Filter Tabs */}
+                                                {(() => {
+                                                    const staticCount = extractedEndpoints.filter(ep => ep.source !== 'ai').length;
+                                                    const aiCount = extractedEndpoints.filter(ep => ep.source === 'ai').length;
+                                                    return (
+                                                        <div className="flex items-center gap-1 mb-3">
+                                                            {(['all', 'static', 'ai'] as const).map((tab) => {
+                                                                const count = tab === 'all' ? extractedEndpoints.length : tab === 'static' ? staticCount : aiCount;
+                                                                const label = tab === 'all' ? 'All' : tab === 'static' ? 'Static' : '🧠 AI';
+                                                                if (tab === 'ai' && aiCount === 0) return null;
+                                                                return (
+                                                                    <button
+                                                                        key={tab}
+                                                                        type="button"
+                                                                        onClick={() => setEndpointFilter(tab)}
+                                                                        className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors ${
+                                                                            endpointFilter === tab
+                                                                                ? tab === 'ai' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/40' : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40'
+                                                                                : 'bg-dark-700 text-gray-500 border border-dark-600 hover:text-gray-300'
+                                                                        }`}
+                                                                    >
+                                                                        {label} <span className="ml-1 opacity-70">{count}</span>
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    );
+                                                })()}
+                                                {/* Scrollable list only */}
+                                                <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                                                    {extractedEndpoints
+                                                        .filter(ep => endpointFilter === 'all' ? true : endpointFilter === 'ai' ? ep.source === 'ai' : ep.source !== 'ai')
+                                                        .map((ep, i) => {
+                                                        const key = `${ep.method}:${ep.path}`;
+                                                        const isSelected = selectedEndpointKeys.has(key);
+                                                        const isAllTab = endpointFilter === 'all';
+                                                        const isAiEntry = ep.source === 'ai';
+                                                        return (
+                                                            <label key={i} className={`flex items-center justify-between text-xs p-2.5 rounded border transition-colors ${
+                                                                isAllTab ? 'cursor-pointer' : 'cursor-default'
+                                                            } ${
+                                                                isAllTab
+                                                                    ? (isSelected ? 'bg-cyan-500/10 border-cyan-500/30' : 'bg-dark-900 border-dark-700 opacity-60')
+                                                                    : (isAiEntry ? 'bg-purple-500/5 border-purple-500/20' : 'bg-dark-900 border-dark-700')
+                                                            }`}>
+                                                                <div className="flex items-center gap-3 truncate">
+                                                                    {isAllTab && (
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            className="accent-cyan-500 w-3.5 h-3.5 flex-shrink-0"
+                                                                            checked={isSelected}
+                                                                            onChange={() => {
+                                                                                const next = new Set(selectedEndpointKeys);
+                                                                                isSelected ? next.delete(key) : next.add(key);
+                                                                                setSelectedEndpointKeys(next);
+                                                                            }}
+                                                                        />
+                                                                    )}
+                                                                    <span className={`font-mono font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${
+                                                                        ep.method === 'GET' ? 'bg-blue-500/20 text-blue-400' :
+                                                                        ep.method === 'POST' ? 'bg-green-500/20 text-green-400' :
+                                                                        ep.method === 'PUT' ? 'bg-amber-500/20 text-amber-400' :
+                                                                        ep.method === 'DELETE' ? 'bg-red-500/20 text-red-400' :
+                                                                        'bg-gray-500/20 text-gray-400'
+                                                                    }`}>{ep.method}</span>
+                                                                    <span className="text-gray-300 font-mono truncate" title={ep.handler}>{ep.path}</span>
+                                                                </div>
+                                                                <div className="flex items-center gap-2 flex-shrink-0 ml-2">
+                                                                    {ep.source === 'ai' && <span className="text-purple-400 text-[9px] bg-purple-400/10 px-1 rounded border border-purple-400/20">AI</span>}
+                                                                    {ep.authRequired && <span className="text-amber-400 text-[10px] bg-amber-400/10 px-1 rounded uppercase border border-amber-400/20">Auth</span>}
+                                                                    {ep.userInputs?.length > 0 && <span className="text-cyan-400 text-[10px] bg-cyan-400/10 px-1 rounded uppercase border border-cyan-400/20">Inputs</span>}
+                                                                </div>
+                                                            </label>
+                                                        );
+                                                    })}
+                                                    {extractedEndpoints.length === 0 && <p className="text-gray-500 text-sm italic">No dynamic routes found in source.</p>}
+                                                </div>
+                                                {/* Footer — outside scroll */}
+                                                <div className="mt-3 pt-3 border-t border-dark-700 space-y-3">
+                                                    {endpointFilter === 'all' && selectedEndpointKeys.size > 0 && (
+                                                        <p className="text-gray-500 text-xs">
+                                                            ✅ Scan will focus on the <span className="text-cyan-400 font-semibold">{selectedEndpointKeys.size}</span> selected endpoint{selectedEndpointKeys.size !== 1 ? 's' : ''}.
+                                                        </p>
+                                                    )}
+                                                    <button
+                                                        type="button"
+                                                        onClick={handleDeepScanAI}
+                                                        disabled={isDeepScanning || isScanning}
+                                                        className="w-full px-3 py-2 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/30 hover:bg-purple-500/20 transition-colors disabled:opacity-50 text-xs flex items-center justify-center gap-2"
+                                                    >
+                                                        {isDeepScanning ? (
+                                                            <span className="flex items-center gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> AI is analyzing dynamic routes...</span>
+                                                        ) : (
+                                                            <span className="flex items-center gap-2">🧠 Deep Scan with AI <span className="text-[9px] opacity-60">(uses tokens)</span></span>
+                                                        )}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
                                 </motion.div>
                             )}
                         </div>

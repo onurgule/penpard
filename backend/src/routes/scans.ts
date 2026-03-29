@@ -28,6 +28,8 @@ import { llmProvider } from '../services/LLMProviderService';
 import { activityMonitor } from '../services/ActivityMonitorService';
 import { takePendingRequest } from './penpard';
 import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
+import { extractRoutes } from '../services/source-analysis/utils/route-extractor';
+import os from 'os';
 
 export const activeAgents = new Map<string, OrchestratorAgent>();
 export const activePools = new Map<string, AgentPool>();
@@ -62,6 +64,114 @@ const upload = multer({
         }
     }
 });
+
+router.post('/extract-endpoints', authenticateToken, upload.single('sourceZip'), async (req: AuthRequest, res: Response): Promise<any> => {
+    try {
+        const { sourceType, sourcePackagePath, sourceGitUrl, sourceGitToken } = req.body;
+        const sourceZip = req.file;
+
+        if (!sourceType || sourceType === 'none') {
+            return res.status(400).json({ status: 'error', message: 'No valid source type provided.' });
+        }
+
+        let finalSourcePath = '';
+        const cleanupPaths: string[] = [];
+
+        try {
+            if (sourceType === 'local') {
+                if (!sourcePackagePath) return res.status(400).json({ status: 'error', message: 'Local path not provided' });
+                finalSourcePath = sourcePackagePath;
+            } else if (sourceType === 'zip') {
+                if (!sourceZip) return res.status(400).json({ status: 'error', message: 'ZIP file not provided' });
+                const extractDir = path.join(os.tmpdir(), `penpard_source_extract_${Date.now()}`);
+                await extractZipArchive(sourceZip.path, extractDir);
+                finalSourcePath = extractDir;
+                cleanupPaths.push(extractDir);
+                cleanupPaths.push(sourceZip.path);
+            } else if (sourceType === 'git') {
+                if (!sourceGitUrl) return res.status(400).json({ status: 'error', message: 'Git URL not provided' });
+                const cloneDir = path.join(os.tmpdir(), `penpard_source_extract_${Date.now()}`);
+                await cloneGitRepository(sourceGitUrl, cloneDir, sourceGitToken || undefined);
+                finalSourcePath = cloneDir;
+                cleanupPaths.push(cloneDir);
+            }
+
+            const endpoints = await extractRoutes(finalSourcePath);
+
+            for (const p of cleanupPaths) {
+                try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) {}
+            }
+
+            res.json({ endpoints });
+        } catch (err: any) {
+            for (const p of cleanupPaths) {
+                try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) {}
+            }
+            if (sourceZip?.path) {
+                try { fs.rmSync(sourceZip.path, { force: true }); } catch (e) {}
+            }
+            throw err;
+        }
+    } catch (error: any) {
+        logger.error('Failed to extract endpoints', { error: error.message });
+        res.status(500).json({ status: 'error', message: error.message || 'Failed to extract endpoints' });
+    }
+});
+
+router.post('/extract-endpoints-ai', authenticateToken, upload.single('sourceZip'), async (req: AuthRequest, res: Response): Promise<any> => {
+    try {
+        const { sourceType, sourcePackagePath, sourceGitUrl, sourceGitToken, existingRoutes } = req.body;
+        const sourceZip = req.file;
+
+        if (!sourceType || sourceType === 'none') {
+            return res.status(400).json({ status: 'error', message: 'No valid source type provided.' });
+        }
+
+        let existingEndpoints: any[] = [];
+        try { existingEndpoints = JSON.parse(existingRoutes || '[]'); } catch { existingEndpoints = []; }
+
+        let finalSourcePath = '';
+        const cleanupPaths: string[] = [];
+
+        try {
+            if (sourceType === 'local') {
+                if (!sourcePackagePath) return res.status(400).json({ status: 'error', message: 'Local path not provided' });
+                finalSourcePath = sourcePackagePath;
+            } else if (sourceType === 'zip') {
+                if (!sourceZip) return res.status(400).json({ status: 'error', message: 'ZIP file not provided' });
+                const extractDir = path.join(os.tmpdir(), `penpard_source_ai_${Date.now()}`);
+                await extractZipArchive(sourceZip.path, extractDir);
+                finalSourcePath = extractDir;
+                cleanupPaths.push(extractDir);
+                cleanupPaths.push(sourceZip.path);
+            } else if (sourceType === 'git') {
+                if (!sourceGitUrl) return res.status(400).json({ status: 'error', message: 'Git URL not provided' });
+                const cloneDir = path.join(os.tmpdir(), `penpard_source_ai_${Date.now()}`);
+                await cloneGitRepository(sourceGitUrl, cloneDir, sourceGitToken || undefined);
+                finalSourcePath = cloneDir;
+                cleanupPaths.push(cloneDir);
+            }
+
+            const { extractRoutesWithAI } = await import('../services/source-analysis/utils/ai-route-extractor');
+            const aiEndpoints = await extractRoutesWithAI(finalSourcePath, existingEndpoints);
+
+            for (const p of cleanupPaths) {
+                try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) {}
+            }
+
+            res.json({ endpoints: aiEndpoints });
+        } catch (err: any) {
+            for (const p of cleanupPaths) {
+                try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) {}
+            }
+            throw err;
+        }
+    } catch (error: any) {
+        logger.error('Failed to extract endpoints with AI', { error: error.message });
+        res.status(500).json({ status: 'error', message: error.message || 'Failed to extract endpoints with AI' });
+    }
+});
+
 
 // Get dashboard stats (Must be defined before /:id)
 router.get('/stats', authenticateToken, (req: AuthRequest, res: Response) => {

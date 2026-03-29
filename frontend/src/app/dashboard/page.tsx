@@ -94,6 +94,9 @@ export default function DashboardPage() {
     const [zipFile, setZipFile] = useState<File | null>(null);
     const [gitUrl, setGitUrl] = useState('');
     const [gitToken, setGitToken] = useState('');
+    const [extractedEndpoints, setExtractedEndpoints] = useState<any[] | null>(null);
+    const [isExtracting, setIsExtracting] = useState(false);
+    const [selectedEndpointKeys, setSelectedEndpointKeys] = useState<Set<string>>(new Set());
 
     useEffect(() => {
         if (!isAuthenticated) {
@@ -161,9 +164,51 @@ export default function DashboardPage() {
         router.push('/');
     };
 
+    const handleExtractEndpoints = async () => {
+        setIsExtracting(true);
+        setExtractedEndpoints(null);
+
+        const formData = new FormData();
+        formData.append('sourceType', sourceType);
+        if (sourceType === 'local') {
+            formData.append('sourcePackagePath', String(sourcePackagePath).trim());
+        } else if (sourceType === 'zip' && zipFile) {
+            formData.append('sourceZip', zipFile);
+        } else if (sourceType === 'git') {
+            formData.append('sourceGitUrl', String(gitUrl).trim());
+            if (gitToken?.trim()) formData.append('sourceGitToken', String(gitToken).trim());
+        }
+
+        try {
+            const token = useAuthStore.getState().token;
+            const res = await fetch(`${API_URL}/scans/extract-endpoints`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}` },
+                body: formData,
+            });
+            const data = await res.json();
+            if (data.endpoints) {
+                setExtractedEndpoints(data.endpoints);
+                setSelectedEndpointKeys(new Set(data.endpoints.map((ep: any) => `${ep.method}:${ep.path}`)));
+                // Also enforce full source aware automatically in burp context
+                setSourceAnalysisMode('full_source_aware');
+            } else {
+                alert(data.message || 'Failed to extract endpoints');
+            }
+        } catch (e: any) {
+            alert(e.message || 'Error executing request');
+        } finally {
+            setIsExtracting(false);
+        }
+    };
+
     const openBurpStartModal = (p: { pendingId: string; url: string }) => {
         setBurpStartModal(p);
         setBurpOptions(getLastScanOptions());
+        setExtractedEndpoints(null);
+        setSelectedEndpointKeys(new Set());
+        // Auto-select full source aware for Burp requests (single targeted endpoint)
+        setSourceAnalysisMode('full_source_aware');
     };
 
     const handleStartFromBurp = async () => {
@@ -195,6 +240,12 @@ export default function DashboardPage() {
                     formData.append('sourceGitUrl', gitUrl.trim());
                     if (gitToken.trim()) formData.append('sourceGitToken', gitToken.trim());
                 }
+            }
+
+            // Pass selected target endpoints
+            if (extractedEndpoints && selectedEndpointKeys.size > 0) {
+                const selected = extractedEndpoints.filter(ep => selectedEndpointKeys.has(`${ep.method}:${ep.path}`));
+                formData.append('targetEndpoints', JSON.stringify(selected));
             }
 
             const res = await fetch(`${API_URL}/scans/from-burp`, {
@@ -235,7 +286,7 @@ export default function DashboardPage() {
                         </div>
                         <div>
                             <h1 className="text-lg font-bold text-white">PENPARD</h1>
-                            <p className="text-xs text-gray-500 terminal-text">CONTROL CENTER</p>
+                            <p className="text-xs text-gray-500 terminal-text">CONTROL CENTER <span className="text-cyan-500/70 font-semibold">v1.1.0</span></p>
                         </div>
                     </div>
 
@@ -599,6 +650,7 @@ export default function DashboardPage() {
                         </a>
                         <span className="text-slate-600">—</span>
                         <span className="text-slate-500">Pentester Pard</span>
+                        <span className="bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 text-[10px] font-bold px-1.5 py-0.5 rounded ml-1">v1.1.0</span>
                         <span className="text-slate-600">—</span>
                         <span className="text-slate-600">Developed by</span>
                         <a

@@ -191,7 +191,7 @@ export default function BottomNavigation() {
                         <div className={`flex items-center gap-1 text-[10px] font-mono ${isConnected ? 'text-green-500' : 'text-gray-600'}`}>
                             {isConnected ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
                         </div>
-                        <span className="text-[10px] font-mono text-gray-700">v1.0.1</span>
+                        <span className="text-[10px] font-mono text-gray-700">v1.1.0</span>
                     </div>
                 </div>
             </div>
