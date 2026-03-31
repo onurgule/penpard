@@ -20,6 +20,7 @@ import {
     updateBrowserSession,
     addBrowserAction,
     getBrowserSession,
+    getBrowserActions,
     closeBrowserSession as dbCloseSession,
 } from '../db/init';
 import path from 'path';
@@ -35,6 +36,7 @@ export interface BrowserSessionOptions {
     findingId?: number;
     proxyHost?: string;
     proxyPort?: number;
+    label?: string;
 }
 
 export interface BrowserAction {
@@ -60,6 +62,7 @@ interface LiveSession {
     page: Page;
     sessionId: string;
     userId: number;
+    userDataDir: string;
 }
 
 // ── Service ──
@@ -386,10 +389,11 @@ public class PenPardIconChanger {
                 );
             }
 
-            // Use a persistent context. This is the ultimate fix for the Chrome "T" taskbar profile badge issue.
-            // Temp contexts trigger Chromium's multi-profile logic, forcing the taskbar to overlay the badge
-            // and fallback to standard generic internal chrome UI icons. Persistent context disables this.
-            const userDataDir = path.join(require('os').homedir(), '.penpard', 'browser_profile_live');
+            // Per-session user data dir — fixes multi-browser bug.
+            // Previously all sessions shared browser_profile_live, causing Chromium's
+            // SingletonLock to block second launches ("chromium browser not found").
+            const userDataDir = path.join(os.homedir(), '.penpard', 'browser_sessions', sessionId);
+            if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
             const context = await chromium.launchPersistentContext(userDataDir, {
                 headless: false, // Visible for human interaction
@@ -419,6 +423,7 @@ public class PenPardIconChanger {
                 page,
                 sessionId,
                 userId,
+                userDataDir,
             };
             this.sessions.set(sessionId, liveSession);
 
@@ -768,6 +773,437 @@ public class PenPardIconChanger {
             dbCloseSession(sessionId);
         }
         this.sessions.clear();
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  FRONTEND ANALYSIS — AI-usable browser intelligence
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Deep page state: DOM summary, scripts, meta, cookies, storage.
+     */
+    async getFullPageState(sessionId: string): Promise<any> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const { page, context } = session;
+
+        const state = await page.evaluate(`(() => {
+            // DOM summary
+            const allElements = document.querySelectorAll('*');
+            const tagCounts = {};
+            allElements.forEach(el => { tagCounts[el.tagName] = (tagCounts[el.tagName] || 0) + 1; });
+
+            // Forms
+            const forms = Array.from(document.querySelectorAll('form')).slice(0, 30).map(form => ({
+                action: form.action || '',
+                method: (form.method || 'get').toUpperCase(),
+                id: form.id || '',
+                name: form.name || '',
+                fields: Array.from(form.querySelectorAll('input, textarea, select, button')).slice(0, 50).map(field => ({
+                    name: field.name || '',
+                    type: field.type || field.tagName.toLowerCase(),
+                    id: field.id || '',
+                    value: field.type === 'hidden' ? field.value : '',
+                    placeholder: field.placeholder || '',
+                })),
+            }));
+
+            // Hidden inputs (outside forms too)
+            const hiddenInputs = Array.from(document.querySelectorAll('input[type="hidden"]')).map(el => ({
+                name: el.name || '',
+                id: el.id || '',
+                value: el.value || '',
+                form: el.form ? (el.form.id || el.form.action || 'unnamed-form') : 'no-form',
+            }));
+
+            // Links
+            const links = Array.from(document.querySelectorAll('a[href]')).slice(0, 100).map(a => ({
+                href: a.href || '',
+                text: (a.textContent || '').trim().substring(0, 100),
+            }));
+
+            // Meta tags
+            const metaTags = Array.from(document.querySelectorAll('meta')).map(m => ({
+                name: m.name || m.httpEquiv || m.getAttribute('property') || '',
+                content: (m.content || '').substring(0, 500),
+            }));
+
+            // Scripts (src + inline)
+            const scripts = Array.from(document.querySelectorAll('script')).map(s => ({
+                src: s.src || '',
+                type: s.type || '',
+                isInline: !s.src,
+                contentPreview: !s.src ? (s.textContent || '').substring(0, 500) : '',
+                contentLength: !s.src ? (s.textContent || '').length : 0,
+            }));
+
+            // Cookies
+            const cookies = document.cookie;
+
+            // localStorage
+            let localStorageData = {};
+            try {
+                for (let i = 0; i < localStorage.length && i < 50; i++) {
+                    const key = localStorage.key(i);
+                    if (key) localStorageData[key] = (localStorage.getItem(key) || '').substring(0, 500);
+                }
+            } catch(e) {}
+
+            // sessionStorage
+            let sessionStorageData = {};
+            try {
+                for (let i = 0; i < sessionStorage.length && i < 50; i++) {
+                    const key = sessionStorage.key(i);
+                    if (key) sessionStorageData[key] = (sessionStorage.getItem(key) || '').substring(0, 500);
+                }
+            } catch(e) {}
+
+            const bodyText = document.body ? document.body.innerText : '';
+            return {
+                tagCounts,
+                totalElements: allElements.length,
+                forms,
+                hiddenInputs,
+                links,
+                metaTags,
+                scripts,
+                cookies,
+                localStorageData,
+                sessionStorageData,
+                textSummary: bodyText.substring(0, 3000),
+            };
+        })()`);
+
+        // Also get Playwright-level cookies for the context
+        let contextCookies: any[] = [];
+        try { contextCookies = await context.cookies(); } catch { /* ignore */ }
+
+        return {
+            url: page.url(),
+            title: await page.title(),
+            ...(state as any),
+            contextCookies,
+        };
+    }
+
+    /**
+     * Loaded scripts analysis — all script tags with URLs and inline content.
+     */
+    async getLoadedScripts(sessionId: string): Promise<any> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+
+        return await session.page.evaluate(`(() => {
+            const scripts = Array.from(document.querySelectorAll('script')).map(s => ({
+                src: s.src || null,
+                type: s.type || 'text/javascript',
+                async: s.async,
+                defer: s.defer,
+                isModule: s.type === 'module',
+                isInline: !s.src,
+                contentPreview: !s.src ? (s.textContent || '').substring(0, 2000) : null,
+                contentLength: !s.src ? (s.textContent || '').length : null,
+            }));
+            // Also check link preloads for JS
+            const preloads = Array.from(document.querySelectorAll('link[rel="preload"][as="script"], link[rel="modulepreload"]')).map(l => ({
+                href: l.href || '',
+                rel: l.rel || '',
+                as: l.getAttribute('as') || '',
+            }));
+            return { scripts, preloads, totalScripts: scripts.length };
+        })()`);
+    }
+
+    /**
+     * Comprehensive frontend intelligence extraction.
+     * Finds API endpoints, GraphQL, WebSockets, tokens, CSRF, routing patterns.
+     */
+    async getFrontendAnalysis(sessionId: string): Promise<any> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+
+        return await session.page.evaluate(`(() => {
+            const results = {
+                apiEndpoints: [],
+                graphqlIndicators: [],
+                websocketUrls: [],
+                tokenPatterns: [],
+                csrfTokens: [],
+                frontendRoutes: [],
+                hiddenParams: [],
+                inlineScriptInsights: [],
+            };
+
+            // Gather all inline script content
+            const allScriptContent = Array.from(document.querySelectorAll('script:not([src])'))
+                .map(s => s.textContent || '').join('\\n');
+
+            // Also gather script src URLs
+            const scriptSrcs = Array.from(document.querySelectorAll('script[src]'))
+                .map(s => s.src);
+
+            // 1. API endpoints — regex patterns in inline JS
+            const apiPatterns = [
+                /["'\`](\\/api\\/[^"'\`\\s]{2,80})["'\`]/g,
+                /["'\`](https?:\\/\\/[^"'\`\\s]*\\/api\\/[^"'\`\\s]{2,120})["'\`]/g,
+                /fetch\\s*\\(\\s*["'\`]([^"'\`]+)["'\`]/g,
+                /axios\\.[a-z]+\\s*\\(\\s*["'\`]([^"'\`]+)["'\`]/g,
+                /\\.(?:get|post|put|delete|patch)\\s*\\(\\s*["'\`]([^"'\`]+)["'\`]/g,
+                /XMLHttpRequest[^]*?\\.open\\s*\\(\\s*["'][A-Z]+["']\\s*,\\s*["'\`]([^"'\`]+)["'\`]/g,
+                /url\\s*[:=]\\s*["'\`](\\/[^"'\`\\s]{2,80})["'\`]/g,
+                /endpoint\\s*[:=]\\s*["'\`]([^"'\`\\s]{2,80})["'\`]/g,
+            ];
+            const foundEndpoints = new Set();
+            for (const pat of apiPatterns) {
+                let m;
+                while ((m = pat.exec(allScriptContent)) !== null) {
+                    const ep = m[1];
+                    if (ep && !ep.includes('{{') && ep.length < 200) foundEndpoints.add(ep);
+                }
+            }
+            results.apiEndpoints = [...foundEndpoints].slice(0, 100);
+
+            // 2. GraphQL indicators
+            if (allScriptContent.includes('graphql') || allScriptContent.includes('GraphQL') ||
+                allScriptContent.includes('__schema') || allScriptContent.includes('mutation ') ||
+                allScriptContent.includes('query {')) {
+                results.graphqlIndicators.push('GraphQL usage detected in inline scripts');
+                const gqlUrlMatch = allScriptContent.match(/["'\`]([^"'\`]*graphql[^"'\`]*)["'\`]/gi);
+                if (gqlUrlMatch) results.graphqlIndicators.push(...gqlUrlMatch.slice(0, 10).map(s => s.replace(/["'\`]/g, '')));
+            }
+            // Check script srcs
+            scriptSrcs.forEach(src => {
+                if (src.toLowerCase().includes('graphql')) results.graphqlIndicators.push('GraphQL script: ' + src);
+            });
+
+            // 3. WebSocket URLs
+            const wsPatterns = /["'\`](wss?:\\/\\/[^"'\`\\s]+)["'\`]/g;
+            let wsMatch;
+            while ((wsMatch = wsPatterns.exec(allScriptContent)) !== null) {
+                results.websocketUrls.push(wsMatch[1]);
+            }
+            if (allScriptContent.includes('new WebSocket')) results.websocketUrls.push('WebSocket constructor usage detected');
+
+            // 4. Token patterns (JWT, Bearer, etc.)
+            if (allScriptContent.match(/bearer/i)) results.tokenPatterns.push('Bearer token pattern detected');
+            if (allScriptContent.match(/localStorage\\.getItem\\s*\\(\\s*["'\`](token|access_token|auth_token|jwt)/i))
+                results.tokenPatterns.push('Token stored in localStorage');
+            if (allScriptContent.match(/sessionStorage\\.getItem\\s*\\(\\s*["'\`](token|access_token|auth_token|jwt)/i))
+                results.tokenPatterns.push('Token stored in sessionStorage');
+            const jwtInStorage = [];
+            try {
+                for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    const v = k ? localStorage.getItem(k) : '';
+                    if (v && v.match(/^eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+/)) {
+                        jwtInStorage.push({ key: k, location: 'localStorage', preview: v.substring(0, 80) + '...' });
+                    }
+                }
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const k = sessionStorage.key(i);
+                    const v = k ? sessionStorage.getItem(k) : '';
+                    if (v && v.match(/^eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+/)) {
+                        jwtInStorage.push({ key: k, location: 'sessionStorage', preview: v.substring(0, 80) + '...' });
+                    }
+                }
+            } catch(e) {}
+            if (jwtInStorage.length > 0) results.tokenPatterns.push(...jwtInStorage.map(j => j.location + ':' + j.key + ' = ' + j.preview));
+
+            // 5. CSRF tokens
+            const csrfInputs = document.querySelectorAll('input[name*="csrf"], input[name*="token"], input[name*="_token"], meta[name*="csrf"]');
+            csrfInputs.forEach(el => {
+                results.csrfTokens.push({
+                    name: el.getAttribute('name') || el.getAttribute('property') || '',
+                    value: (el.getAttribute('value') || el.getAttribute('content') || '').substring(0, 100),
+                    tag: el.tagName,
+                });
+            });
+
+            // 6. Frontend routes (React Router, Vue Router, Next.js patterns)
+            const routePatterns = /(?:path|route)\\s*[:=]\\s*["'\`](\\/[^"'\`]{1,80})["'\`]/g;
+            let routeMatch;
+            const foundRoutes = new Set();
+            while ((routeMatch = routePatterns.exec(allScriptContent)) !== null) {
+                foundRoutes.add(routeMatch[1]);
+            }
+            results.frontendRoutes = [...foundRoutes].slice(0, 50);
+
+            // 7. Hidden params (data attributes, hidden inputs outside forms)
+            const hiddenInputs = document.querySelectorAll('input[type="hidden"]');
+            hiddenInputs.forEach(inp => {
+                results.hiddenParams.push({
+                    name: inp.name || '',
+                    value: (inp.value || '').substring(0, 200),
+                    id: inp.id || '',
+                });
+            });
+
+            return results;
+        })()`);
+    }
+
+    /**
+     * Dump session storage: cookies, localStorage, sessionStorage.
+     */
+    async getSessionStorageData(sessionId: string): Promise<any> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+
+        const browserStorage = await session.page.evaluate(`(() => {
+            let localStorageData = {};
+            try {
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key) localStorageData[key] = localStorage.getItem(key);
+                }
+            } catch(e) {}
+            let sessionStorageData = {};
+            try {
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const key = sessionStorage.key(i);
+                    if (key) sessionStorageData[key] = sessionStorage.getItem(key);
+                }
+            } catch(e) {}
+            return { cookies: document.cookie, localStorageData, sessionStorageData };
+        })()`);
+
+        let contextCookies: any[] = [];
+        try { contextCookies = await session.context.cookies(); } catch { /* ignore */ }
+
+        return { url: session.page.url(), ...(browserStorage as any), contextCookies };
+    }
+
+    /**
+     * Correlate browser-visible state with Burp MCP proxy history.
+     * Merges what the browser sees with what Burp intercepted.
+     */
+    async correlateBrowserWithBurp(sessionId: string): Promise<any> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+
+        // Get browser state
+        const currentUrl = session.page.url();
+        let host = '';
+        try { host = new URL(currentUrl).hostname; } catch { /* ignore */ }
+
+        // Get Burp proxy history via MCP
+        let burpHistory: any[] = [];
+        let burpAvailable = false;
+        try {
+            const { burpMCP } = require('./burp-mcp');
+            burpAvailable = await burpMCP.isAvailable();
+            if (burpAvailable) {
+                const result = await burpMCP.callTool('get_proxy_history', { count: 50 });
+                burpHistory = result?.content?.[0]?.text
+                    ? JSON.parse(result.content[0].text).history || []
+                    : [];
+            }
+        } catch (e: any) {
+            logger.warn('Burp MCP correlation failed', { error: e.message });
+        }
+
+        // Get browser action log
+        const actions = getBrowserActions(sessionId);
+
+        // Match browser URLs with Burp history
+        const matchedRequests = burpHistory.filter((entry: any) => {
+            const entryUrl = entry.url || '';
+            try {
+                const entryHost = new URL(entryUrl).hostname;
+                return entryHost === host;
+            } catch { return false; }
+        });
+
+        // Extract unique endpoints from Burp for this host
+        const burpEndpoints = [...new Set(matchedRequests.map((r: any) => {
+            try { return new URL(r.url).pathname; } catch { return r.url; }
+        }))];
+
+        // Get frontend-discovered API endpoints
+        let frontendEndpoints: string[] = [];
+        try {
+            const analysis = await this.getFrontendAnalysis(sessionId);
+            frontendEndpoints = analysis.apiEndpoints || [];
+        } catch { /* ignore */ }
+
+        // Find endpoints visible in frontend JS but NOT seen in Burp traffic
+        const burpPathSet = new Set(burpEndpoints);
+        const frontendOnly = frontendEndpoints.filter(ep => !burpPathSet.has(ep));
+
+        return {
+            burpAvailable,
+            currentUrl,
+            host,
+            browserActionsCount: actions.length,
+            burpRequestsForHost: matchedRequests.length,
+            totalBurpHistory: burpHistory.length,
+            matchedRequests: matchedRequests.slice(0, 30).map((r: any) => ({
+                method: r.method,
+                url: r.url,
+                status: r.status,
+                mimeType: r.mimeType,
+            })),
+            burpEndpoints,
+            frontendEndpoints,
+            frontendOnlyEndpoints: frontendOnly,
+            insight: frontendOnly.length > 0
+                ? `Found ${frontendOnly.length} API endpoint(s) in frontend JavaScript that have NOT been seen in Burp traffic. These may be untested attack surface.`
+                : 'All frontend-discovered endpoints match Burp traffic.',
+        };
+    }
+
+    /**
+     * Compare two browser sessions — for IDOR, BAC, multi-user testing.
+     */
+    async compareSessionStates(sessionIdA: string, sessionIdB: string): Promise<any> {
+        const sessionA = this.sessions.get(sessionIdA);
+        const sessionB = this.sessions.get(sessionIdB);
+        if (!sessionA) throw new Error(`Session A (${sessionIdA}) not found or not active`);
+        if (!sessionB) throw new Error(`Session B (${sessionIdB}) not found or not active`);
+
+        const [stateA, stateB] = await Promise.all([
+            this.getSessionStorageData(sessionIdA),
+            this.getSessionStorageData(sessionIdB),
+        ]);
+
+        // Compare cookies
+        const cookiesA = new Set((stateA.contextCookies || []).map((c: any) => `${c.name}=${c.value}`));
+        const cookiesB = new Set((stateB.contextCookies || []).map((c: any) => `${c.name}=${c.value}`));
+        const sharedCookies = [...cookiesA].filter(c => cookiesB.has(c));
+        const onlyA = [...cookiesA].filter(c => !cookiesB.has(c));
+        const onlyB = [...cookiesB].filter(c => !cookiesA.has(c));
+
+        // Compare localStorage keys
+        const lsKeysA = Object.keys(stateA.localStorageData || {});
+        const lsKeysB = Object.keys(stateB.localStorageData || {});
+        const lsDiffs: any[] = [];
+        const allLsKeys = new Set([...lsKeysA, ...lsKeysB]);
+        allLsKeys.forEach(key => {
+            const vA = stateA.localStorageData?.[key];
+            const vB = stateB.localStorageData?.[key];
+            if (vA !== vB) lsDiffs.push({ key, sessionA: vA || '(missing)', sessionB: vB || '(missing)' });
+        });
+
+        return {
+            sessionA: { id: sessionIdA, url: stateA.url },
+            sessionB: { id: sessionIdB, url: stateB.url },
+            urlMatch: stateA.url === stateB.url,
+            cookies: {
+                sharedCount: sharedCookies.length,
+                onlyInA: onlyA.length,
+                onlyInB: onlyB.length,
+                onlyInAList: onlyA.slice(0, 20),
+                onlyInBList: onlyB.slice(0, 20),
+                isolated: onlyA.length > 0 || onlyB.length > 0,
+            },
+            localStorage: {
+                differencesCount: lsDiffs.length,
+                differences: lsDiffs.slice(0, 20),
+            },
+            insight: (onlyA.length > 0 || onlyB.length > 0)
+                ? 'Sessions have different cookies — session isolation is working. Suitable for IDOR/BAC testing.'
+                : 'Sessions share identical cookies — may need different login states for access control testing.',
+        };
     }
 }
 

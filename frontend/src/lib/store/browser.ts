@@ -2,7 +2,8 @@
  * PenPard Browser — Zustand Store
  *
  * Manages browser session state in the frontend. Handles API communication
- * for launching, controlling, and monitoring browser sessions.
+ * for launching, controlling, monitoring, and analyzing browser sessions.
+ * Supports multi-session, frontend analysis, Burp correlation, and session comparison.
  */
 
 import { create } from 'zustand';
@@ -23,6 +24,7 @@ export interface BrowserSession {
     launched_at: string;
     last_activity_at: string;
     closed_at: string | null;
+    label?: string;
     isLive?: boolean;
     title?: string;
 }
@@ -54,18 +56,32 @@ interface BrowserState {
     isExecutingAction: boolean;
     error: string | null;
 
+    // Frontend analysis state
+    frontendAnalysis: any | null;
+    burpCorrelation: any | null;
+    sessionComparison: any | null;
+    fullPageState: any | null;
+    isLoadingAnalysis: boolean;
+
     // Actions
     fetchSessions: () => Promise<void>;
     fetchSessionDetail: (id: string) => Promise<void>;
     fetchSessionActions: (id: string) => Promise<void>;
     fetchProxyConfig: () => Promise<void>;
-    launchSession: (targetUrl?: string, scanId?: string) => Promise<string | null>;
+    launchSession: (targetUrl?: string, scanId?: string, label?: string) => Promise<string | null>;
     executeAction: (sessionId: string, action: any) => Promise<any>;
     captureScreenshot: (sessionId: string) => Promise<string | null>;
     closeSession: (sessionId: string) => Promise<void>;
     selectSession: (id: string | null) => void;
     saveProxyConfig: (config: ProxyConfig) => Promise<void>;
     clearError: () => void;
+    clearClosedSessions: () => Promise<void>;
+
+    // Frontend analysis actions
+    fetchFullPageState: (sessionId: string) => Promise<void>;
+    fetchFrontendAnalysis: (sessionId: string) => Promise<void>;
+    fetchBurpCorrelation: (sessionId: string) => Promise<void>;
+    compareSessions: (sessionIdA: string, sessionIdB: string) => Promise<void>;
 }
 
 function getAuthHeaders(): Record<string, string> {
@@ -83,6 +99,11 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
     isLoadingSessions: false,
     isExecutingAction: false,
     error: null,
+    frontendAnalysis: null,
+    burpCorrelation: null,
+    sessionComparison: null,
+    fullPageState: null,
+    isLoadingAnalysis: false,
 
     fetchSessions: async () => {
         set({ isLoadingSessions: true });
@@ -91,12 +112,8 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
             if (res.ok) {
                 const data = await res.json();
                 set({ sessions: data.sessions || [], isLoadingSessions: false });
-            } else {
-                set({ isLoadingSessions: false });
-            }
-        } catch {
-            set({ isLoadingSessions: false });
-        }
+            } else { set({ isLoadingSessions: false }); }
+        } catch { set({ isLoadingSessions: false }); }
     },
 
     fetchSessionDetail: async (id: string) => {
@@ -129,13 +146,13 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
         } catch { /* ignore */ }
     },
 
-    launchSession: async (targetUrl?: string, scanId?: string) => {
+    launchSession: async (targetUrl?: string, scanId?: string, label?: string) => {
         set({ isLaunching: true, error: null });
         try {
             const res = await fetch(`${API_URL}/browser/launch`, {
                 method: 'POST',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({ targetUrl, scanId }),
+                body: JSON.stringify({ targetUrl, scanId, label }),
             });
             const data = await res.json();
             if (res.ok && data.sessionId) {
@@ -162,10 +179,7 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
             });
             const data = await res.json();
             set({ isExecutingAction: false });
-            if (!res.ok) {
-                set({ error: data.message || 'Action failed' });
-            }
-            // Refresh session detail + actions after AI action
+            if (!res.ok) { set({ error: data.message || 'Action failed' }); }
             get().fetchSessionDetail(sessionId);
             get().fetchSessionActions(sessionId);
             return data.result || null;
@@ -178,8 +192,7 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
     captureScreenshot: async (sessionId: string) => {
         try {
             const res = await fetch(`${API_URL}/browser/sessions/${sessionId}/screenshot`, {
-                method: 'POST',
-                headers: getAuthHeaders(),
+                method: 'POST', headers: getAuthHeaders(),
             });
             if (res.ok) {
                 const data = await res.json();
@@ -192,8 +205,7 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
     closeSession: async (sessionId: string) => {
         try {
             await fetch(`${API_URL}/browser/sessions/${sessionId}/close`, {
-                method: 'POST',
-                headers: getAuthHeaders(),
+                method: 'POST', headers: getAuthHeaders(),
             });
             set((state) => ({
                 sessions: state.sessions.map(s => s.id === sessionId ? { ...s, status: 'closed' as const } : s),
@@ -205,7 +217,7 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
     },
 
     selectSession: (id: string | null) => {
-        set({ selectedSessionId: id, sessionDetail: null, sessionActions: [] });
+        set({ selectedSessionId: id, sessionDetail: null, sessionActions: [], frontendAnalysis: null, burpCorrelation: null, sessionComparison: null, fullPageState: null });
         if (id) {
             get().fetchSessionDetail(id);
             get().fetchSessionActions(id);
@@ -215,8 +227,7 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
     saveProxyConfig: async (config: ProxyConfig) => {
         try {
             await fetch(`${API_URL}/browser/proxy-config`, {
-                method: 'POST',
-                headers: getAuthHeaders(),
+                method: 'POST', headers: getAuthHeaders(),
                 body: JSON.stringify(config),
             });
             set({ proxyConfig: config });
@@ -224,4 +235,61 @@ export const useBrowserStore = create<BrowserState>()((set, get) => ({
     },
 
     clearError: () => set({ error: null }),
+
+    clearClosedSessions: async () => {
+        try {
+            const res = await fetch(`${API_URL}/browser/sessions/closed`, {
+                method: 'DELETE', headers: getAuthHeaders(),
+            });
+            if (res.ok) {
+                set((state) => ({ sessions: state.sessions.filter(s => s.status !== 'closed') }));
+            }
+        } catch { /* ignore */ }
+    },
+
+    // ── Frontend Analysis Actions ──
+
+    fetchFullPageState: async (sessionId: string) => {
+        set({ isLoadingAnalysis: true });
+        try {
+            const res = await fetch(`${API_URL}/browser/sessions/${sessionId}/full-state`, { headers: getAuthHeaders() });
+            if (res.ok) {
+                const data = await res.json();
+                set({ fullPageState: data.state, isLoadingAnalysis: false });
+            } else { set({ isLoadingAnalysis: false }); }
+        } catch { set({ isLoadingAnalysis: false }); }
+    },
+
+    fetchFrontendAnalysis: async (sessionId: string) => {
+        set({ isLoadingAnalysis: true });
+        try {
+            const res = await fetch(`${API_URL}/browser/sessions/${sessionId}/frontend-analysis`, { headers: getAuthHeaders() });
+            if (res.ok) {
+                const data = await res.json();
+                set({ frontendAnalysis: data.analysis, isLoadingAnalysis: false });
+            } else { set({ isLoadingAnalysis: false }); }
+        } catch { set({ isLoadingAnalysis: false }); }
+    },
+
+    fetchBurpCorrelation: async (sessionId: string) => {
+        set({ isLoadingAnalysis: true });
+        try {
+            const res = await fetch(`${API_URL}/browser/sessions/${sessionId}/burp-correlation`, { headers: getAuthHeaders() });
+            if (res.ok) {
+                const data = await res.json();
+                set({ burpCorrelation: data.correlation, isLoadingAnalysis: false });
+            } else { set({ isLoadingAnalysis: false }); }
+        } catch { set({ isLoadingAnalysis: false }); }
+    },
+
+    compareSessions: async (sessionIdA: string, sessionIdB: string) => {
+        set({ isLoadingAnalysis: true });
+        try {
+            const res = await fetch(`${API_URL}/browser/sessions/${sessionIdA}/compare/${sessionIdB}`, { headers: getAuthHeaders() });
+            if (res.ok) {
+                const data = await res.json();
+                set({ sessionComparison: data.comparison, isLoadingAnalysis: false });
+            } else { set({ isLoadingAnalysis: false }); }
+        } catch { set({ isLoadingAnalysis: false }); }
+    },
 }));

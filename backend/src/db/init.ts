@@ -433,6 +433,13 @@ export async function initDatabase(): Promise<void> {
     logger.info('Added scans.source_analysis_result_json column');
   }
 
+  // Migration: browser_sessions.label (user-friendly session names for multi-session testing)
+  const browserCols = db.prepare('PRAGMA table_info(browser_sessions)').all() as { name: string }[];
+  if (!browserCols.some((c) => c.name === 'label')) {
+    db.exec('ALTER TABLE browser_sessions ADD COLUMN label TEXT');
+    logger.info('Added browser_sessions.label column');
+  }
+
   logger.info('Database initialized successfully');
 }
 
@@ -860,4 +867,10 @@ export const addBrowserAction = (data: {
 
 export const getBrowserActions = (sessionId: string) => {
   return db.prepare('SELECT * FROM browser_actions WHERE session_id = ? ORDER BY id ASC').all(sessionId) as any[];
+};
+
+export const deleteClosedBrowserSessions = (userId: number) => {
+  // browser_actions has ON DELETE CASCADE, so deleting sessions auto-deletes their actions
+  const result = db.prepare('DELETE FROM browser_sessions WHERE user_id = ? AND status = ?').run(userId, 'closed');
+  return result.changes;
 };
