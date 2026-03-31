@@ -346,6 +346,43 @@ export async function initDatabase(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_psrt_run ON presence_scan_run_ttps(run_id);
     CREATE INDEX IF NOT EXISTS idx_psrt_ttp ON presence_scan_run_ttps(ttp_id);
+
+    -- PenPard Browser sessions
+    CREATE TABLE IF NOT EXISTS browser_sessions (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      scan_id TEXT,
+      finding_id INTEGER,
+      target_url TEXT,
+      status TEXT DEFAULT 'launching' CHECK(status IN ('launching','active','paused','closed')),
+      mode TEXT DEFAULT 'human' CHECK(mode IN ('human','ai','mixed')),
+      current_url TEXT,
+      proxy_host TEXT,
+      proxy_port INTEGER,
+      launched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_activity_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      closed_at DATETIME,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE SET NULL
+    );
+
+    -- PenPard Browser action/event log (for future replay/PoC)
+    CREATE TABLE IF NOT EXISTS browser_actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      action_data TEXT,
+      page_url TEXT,
+      page_title TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      source TEXT DEFAULT 'human' CHECK(source IN ('human','ai','system')),
+      FOREIGN KEY (session_id) REFERENCES browser_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_browser_sessions_user ON browser_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_browser_sessions_status ON browser_sessions(status);
+    CREATE INDEX IF NOT EXISTS idx_browser_sessions_scan ON browser_sessions(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_browser_actions_session ON browser_actions(session_id);
   `);
 
   // Seed lock_key_hash if not exists (default key: "penpard")
@@ -764,4 +801,63 @@ export const getCachedPlaybook = (ttpId: string): { content: string; model: stri
 
 export const cachePlaybook = (ttpId: string, content: string, model: string, tokens: number) => {
   db.prepare('INSERT INTO ttp_test_playbooks (ttp_id, content, model, tokens) VALUES (?, ?, ?, ?)').run(ttpId, content, model, tokens);
+};
+
+// ── PenPard Browser Session Helpers ──
+
+export const createBrowserSession = (data: {
+  id: string; userId: number; scanId?: string; findingId?: number;
+  targetUrl?: string; proxyHost?: string; proxyPort?: number;
+}) => {
+  const safeVal = (v: any) => (v === undefined || v === null) ? null : v;
+  return db.prepare(`
+    INSERT INTO browser_sessions (id, user_id, scan_id, finding_id, target_url, status, mode, current_url, proxy_host, proxy_port)
+    VALUES (?, ?, ?, ?, ?, 'launching', 'human', ?, ?, ?)
+  `).run(
+    data.id, data.userId, safeVal(data.scanId), safeVal(data.findingId),
+    safeVal(data.targetUrl), safeVal(data.targetUrl),
+    safeVal(data.proxyHost), safeVal(data.proxyPort)
+  );
+};
+
+export const getBrowserSession = (id: string) => {
+  return db.prepare('SELECT * FROM browser_sessions WHERE id = ?').get(id) as any;
+};
+
+export const getUserBrowserSessions = (userId: number) => {
+  return db.prepare('SELECT * FROM browser_sessions WHERE user_id = ? ORDER BY launched_at DESC').all(userId) as any[];
+};
+
+export const updateBrowserSession = (id: string, updates: Record<string, any>) => {
+  const setClauses = Object.keys(updates).map(k => `${k} = ?`).join(', ');
+  const values = Object.values(updates);
+  return db.prepare(`UPDATE browser_sessions SET ${setClauses} WHERE id = ?`).run(...values, id);
+};
+
+export const closeBrowserSession = (sessionId: string) => {
+  return db.prepare(`
+    UPDATE browser_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ? AND status != 'closed'
+  `).run(sessionId);
+};
+
+export const addBrowserAction = (data: {
+  sessionId: string; actionType: string; actionData?: string;
+  pageUrl?: string; pageTitle?: string; source?: string;
+}) => {
+  const safeVal = (v: any) => (v === undefined || v === null) ? null : v;
+  try {
+    return db.prepare(`
+      INSERT INTO browser_actions (session_id, action_type, action_data, page_url, page_title, source)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      data.sessionId, data.actionType, safeVal(data.actionData),
+      safeVal(data.pageUrl), safeVal(data.pageTitle), data.source || 'human'
+    );
+  } catch (e: any) {
+    logger.error(`Failed to save browser action: ${e.message}`);
+  }
+};
+
+export const getBrowserActions = (sessionId: string) => {
+  return db.prepare('SELECT * FROM browser_actions WHERE session_id = ? ORDER BY id ASC').all(sessionId) as any[];
 };

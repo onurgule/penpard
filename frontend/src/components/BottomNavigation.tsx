@@ -2,7 +2,7 @@
 
 import { useRouter, usePathname } from 'next/navigation';
 import { motion } from 'framer-motion';
-import { Home, ChevronLeft, ChevronRight, Settings, Zap, Shield, Activity, Server, Wifi, WifiOff, FileSearch, Crosshair } from 'lucide-react';
+import { Home, ChevronLeft, ChevronRight, Settings, Zap, Shield, Activity, Server, Wifi, WifiOff, FileSearch, Crosshair, Compass } from 'lucide-react';
 import { useState, useEffect, useCallback } from 'react';
 import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
@@ -244,6 +244,15 @@ export default function BottomNavigation() {
                     >
                         <Crosshair className="w-5 h-5" />
                         <span className="text-[9px] mt-0.5">Scan</span>
+                    </button>
+
+                    <button
+                        onClick={() => router.push('/browser')}
+                        className={`flex flex-col items-center justify-center p-2 rounded-lg transition-all active:scale-90 ${pathname?.startsWith('/browser') ? 'text-violet-400' : 'text-gray-400 hover:text-white'
+                            }`}
+                    >
+                        <Compass className="w-5 h-5" />
+                        <span className="text-[9px] mt-0.5">Browser</span>
                     </button>
 
                     <button

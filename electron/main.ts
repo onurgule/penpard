@@ -290,6 +290,9 @@ ipcMain.handle('menu-action', (_event, action: string) => {
         case 'open-dashboard':
             mainWindow?.webContents.send('navigate-to', '/dashboard');
             break;
+        case 'open-browser':
+            mainWindow?.webContents.send('navigate-to', '/browser');
+            break;
         case 'settings':
             mainWindow?.webContents.send('navigate-to', '/settings');
             break;

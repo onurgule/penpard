@@ -1,6 +1,6 @@
 {
     "name": "penpard",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "description": "PenPard - AI-Powered Penetration Testing Assistant",
     "author": "PenPard Team <info@penpard.com>",
     "license": "PolyForm Noncommercial License 1.0.0",
@@ -77,6 +77,14 @@
             {
                 "from": "backend/node_modules",
                 "to": "backend/node_modules"
+            },
+            {
+                "from": "electron/assets/browser-extension",
+                "to": "browser-extension"
+            },
+            {
+                "from": "electron/assets/browser-icon.ico",
+                "to": "browser-icon.ico"
             }
         ],
         "asarUnpack": [
@@ -150,13 +158,15 @@
         }
     },
     "devDependencies": {
+        "@electron/rebuild": "^4.0.0",
         "@types/node": "^20.11.0",
         "concurrently": "^8.2.0",
         "cross-env": "^7.0.3",
         "electron": "^36.0.0",
         "electron-builder": "^26.7.0",
-        "@electron/rebuild": "^4.0.0",
         "png-to-ico": "^3.0.1",
+        "rcedit": "^5.0.2",
+        "sharp": "^0.34.5",
         "tsx": "^4.21.0",
         "typescript": "^5.9.3",
         "wait-on": "^7.2.0"

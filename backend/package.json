@@ -1,6 +1,6 @@
 {
     "name": "penpard-backend",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "license": "PolyForm Noncommercial License 1.0.0",
     "private": true,
     "bin": {
@@ -33,6 +33,7 @@
         "openai": "^6.16.0",
         "pdf-lib": "^1.17.1",
         "pdf-parse": "^2.4.5",
+        "playwright-core": "^1.58.2",
         "pptxgenjs": "^4.0.1",
         "puppeteer": "^24.0.0",
         "uuid": "^9.0.0",

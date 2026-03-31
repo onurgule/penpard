@@ -15,6 +15,7 @@ import {
     AlertTriangle,
     CheckCircle,
     BarChart3,
+    Compass,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
@@ -480,7 +481,7 @@ export default function DashboardPage() {
                 )}
 
                 {/* Scan Options */}
-                <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+                <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
                     {/* Web Scan Card */}
                     <Link href="/scan/web" data-tour="new-web-scan">
                         <motion.div
@@ -549,6 +550,35 @@ export default function DashboardPage() {
                             </div>
                         </motion.div>
                     </div>
+
+                    {/* PenPard Browser Card */}
+                    <Link href="/browser">
+                        <motion.div
+                            whileHover={{ scale: 1.02, y: -4 }}
+                            whileTap={{ scale: 0.98 }}
+                            className="card card-hover p-8 cursor-pointer group h-full"
+                        >
+                            <div className="flex items-start gap-4">
+                                <div className="p-4 rounded-xl bg-gradient-to-br from-violet-500/20 to-purple-500/20 border border-violet-500/30 group-hover:from-violet-500/30 group-hover:to-purple-500/30 transition-colors">
+                                    <Compass className="w-8 h-8 text-violet-400" />
+                                </div>
+                                <div className="flex-1">
+                                    <h3 className="text-xl font-bold text-white mb-2 group-hover:text-violet-400 transition-colors">
+                                        PenPard Browser
+                                    </h3>
+                                    <p className="text-gray-400 text-sm mb-4">
+                                        Burp-routed testing browser with AI control and manual pentester interaction.
+                                    </p>
+                                    <div className="flex items-center gap-4 text-sm">
+                                        <span className="flex items-center gap-1 text-gray-500">
+                                            <CheckCircle className="w-4 h-4 text-violet-400" />
+                                            Dual-Control
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </motion.div>
+                    </Link>
 
                     {/* System Config Card */}
                     <Link href="/settings">

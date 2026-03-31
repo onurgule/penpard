@@ -19,6 +19,7 @@ import tokenUsageRoutes from './routes/token-usage';
 import penpardRoutes from './routes/penpard';
 import reportAnalysisRoutes from './routes/report-analysis';
 import presenceScanRoutes from './routes/presence-scan';
+import browserRoutes from './routes/browser';
 
 // Load environment variables
 dotenv.config();
@@ -79,6 +80,7 @@ app.use('/api/token-usage', tokenUsageRoutes);
 app.use('/api/penpard', penpardRoutes);
 app.use('/api/report-analysis', reportAnalysisRoutes);
 app.use('/api/presence-scan', presenceScanRoutes);
+app.use('/api/browser', browserRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
