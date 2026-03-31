@@ -109,3 +109,6 @@ playwright-report/
 # Gradle (Burp extension)
 .gradle/
 burp-extension/build/
+
+# AI Agent config
+.agent/
