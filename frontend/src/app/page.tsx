@@ -193,7 +193,7 @@ export default function LockScreenPage() {
                     {/* Footer */}
                     <div className="mt-8 pt-6 border-t border-dark-600/50 text-center">
                         <p className="text-gray-500 text-xs terminal-text">
-                            SYSTEM v1.1.1 • LOCAL INSTANCE
+                            SYSTEM v2.0.0 • LOCAL INSTANCE
                         </p>
                         <p className="text-gray-600 text-xs mt-1">
                             Unauthorized access is prohibited

@@ -287,7 +287,7 @@ export default function DashboardPage() {
                         </div>
                         <div>
                             <h1 className="text-lg font-bold text-white">PENPARD</h1>
-                            <p className="text-xs text-gray-500 terminal-text">CONTROL CENTER <span className="text-cyan-500/70 font-semibold">v1.1.1</span></p>
+                            <p className="text-xs text-gray-500 terminal-text">CONTROL CENTER <span className="text-cyan-500/70 font-semibold">v2.0.0</span></p>
                         </div>
                     </div>
 
@@ -680,7 +680,7 @@ export default function DashboardPage() {
                         </a>
                         <span className="text-slate-600">—</span>
                         <span className="text-slate-500">Pentester Pard</span>
-                        <span className="bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 text-[10px] font-bold px-1.5 py-0.5 rounded ml-1">v1.1.1</span>
+                        <span className="bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 text-[10px] font-bold px-1.5 py-0.5 rounded ml-1">v2.0.0</span>
                         <span className="text-slate-600">—</span>
                         <span className="text-slate-600">Developed by</span>
                         <a
