@@ -37,6 +37,8 @@ export interface BrowserSessionOptions {
     proxyHost?: string;
     proxyPort?: number;
     label?: string;
+    /** Launch in headless mode. Default false (visible) for manual sessions, true for agent sessions. */
+    headless?: boolean;
 }
 
 export interface BrowserAction {
@@ -63,6 +65,16 @@ interface LiveSession {
     sessionId: string;
     userId: number;
     userDataDir: string;
+    /** Whether this session is currently running in headless mode. */
+    isHeadless: boolean;
+    /** Proxy server string for relaunches (e.g. "http://127.0.0.1:8080"). */
+    proxyServer: string;
+    /** Chromium executable path resolved at first launch. */
+    executablePath: string;
+    /** Branding extension path, if available. */
+    brandingExtPath: string | null;
+    /** Lock to prevent concurrent show/hide transitions. */
+    transitioning: boolean;
 }
 
 // ── Service ──
@@ -395,13 +407,14 @@ public class PenPardIconChanger {
             const userDataDir = path.join(os.homedir(), '.penpard', 'browser_sessions', sessionId);
             if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
+            const isHeadless = options.headless ?? false;
             const context = await chromium.launchPersistentContext(userDataDir, {
-                headless: false, // Visible for human interaction
+                headless: isHeadless,
                 executablePath,
                 args: launchArgs,
                 ignoreHTTPSErrors: true,
                 proxy: { server: proxyServer },
-                viewport: null, // Use full window size
+                viewport: isHeadless ? { width: 1280, height: 720 } : null,
             });
 
             // ── Windows Icon Override ──
@@ -424,6 +437,11 @@ public class PenPardIconChanger {
                 sessionId,
                 userId,
                 userDataDir,
+                isHeadless,
+                proxyServer,
+                executablePath: executablePath || '',
+                brandingExtPath,
+                transitioning: false,
             };
             this.sessions.set(sessionId, liveSession);
 
@@ -748,9 +766,10 @@ public class PenPardIconChanger {
     }
 
     /**
-     * Check if a session is alive in-memory.
+     * Check if a session is alive in-memory (simple check).
+     * A more robust version with context validation is available below.
      */
-    isSessionAlive(sessionId: string): boolean {
+    isSessionAliveSimple(sessionId: string): boolean {
         return this.sessions.has(sessionId);
     }
 
@@ -1204,6 +1223,171 @@ public class PenPardIconChanger {
                 ? 'Sessions have different cookies — session isolation is working. Suitable for IDOR/BAC testing.'
                 : 'Sessions share identical cookies — may need different login states for access control testing.',
         };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Session Health & Visibility Toggle
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Check if a session exists and its underlying Playwright context is still connected.
+     */
+    isSessionAlive(sessionId: string): boolean {
+        const session = this.sessions.get(sessionId);
+        if (!session) return false;
+        try {
+            // Playwright BrowserContext does not expose a direct "connected" check.
+            // Accessing pages() on a closed context throws.
+            session.context.pages();
+            return true;
+        } catch {
+            // Context is dead — clean up stale reference
+            this.sessions.delete(sessionId);
+            return false;
+        }
+    }
+
+    /**
+     * Get the current headless state of a session.
+     */
+    getSessionVisibility(sessionId: string): { isHeadless: boolean; transitioning: boolean } | null {
+        const session = this.sessions.get(sessionId);
+        if (!session) return null;
+        return { isHeadless: session.isHeadless, transitioning: session.transitioning };
+    }
+
+    /**
+     * Show a headless browser session — relaunch visible using the same userDataDir.
+     * Cookies, localStorage, and sessionStorage are preserved via the persistent profile.
+     */
+    async showBrowser(sessionId: string): Promise<void> {
+        await this.toggleVisibility(sessionId, false);
+    }
+
+    /**
+     * Hide a visible browser session — relaunch headless using the same userDataDir.
+     */
+    async hideBrowser(sessionId: string): Promise<void> {
+        await this.toggleVisibility(sessionId, true);
+    }
+
+    /**
+     * Core relaunch logic for visibility transitions.
+     * Closes the current context and relaunches with the desired headless state.
+     */
+    private async toggleVisibility(sessionId: string, targetHeadless: boolean): Promise<void> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        if (session.transitioning) throw new Error(`Session ${sessionId} is already transitioning`);
+        if (session.isHeadless === targetHeadless) {
+            logger.info('Session already in desired visibility state', { sessionId, headless: targetHeadless });
+            return; // Already in the desired state
+        }
+
+        session.transitioning = true;
+        const label = targetHeadless ? 'headless' : 'visible';
+        logger.info(`Switching browser session to ${label}`, { sessionId });
+
+        try {
+            // Capture current URL before closing
+            let lastUrl = 'about:blank';
+            try {
+                lastUrl = session.page.url();
+            } catch { /* page may be dead */ }
+
+            // Close old context gracefully
+            try {
+                // Remove the 'close' listener temporarily to avoid premature cleanup
+                session.context.removeAllListeners('close');
+                await session.context.close();
+            } catch (e: any) {
+                logger.warn('Error closing context during visibility toggle (non-fatal)', { sessionId, error: e.message });
+            }
+
+            // Rebuild launch args
+            const launchArgs: string[] = [
+                `--proxy-server=${session.proxyServer}`,
+                '--ignore-certificate-errors',
+                '--ignore-certificate-errors-spki-list',
+                '--disable-web-security',
+                '--allow-running-insecure-content',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-blink-features=AutomationControlled',
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            ];
+
+            if (session.brandingExtPath && !targetHeadless) {
+                launchArgs.push(
+                    `--disable-extensions-except=${session.brandingExtPath}`,
+                    `--load-extension=${session.brandingExtPath}`,
+                );
+            }
+
+            // Relaunch with the same persistent profile
+            const newContext = await chromium.launchPersistentContext(session.userDataDir, {
+                headless: targetHeadless,
+                executablePath: session.executablePath,
+                args: launchArgs,
+                ignoreHTTPSErrors: true,
+                proxy: { server: session.proxyServer },
+                viewport: targetHeadless ? { width: 1280, height: 720 } : null,
+            });
+
+            const pages = newContext.pages();
+            const newPage = pages.length > 0 ? pages[0] : await newContext.newPage();
+
+            // Restore last URL
+            if (lastUrl && lastUrl !== 'about:blank') {
+                try {
+                    await newPage.goto(lastUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                } catch (navErr: any) {
+                    logger.warn('Could not restore URL after visibility toggle (non-fatal)', {
+                        sessionId, lastUrl, error: navErr.message,
+                    });
+                }
+            }
+
+            // Re-attach event listeners
+            newPage.on('framenavigated', (frame: any) => {
+                if (frame === newPage.mainFrame()) {
+                    const url = newPage.url();
+                    updateBrowserSession(sessionId, {
+                        current_url: url,
+                        last_activity_at: new Date().toISOString(),
+                    });
+                }
+            });
+
+            newContext.on('close', () => {
+                logger.info('Browser context closed (post-toggle)', { sessionId });
+                this.sessions.delete(sessionId);
+                dbCloseSession(sessionId);
+            });
+
+            // Update session references in-place
+            session.browser = newContext.browser() || (newContext as any);
+            session.context = newContext;
+            session.page = newPage;
+            session.isHeadless = targetHeadless;
+            session.transitioning = false;
+
+            // Apply Windows icon override for visible mode
+            if (!targetHeadless) {
+                const browserIcoPath = this.resolveBrowserIconPath();
+                if (browserIcoPath) {
+                    this.applyWindowsIconOverride(browserIcoPath);
+                }
+            }
+
+            logger.info(`Browser session switched to ${label}`, { sessionId, restoredUrl: lastUrl });
+
+        } catch (error: any) {
+            session.transitioning = false;
+            logger.error(`Failed to switch browser visibility to ${label}`, { sessionId, error: error.message });
+            // Attempt to clean up the stale session
+            this.sessions.delete(sessionId);
+            throw new Error(`Visibility toggle failed: ${error.message}. Session ${sessionId} is no longer valid.`);
+        }
     }
 }
 

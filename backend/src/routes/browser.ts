@@ -219,4 +219,44 @@ router.delete('/sessions/closed', authenticateToken, (req: AuthRequest, res: Res
     }
 });
 
+/** POST /api/browser/sessions/:id/show — switch from headless to visible */
+router.post('/sessions/:id/show', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        logger.info('Show browser requested', { sessionId: id });
+        await browserService.showBrowser(id);
+        res.json({ message: 'Browser is now visible', isHeadless: false });
+    } catch (error: any) {
+        logger.error('Show browser failed', { error: error.message });
+        res.status(400).json({ error: true, message: error.message });
+    }
+});
+
+/** POST /api/browser/sessions/:id/hide — switch from visible to headless */
+router.post('/sessions/:id/hide', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        logger.info('Hide browser requested', { sessionId: id });
+        await browserService.hideBrowser(id);
+        res.json({ message: 'Browser is now headless', isHeadless: true });
+    } catch (error: any) {
+        logger.error('Hide browser failed', { error: error.message });
+        res.status(400).json({ error: true, message: error.message });
+    }
+});
+
+/** GET /api/browser/sessions/:id/visibility — get current visibility state */
+router.get('/sessions/:id/visibility', authenticateToken, (req: AuthRequest, res: Response) => {
+    try {
+        const visibility = browserService.getSessionVisibility(req.params.id);
+        if (!visibility) {
+            res.status(404).json({ error: true, message: 'Session not found or not active' });
+            return;
+        }
+        res.json(visibility);
+    } catch (error: any) {
+        res.status(500).json({ error: true, message: error.message });
+    }
+});
+
 export default router;

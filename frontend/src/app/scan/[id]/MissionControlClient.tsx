@@ -15,6 +15,7 @@ import {
     Activity,
     Lock,
     Eye,
+    EyeOff,
     StopCircle,
     Download,
     Pause,
@@ -23,6 +24,7 @@ import {
     Loader2,
     Crosshair,
     ScanSearch,
+    Globe,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import toast from 'react-hot-toast';
@@ -104,6 +106,17 @@ export default function MissionControlClient() {
     const [continueIterations, setContinueIterations] = useState(3);
     const [continuePlanning, setContinuePlanning] = useState(true);
     const [isContinuing, setIsContinuing] = useState(false);
+
+    // Browser visibility state
+    const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
+    const [browserIsHeadless, setBrowserIsHeadless] = useState<boolean | null>(null);
+    const [browserTransitioning, setBrowserTransitioning] = useState(false);
+
+    // Pentester Loop v2 state
+    const [hypothesisCount, setHypothesisCount] = useState<Record<string, number>>({ new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 });
+    const [coverageSummary, setCoverageSummary] = useState<{ routesSeen: number; exercised: number; promoted: number; untested: number; coveragePercentage: number } | null>(null);
+    const [harvestedCount, setHarvestedCount] = useState(0);
+    const [promotedCount, setPromotedCount] = useState(0);
 
     // Initial fetch
     // Modal State
@@ -202,6 +215,21 @@ export default function MissionControlClient() {
             setBurpConnected(data.burpConnected);
             setActiveAgentCount(data.activeAgents || 0);
             setScanCompleted(data.scanCompleted || false);
+
+            // Track browser state
+            if (data.browserSessionId) {
+                setBrowserSessionId(data.browserSessionId);
+                setBrowserIsHeadless(data.browserIsHeadless ?? null);
+                setBrowserTransitioning(data.browserTransitioning ?? false);
+            } else {
+                setBrowserSessionId(null);
+            }
+
+            // Track pentester loop v2 state
+            if (data.hypothesisCount) setHypothesisCount(data.hypothesisCount);
+            if (data.coverageSummary) setCoverageSummary(data.coverageSummary);
+            if (data.harvestedRequestCount !== undefined) setHarvestedCount(data.harvestedRequestCount);
+            if (data.promotedRequestCount !== undefined) setPromotedCount(data.promotedRequestCount);
 
             // Append new logs (only if there are actually new ones)
             if (data.logs && data.logs.length > 0 && data.logsCount > logIndexRef.current) {
@@ -500,6 +528,43 @@ User Question: ${userQuestion}`;
                         </div>
                     </div>
                     <div className="flex items-center gap-3">
+                        {/* Browser Show/Hide Toggle */}
+                        {isAgentActive && browserSessionId && status !== 'completed' && status !== 'failed' && status !== 'stopped' && (
+                            <button
+                                onClick={async () => {
+                                    if (browserTransitioning) return;
+                                    setBrowserTransitioning(true);
+                                    try {
+                                        const endpoint = browserIsHeadless ? 'show' : 'hide';
+                                        await axios.post(`${API_URL}/scans/${scanIdRef.current}/browser/${endpoint}`, {}, {
+                                            headers: { Authorization: `Bearer ${token}` }
+                                        });
+                                        setBrowserIsHeadless(!browserIsHeadless);
+                                        toast.success(browserIsHeadless ? 'Browser window opened' : 'Browser hidden');
+                                    } catch (e: any) {
+                                        toast.error(e.response?.data?.message || 'Failed to toggle browser');
+                                    } finally {
+                                        setBrowserTransitioning(false);
+                                    }
+                                }}
+                                disabled={browserTransitioning}
+                                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                                    browserIsHeadless
+                                        ? 'bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:bg-purple-500/20'
+                                        : 'bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20'
+                                } disabled:opacity-50`}
+                                title={browserIsHeadless ? 'Show the Chromium browser window' : 'Hide browser back to headless mode'}
+                            >
+                                {browserTransitioning ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : browserIsHeadless ? (
+                                    <Eye className="w-3.5 h-3.5" />
+                                ) : (
+                                    <EyeOff className="w-3.5 h-3.5" />
+                                )}
+                                {browserTransitioning ? 'Switching...' : browserIsHeadless ? 'Show Browser' : 'Hide Browser'}
+                            </button>
+                        )}
                         {/* Pause / Resume Button */}
                         {isAgentActive && !isPaused && status !== 'completed' && status !== 'failed' && status !== 'stopped' && (
                             <button
@@ -831,6 +896,52 @@ User Question: ${userQuestion}`;
                                 }`}></div>
                                 {scanCompleted ? 'Burp Session Ended' : burpConnected === true ? 'Burp Connected' : 'Burp Disconnected'}
                             </span>
+                            {/* Browser status indicator */}
+                            {isAgentActive && browserSessionId && (
+                                <span className="flex items-center gap-1">
+                                    <div className={`w-1.5 h-1.5 rounded-full ${
+                                        browserIsHeadless ? 'bg-purple-500' : 'bg-green-500'
+                                    }`}></div>
+                                    <Globe className="w-3 h-3 text-slate-500" />
+                                    {browserIsHeadless ? 'Headless' : 'Visible'}
+                                </span>
+                            )}
+                            {/* Hypothesis status badges */}
+                            {isAgentActive && (hypothesisCount.testing > 0 || hypothesisCount.escalated > 0 || hypothesisCount.confirmed > 0) && (
+                                <span className="flex items-center gap-1.5">
+                                    {hypothesisCount.escalated > 0 && (
+                                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-amber-500/20 text-amber-400 font-medium">
+                                            ⚡ {hypothesisCount.escalated} escalated
+                                        </span>
+                                    )}
+                                    {hypothesisCount.confirmed > 0 && (
+                                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-green-500/20 text-green-400 font-medium">
+                                            ✅ {hypothesisCount.confirmed} confirmed
+                                        </span>
+                                    )}
+                                    {hypothesisCount.testing > 0 && (
+                                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-blue-500/20 text-blue-400 font-medium">
+                                            🔬 {hypothesisCount.testing} testing
+                                        </span>
+                                    )}
+                                </span>
+                            )}
+                            {/* Coverage indicator */}
+                            {isAgentActive && coverageSummary && coverageSummary.routesSeen > 0 && (
+                                <span className="flex items-center gap-1 text-[10px] text-slate-500">
+                                    Routes: {coverageSummary.exercised}/{coverageSummary.routesSeen}
+                                    {coverageSummary.coveragePercentage > 0 && (
+                                        <span className={`font-medium ${
+                                            coverageSummary.coveragePercentage >= 70 ? 'text-green-400' :
+                                            coverageSummary.coveragePercentage >= 40 ? 'text-amber-400' : 'text-red-400'
+                                        }`}>
+                                            ({coverageSummary.coveragePercentage}%)
+                                        </span>
+                                    )}
+                                    {harvestedCount > 0 && <span>| Harvested: {harvestedCount}</span>}
+                                    {promotedCount > 0 && <span>| Promoted: {promotedCount}</span>}
+                                </span>
+                            )}
                         </div>
                         <div className="flex items-center gap-3">
                             {isAgentActive && !isPaused && status !== 'completed' && status !== 'failed' && (

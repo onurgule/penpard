@@ -20,6 +20,11 @@ import fs from 'fs';
 import { mindsetService, MindsetTTP } from '../services/mindset-service';
 import { analyzeSource, buildAgentContextBlock } from '../services/source-analysis/SourceAnalysisService';
 import { SourceAnalysisMode } from '../services/source-analysis/SourceAnalysisMode';
+import { RequestHarvester, HarvestedRequest, PromotedRequest } from '../services/RequestHarvester';
+import { HypothesisEngine, VulnHypothesis, MutationTemplate } from '../services/HypothesisEngine';
+import { CoverageTracker } from '../services/CoverageTracker';
+import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
+import { browserService } from '../services/BrowserService';
 
 type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
 
@@ -135,6 +140,66 @@ When asked to REPLAN, review all findings so far and create the next 5-step plan
 9. extract_links
    Args: { "url": "full_url" }
    Extract all links, forms, and resources from a page.
+
+10. browser_navigate
+    Args: { "url": "full_url" }
+    Navigate to URL in PenPard Browser (renders JavaScript, executes client-side code).
+    Use instead of send_http_request when you need to see JS-rendered content, SPAs, or
+    interact with the page. ALL browser traffic routes through Burp proxy automatically.
+
+11. browser_get_page_state
+    Args: {}
+    Get current page DOM state: forms, links, hidden inputs, meta tags, cookies,
+    localStorage, sessionStorage. More complete than HTTP response body for JS-heavy apps.
+
+12. browser_get_frontend_analysis
+    Args: {}
+    Extract from current page JavaScript: API endpoints, GraphQL URLs, WebSocket URLs,
+    JWT tokens, CSRF tokens, frontend routes, hidden parameters.
+    Reveals attack surface invisible to HTTP-only testing.
+
+13. browser_fill_and_submit
+    Args: { "fields": [{"selector": "input[name=user]", "value": "admin"}, {"selector": "input[name=pass]", "value": "' OR 1=1--"}], "submit_selector": "button[type=submit]" }
+    Fill form fields and submit. For testing login, search, registration with payloads.
+    All submission traffic is captured by Burp proxy.
+
+14. browser_evaluate_js
+    Args: { "script": "document.cookie" }
+    Run JavaScript in the page context. Access DOM, cookies, localStorage, sessionStorage.
+    Returns the evaluation result.
+
+15. browser_screenshot
+    Args: {}
+    Capture screenshot of current page state. Use as evidence when reporting findings.
+
+16. browser_correlate_burp
+    Args: {}
+    Compare frontend-discovered API endpoints with Burp proxy traffic history.
+    Returns endpoints found in JS but never seen in Burp = untested attack surface.
+    ALWAYS use after browser_get_frontend_analysis to find hidden endpoints.
+
+17. harvest_traffic
+    Args: {}
+    Harvest recent Burp proxy traffic, classify requests by purpose (authentication,
+    state-changing, object-reference, admin, etc.), and score them for testing interest.
+    Returns newly-harvested high-value requests ready for active testing.
+
+18. get_hypotheses
+    Args: { "status": "new|testing|escalated|confirmed|discarded|all" }
+    Get current vulnerability hypotheses and their validation evidence.
+    Each hypothesis tracks: type, target endpoint, parameter, confidence, status, next action.
+
+19. get_coverage
+    Args: {}
+    Get coverage summary: tested vs untested endpoints, explored vs unexplored workflows,
+    frontend-only routes, weakly-tested areas. Use to identify gaps in testing.
+
+20. repeater_test
+    Args: { "requestId": "req-...", "mutations": [{ "parameter": "id", "originalValue": "1", "newValue": "2", "description": "IDOR swap" }] }
+    Send a harvested request through Burp with controlled mutations.
+    Returns response diff analysis: status change, body change, keyword signals, significance.
+    Use for hypothesis validation — testing specific vulnerability theories with evidence.
+
 
 ═══════════════════════════════════════════════════════════════
   OPERATOR SCAN INSTRUCTIONS (HIGHEST PRIORITY — OVERRIDES PHASES)
@@ -331,7 +396,13 @@ ALL FINDINGS SO FAR:
 DISCOVERED ENDPOINTS:
 {ENDPOINTS}
 
+{HYPOTHESIS_STATUS}
+
+{COVERAGE_STATUS}
+
 Now decide: is more testing needed within the allowed scope?
+- PRIORITIZE untested surface and escalated hypotheses before testing already-covered endpoints.
+- Use harvest_traffic to discover new Burp-observed requests, then repeater_test for hypothesis validation.
 - If operator instructions defined a specific scope and you have tested it thoroughly → FINISH. Respond with the completion JSON.
 - Do NOT expand beyond operator-defined scope. Do NOT add new endpoints or vuln types that were not requested.
 - If more testing is needed within scope: test different payloads, techniques, or parameters on the SAME endpoint(s).
@@ -394,6 +465,17 @@ export class OrchestratorAgent {
     // Mindset library — loaded TTPs from past report analyses
     private mindsetTTPs: MindsetTTP[] = [];
 
+    // Browser session for AI-driven browser testing
+    private browserSessionId: string | null = null;
+    private browserLock: boolean = false;
+
+    // ── Pentester Loop Services (v2) ──
+    private harvester: RequestHarvester;
+    private hypothesisEngine: HypothesisEngine;
+    private coverageTracker: CoverageTracker;
+    private lastFrontendAnalysis: any = null;
+    private frontendAnalysisVersion: number = 0;
+
     constructor(scanId: string, targetUrl: string, config: ScanConfig, burp: BurpMCPClient) {
         this.scanId = scanId;
         this.targetUrl = targetUrl;
@@ -403,6 +485,11 @@ export class OrchestratorAgent {
         // maxPlanRounds: 0 or undefined = no fixed limit (model decides)
         const requested = config.maxPlanRounds ?? 0;
         this.maxPlanRounds = requested > 0 ? requested : 0;
+
+        // Initialize pentester loop services
+        this.harvester = new RequestHarvester();
+        this.hypothesisEngine = new HypothesisEngine();
+        this.coverageTracker = new CoverageTracker();
     }
 
     /**
@@ -815,6 +902,8 @@ Proceed with testing.`
         this.isRunning = false;
         this.phase = 'stopped';
         this.log('system', 'Stop command received. Terminating agent...');
+        // Cleanup browser session
+        this.cleanupBrowserSession();
     }
 
     public pause() {
@@ -835,6 +924,7 @@ Proceed with testing.`
     }
 
     public getState() {
+        const loopState = this.getPentesterLoopState();
         return {
             phase: this.phase,
             isRunning: this.isRunning,
@@ -843,6 +933,7 @@ Proceed with testing.`
             findingsCount: this.findings.length,
             planRound: this.planRound,
             currentPlan: this.currentPlan,
+            ...loopState,
         };
     }
 
@@ -1003,6 +1094,9 @@ Proceed with testing.`
 
         this.log('system', '✓ System prompt loaded');
         await this.delay(500);
+
+        // ── Auto-launch headless browser + frontend analysis ──
+        await this.initBrowserAndAnalyze();
 
         // Analyze operator instructions with LLM to determine scope
         if (this.config.customSystemPrompt) {
@@ -1287,6 +1381,20 @@ Start by sending the original request as-is to get a baseline response, then beg
 
             this.stepResults = [...this.stepResults, ...roundResults];
 
+            // ── HARVEST: Pull and classify Burp traffic after round ──
+            try {
+                await this.runHarvestCycle();
+            } catch (e: any) {
+                this.log('error', `Harvest cycle failed (non-fatal): ${e.message}`);
+            }
+
+            // ── DELTA FRONTEND ANALYSIS: Check for new state after round ──
+            try {
+                await this.deltaFrontendAnalysis('round-end');
+            } catch (e: any) {
+                this.log('error', `Delta analysis failed (non-fatal): ${e.message}`);
+            }
+
             // ── REPLAN ──
             this.phase = 'replanning';
             this.log('system', `\nRound ${this.planRound} complete. Findings this round: ${roundResults.reduce((sum, r) => sum + r.findings.length, 0)}`);
@@ -1340,6 +1448,9 @@ Start by sending the original request as-is to get a baseline response, then beg
         updateScanStatus(this.scanId, 'completed');
         this.log('system', `\n═══ SCAN COMPLETED ═══`);
         this.log('system', `Rounds: ${this.planRound} | Endpoints: ${this.discoveredEndpoints.size} | Findings: ${vulns.length}`);
+
+        // Cleanup browser session when scan completes
+        this.cleanupBrowserSession();
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1565,7 +1676,9 @@ Start by sending the original request as-is to get a baseline response, then beg
                 .replace('{STEP_RESULTS}', stepSummary)
                 .replace('{ALL_FINDINGS}', allFindings || 'None yet')
                 .replace('{ENDPOINTS}', endpoints || 'None discovered')
-                .replace('{OPERATOR_INSTRUCTIONS_REMINDER}', this.getOperatorInstructionsReminder());
+                .replace('{OPERATOR_INSTRUCTIONS_REMINDER}', this.getOperatorInstructionsReminder())
+                .replace('{HYPOTHESIS_STATUS}', this.hypothesisEngine.getSummaryForPrompt())
+                .replace('{COVERAGE_STATUS}', this.coverageTracker.getSummaryForPrompt());
 
             this.conversationHistory.push({ role: 'user', content: replanPrompt });
 
@@ -1661,12 +1774,47 @@ Start by sending the original request as-is to get a baseline response, then beg
                 case 'analyze_response':
                     return { status: 'Analysis requested - handled by LLM' };
 
+                // ── Browser Tools ──
+                case 'browser_navigate':
+                    return await this.executeBrowserNavigate(toolCall);
+
+                case 'browser_get_page_state':
+                    return await this.executeBrowserPageState();
+
+                case 'browser_get_frontend_analysis':
+                    return await this.executeBrowserFrontendAnalysis();
+
+                case 'browser_fill_and_submit':
+                    return await this.executeBrowserFillSubmit(toolCall);
+
+                case 'browser_evaluate_js':
+                    return await this.executeBrowserEvaluateJs(toolCall);
+
+                case 'browser_screenshot':
+                    return await this.executeBrowserScreenshot();
+
+                case 'browser_correlate_burp':
+                    return await this.executeBrowserCorrelateBurp();
+
+                // ── Pentester Loop Tools (v2) ──
+                case 'harvest_traffic':
+                    return await this.executeHarvestTraffic();
+
+                case 'get_hypotheses':
+                    return await this.executeGetHypotheses(toolCall);
+
+                case 'get_coverage':
+                    return await this.executeGetCoverage();
+
+                case 'repeater_test':
+                    return await this.executeRepeaterTest(toolCall);
+
                 case 'none':
                     return { status: 'No tool call (step complete)' };
 
                 default:
                     this.log('error', `Unknown tool: ${toolCall.tool}`);
-                    return { error: `Unknown tool: ${toolCall.tool}. Available: send_http_request, get_proxy_history, get_session_cookies, get_cookies_and_auth_for_host, send_to_scanner, get_sitemap, spider_url, check_authorization, generate_payloads, extract_links` };
+                    return { error: `Unknown tool: ${toolCall.tool}. Available: send_http_request, get_proxy_history, get_session_cookies, send_to_scanner, get_sitemap, spider_url, check_authorization, generate_payloads, extract_links, browser_navigate, browser_get_page_state, browser_get_frontend_analysis, browser_fill_and_submit, browser_evaluate_js, browser_screenshot, browser_correlate_burp, harvest_traffic, get_hypotheses, get_coverage, repeater_test` };
             }
         } catch (e: any) {
             this.log('error', `Tool error: ${e.message}`);
@@ -2274,6 +2422,315 @@ Start by sending the original request as-is to get a baseline response, then beg
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  BROWSER TOOLS — AI-driven browser testing
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Initialize headless browser and run automatic frontend analysis.
+     * Called early in phaseInit() so browser intelligence informs the first planning round.
+     * Non-fatal: if browser launch fails the scan continues in HTTP-only mode.
+     */
+    private async initBrowserAndAnalyze(): Promise<void> {
+        this.log('system', '🌐 Launching headless PenPard Browser...');
+        try {
+            this.browserSessionId = await browserService.launchSession(1, {
+                targetUrl: this.targetUrl,
+                scanId: this.scanId,
+                headless: true,
+            });
+            this.log('system', '✓ PenPard Browser: Running (headless)');
+        } catch (err: any) {
+            this.log('error', `Browser launch failed (non-fatal): ${err.message}`);
+            this.log('system', 'Continuing without browser tools — HTTP-only mode.');
+            this.browserSessionId = null;
+            return;
+        }
+
+        // ── Automatic Frontend Analysis ──
+        this.log('system', '🔍 Running automatic frontend analysis...');
+        try {
+            let browserIntelBlock = '\n\n═══════════════════════════════════════════════════════════════\n';
+            browserIntelBlock += '  BROWSER INTELLIGENCE (auto-collected at scan start)\n';
+            browserIntelBlock += '═══════════════════════════════════════════════════════════════\n\n';
+
+            let hasIntel = false;
+
+            // Frontend analysis — extract JS-embedded endpoints, tokens, routes
+            try {
+                const frontendAnalysis = await browserService.getFrontendAnalysis(this.browserSessionId);
+                if (frontendAnalysis.apiEndpoints?.length > 0) {
+                    browserIntelBlock += `API Endpoints (from JavaScript): ${frontendAnalysis.apiEndpoints.join(', ')}\n`;
+                    frontendAnalysis.apiEndpoints.forEach((ep: string) => this.discoveredEndpoints.add(ep));
+                    hasIntel = true;
+                }
+                if (frontendAnalysis.graphqlIndicators?.length > 0) {
+                    browserIntelBlock += `GraphQL Indicators: ${frontendAnalysis.graphqlIndicators.join(', ')}\n`;
+                    hasIntel = true;
+                }
+                if (frontendAnalysis.websocketUrls?.length > 0) {
+                    browserIntelBlock += `WebSocket URLs: ${frontendAnalysis.websocketUrls.join(', ')}\n`;
+                    hasIntel = true;
+                }
+                if (frontendAnalysis.csrfTokens?.length > 0) {
+                    browserIntelBlock += `CSRF Tokens: ${JSON.stringify(frontendAnalysis.csrfTokens)}\n`;
+                    hasIntel = true;
+                }
+                if (frontendAnalysis.tokenPatterns?.length > 0) {
+                    browserIntelBlock += `Token Patterns: ${frontendAnalysis.tokenPatterns.join(', ')}\n`;
+                    hasIntel = true;
+                }
+                this.log('system', `✓ Frontend analysis: ${frontendAnalysis.apiEndpoints?.length || 0} API endpoints found`);
+            } catch (e: any) {
+                this.log('error', `Frontend analysis failed (non-fatal): ${e.message}`);
+            }
+
+            // Page state — extract forms, links, hidden inputs
+            try {
+                const pageState = await browserService.getPageState(this.browserSessionId);
+                if (pageState?.forms?.length > 0) {
+                    browserIntelBlock += `\nForms (${pageState.forms.length} found):\n`;
+                    pageState.forms.forEach((f: any) => {
+                        const fields = f.fields?.map((fd: any) => `${fd.name || fd.id}(${fd.type})`).join(', ') || 'no fields';
+                        browserIntelBlock += `  - ${f.method || 'GET'} ${f.action || '/'} [${fields}]\n`;
+                    });
+                    hasIntel = true;
+                }
+                this.log('system', `✓ Page state: ${pageState?.forms?.length || 0} forms, ${pageState?.links?.length || 0} links`);
+            } catch (e: any) {
+                this.log('error', `Page state extraction failed (non-fatal): ${e.message}`);
+            }
+
+            // Burp correlation — find untested endpoints
+            try {
+                const correlation = await browserService.correlateBrowserWithBurp(this.browserSessionId);
+                if (correlation?.frontendOnlyEndpoints?.length > 0) {
+                    browserIntelBlock += `\n⚠️ UNTESTED ENDPOINTS (found in JavaScript but NOT in Burp proxy traffic):\n`;
+                    correlation.frontendOnlyEndpoints.forEach((ep: string) => {
+                        browserIntelBlock += `  → ${ep}\n`;
+                    });
+                    browserIntelBlock += `  These are HIGH PRIORITY targets — test them!\n`;
+                    hasIntel = true;
+                    this.log('system', `✓ Burp correlation: ${correlation.frontendOnlyEndpoints.length} untested endpoints found`);
+                } else {
+                    this.log('system', '✓ Burp correlation: No untested endpoints found');
+                }
+            } catch (e: any) {
+                this.log('error', `Burp correlation failed (non-fatal): ${e.message}`);
+            }
+
+            // Inject browser intelligence into system prompt
+            if (hasIntel) {
+                this.systemPromptContent += browserIntelBlock;
+                // Update the already-pushed system message
+                if (this.conversationHistory.length > 0 && this.conversationHistory[0].role === 'system') {
+                    this.conversationHistory[0].content = this.systemPromptContent;
+                }
+                this.log('system', '✓ Browser intelligence injected into agent context');
+            } else {
+                this.log('system', 'No browser intelligence discovered at startup');
+            }
+        } catch (e: any) {
+            this.log('error', `Automatic frontend analysis failed (non-fatal): ${e.message}`);
+        }
+    }
+
+    /**
+     * Ensure a browser session exists and is alive.
+     * If the session is dead or missing, attempt a relaunch.
+     */
+    private async ensureBrowserSession(): Promise<string> {
+        if (this.browserSessionId && browserService.isSessionAlive(this.browserSessionId)) {
+            return this.browserSessionId;
+        }
+
+        // Session is dead or was never created — attempt relaunch
+        this.log('system', '🌐 Browser session not found. Re-launching headless browser...');
+        try {
+            this.browserSessionId = await browserService.launchSession(1, {
+                targetUrl: this.targetUrl,
+                scanId: this.scanId,
+                headless: true,
+            });
+            this.log('system', '✓ Browser re-launched successfully');
+            return this.browserSessionId;
+        } catch (err: any) {
+            this.log('error', `Browser re-launch failed: ${err.message}`);
+            throw new Error(`Browser session unavailable: ${err.message}`);
+        }
+    }
+
+    /**
+     * Cleanup browser session. Safe to call multiple times.
+     */
+    private cleanupBrowserSession(): void {
+        if (this.browserSessionId) {
+            const sid = this.browserSessionId;
+            this.browserSessionId = null;
+            browserService.closeSession(sid).catch((err: any) => {
+                this.log('error', `Browser session cleanup failed (non-fatal): ${err.message}`);
+            });
+            this.log('system', '🌐 Browser session closed');
+        }
+    }
+
+    /**
+     * Get the current browser session ID. Exposed for show/hide API.
+     */
+    public getBrowserSessionId(): string | null {
+        return this.browserSessionId;
+    }
+
+    // ── Browser Tool Implementations ──
+
+    private async executeBrowserNavigate(toolCall: ToolCall): Promise<any> {
+        const sessionId = await this.ensureBrowserSession();
+        const url = toolCall.args?.url;
+        if (!url) return { error: 'Missing required arg: url' };
+
+        this.log('tool', `🌐 browser_navigate → ${url}`);
+        const result = await browserService.executeAction(sessionId, {
+            type: 'goto',
+            url,
+        });
+
+        // Track the discovered endpoint + update coverage
+        try {
+            const pathname = new URL(url).pathname;
+            this.discoveredEndpoints.add(pathname);
+            this.coverageTracker.markExercisedInBrowser(pathname, 'GET');
+            this.coverageTracker.inferWorkflowFromRoute(pathname);
+        } catch { /* malformed URL */ }
+
+        // Delta analysis after navigation
+        this.deltaFrontendAnalysis('navigation').catch(() => { /* non-fatal */ });
+
+        return result;
+    }
+
+    private async executeBrowserPageState(): Promise<any> {
+        const sessionId = await this.ensureBrowserSession();
+        this.log('tool', '🌐 browser_get_page_state');
+        const state = await browserService.getPageState(sessionId);
+
+        // Also get storage data for a complete picture
+        let storageData: any = {};
+        try {
+            storageData = await browserService.getSessionStorageData(sessionId);
+        } catch { /* non-fatal */ }
+
+        return {
+            ...state,
+            cookies: storageData.contextCookies || [],
+            localStorage: storageData.localStorageData || {},
+            sessionStorage: storageData.sessionStorageData || {},
+        };
+    }
+
+    private async executeBrowserFrontendAnalysis(): Promise<any> {
+        const sessionId = await this.ensureBrowserSession();
+        this.log('tool', '🌐 browser_get_frontend_analysis');
+        const analysis = await browserService.getFrontendAnalysis(sessionId);
+
+        // Feed discovered endpoints into the orchestrator's tracking
+        if (analysis.apiEndpoints?.length > 0) {
+            analysis.apiEndpoints.forEach((ep: string) => this.discoveredEndpoints.add(ep));
+        }
+
+        return analysis;
+    }
+
+    private async executeBrowserFillSubmit(toolCall: ToolCall): Promise<any> {
+        const sessionId = await this.ensureBrowserSession();
+        const { fields, submit_selector } = toolCall.args || {};
+        if (!fields || !Array.isArray(fields)) {
+            return { error: 'Missing required arg: fields (array of {selector, value})' };
+        }
+
+        this.log('tool', `🌐 browser_fill_and_submit (${fields.length} fields)`);
+
+        // Fill each field sequentially
+        for (const field of fields) {
+            if (!field.selector || field.value === undefined) continue;
+            await browserService.executeAction(sessionId, {
+                type: 'fill',
+                selector: field.selector,
+                value: String(field.value),
+            });
+        }
+
+        // Submit if a selector is provided
+        if (submit_selector) {
+            await browserService.executeAction(sessionId, {
+                type: 'click',
+                selector: submit_selector,
+            });
+            // Wait for navigation after submit
+            try {
+                await browserService.executeAction(sessionId, {
+                    type: 'waitForNavigation',
+                    timeout: 5000,
+                });
+            } catch { /* navigation may not happen for AJAX forms */ }
+        }
+
+        // Return new page state after submission
+        const newState = await browserService.getPageState(sessionId);
+
+        // Delta analysis after form submission
+        this.deltaFrontendAnalysis('form-submission').catch(() => { /* non-fatal */ });
+
+        return {
+            submitted: true,
+            newUrl: newState?.url || 'unknown',
+            newTitle: newState?.title || '',
+            forms: newState?.forms?.length || 0,
+        };
+    }
+
+    private async executeBrowserEvaluateJs(toolCall: ToolCall): Promise<any> {
+        const sessionId = await this.ensureBrowserSession();
+        const script = toolCall.args?.script;
+        if (!script) return { error: 'Missing required arg: script' };
+
+        this.log('tool', `🌐 browser_evaluate_js (${script.substring(0, 80)}...)`);
+        const result = await browserService.executeAction(sessionId, {
+            type: 'evaluate',
+            script,
+        });
+        return result;
+    }
+
+    private async executeBrowserScreenshot(): Promise<any> {
+        const sessionId = await this.ensureBrowserSession();
+        this.log('tool', '🌐 browser_screenshot');
+
+        const result = await browserService.executeAction(sessionId, {
+            type: 'screenshot',
+        });
+
+        return {
+            captured: true,
+            mimeType: result?.mimeType || 'image/png',
+            sizeBytes: result?.base64?.length || 0,
+            note: 'Screenshot captured and stored. Can be used as finding evidence.',
+        };
+    }
+
+    private async executeBrowserCorrelateBurp(): Promise<any> {
+        const sessionId = await this.ensureBrowserSession();
+        this.log('tool', '🌐 browser_correlate_burp');
+        const correlation = await browserService.correlateBrowserWithBurp(sessionId);
+
+        // Track newly discovered untested endpoints
+        if (correlation?.frontendOnlyEndpoints?.length > 0) {
+            correlation.frontendOnlyEndpoints.forEach((ep: string) => this.discoveredEndpoints.add(ep));
+            this.log('system', `Browser⇔Burp correlation: ${correlation.frontendOnlyEndpoints.length} untested endpoints found`);
+        }
+
+        return correlation;
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  HELPERS
     // ═══════════════════════════════════════════════════════════
 
@@ -2467,5 +2924,384 @@ Start by sending the original request as-is to get a baseline response, then beg
         } catch (error: any) {
             this.log('debug', `Repeater send failed: ${error.message}`);
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  PENTESTER LOOP v2: Harvest → Classify → Hypothesize → Validate
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Browser lock — ensures only one browser operation runs at a time.
+     * Prevents race conditions during show/hide transitions.
+     */
+    private async withBrowserLock<T>(fn: () => Promise<T>): Promise<T> {
+        if (this.browserLock) {
+            throw new Error('Browser operation in progress — retry later');
+        }
+        this.browserLock = true;
+        try {
+            return await fn();
+        } finally {
+            this.browserLock = false;
+        }
+    }
+
+    /**
+     * Delta frontend analysis — re-runs analysis after state changes.
+     * Captures new endpoints, tokens, and routes that appeared after navigation/form submission.
+     */
+    private async deltaFrontendAnalysis(trigger: string): Promise<void> {
+        if (!this.browserSessionId) return;
+
+        this.log('system', `🔍 Delta frontend analysis (trigger: ${trigger})`);
+        try {
+            const isAlive = await browserService.isSessionAlive(this.browserSessionId);
+            if (!isAlive) return;
+
+            const newAnalysis = await browserService.getFrontendAnalysis(this.browserSessionId);
+            const newEndpoints = (newAnalysis.apiEndpoints || []).filter(
+                (ep: string) => !this.discoveredEndpoints.has(ep)
+            );
+
+            if (newEndpoints.length > 0) {
+                newEndpoints.forEach((ep: string) => {
+                    this.discoveredEndpoints.add(ep);
+                    this.coverageTracker.addRoute(ep, 'GET', 'frontend-js');
+                });
+                this.log('system', `✓ Delta analysis: ${newEndpoints.length} new endpoint(s) discovered`);
+                this.conversationHistory.push({
+                    role: 'user',
+                    content: `[SYSTEM] Frontend analysis update (after ${trigger}): New endpoints: ${newEndpoints.join(', ')}`
+                });
+            }
+
+            // Track new frontend routes
+            if (newAnalysis.frontendRoutes?.length > 0) {
+                newAnalysis.frontendRoutes.forEach((r: string) => this.coverageTracker.addRoute(r, 'GET', 'frontend-js'));
+            }
+
+            this.lastFrontendAnalysis = newAnalysis;
+            this.frontendAnalysisVersion++;
+        } catch (e: any) {
+            this.log('error', `Delta frontend analysis failed (non-fatal): ${e.message}`);
+        }
+    }
+
+    /**
+     * Run a full harvest → classify → promote → hypothesize cycle.
+     * Called at harvest checkpoints in the main loop.
+     */
+    private async runHarvestCycle(): Promise<void> {
+        let targetHost = '';
+        try { targetHost = new URL(this.targetUrl).hostname; } catch { return; }
+
+        this.log('system', '═══ HARVEST CYCLE ═══');
+
+        // 1. Harvest new requests from Burp
+        const newRequests = await this.harvester.harvest(this.burp, targetHost);
+        if (newRequests.length === 0) {
+            this.log('system', '  No new requests harvested');
+            return;
+        }
+
+        this.log('system', `  Harvested ${newRequests.length} new request(s)`);
+
+        // 2. Update coverage from harvested requests
+        for (const req of newRequests) {
+            this.coverageTracker.addRoute(req.path, req.method, 'burp');
+            this.coverageTracker.inferWorkflowFromRoute(req.path);
+        }
+
+        // 3. Promote top candidates
+        const promoted = this.harvester.getPromotionCandidates(5);
+        if (promoted.length > 0) {
+            this.log('system', `  Promoted ${promoted.length} request(s) for active testing:`);
+            for (const p of promoted) {
+                this.log('system', `    → ${p.reason}`);
+                this.coverageTracker.markPromoted(p.request.path, p.request.method);
+
+                // 4. Generate hypotheses for promoted requests
+                const hypotheses = this.hypothesisEngine.generateFromRequest(p.request);
+                for (const h of hypotheses) {
+                    this.log('system', `    ⚡ Hypothesis ${h.id}: ${h.type} on ${h.parameter || h.targetEndpoint} (confidence: ${h.confidence}%)`);
+                }
+            }
+        } else {
+            this.log('system', `  No requests scored high enough for promotion`);
+        }
+
+        // 5. Inject harvest summary into conversation
+        const harvesterSummary = this.harvester.getSummary();
+        const hypSummary = this.hypothesisEngine.getSummaryForPrompt();
+        const covSummary = this.coverageTracker.getSummaryForPrompt();
+
+        this.conversationHistory.push({
+            role: 'user',
+            content: `[SYSTEM] Harvest cycle complete:\n  Requests: ${harvesterSummary.total} total, ${harvesterSummary.promoted} promoted\n  ${hypSummary}\n  ${covSummary}`
+        });
+    }
+
+    // ── Pentester Loop Tool Implementations ──
+
+    private async executeHarvestTraffic(): Promise<any> {
+        this.log('tool', '📡 harvest_traffic');
+        let targetHost = '';
+        try { targetHost = new URL(this.targetUrl).hostname; } catch { /* skip */ }
+
+        const newRequests = await this.harvester.harvest(this.burp, targetHost);
+
+        // Update coverage
+        for (const req of newRequests) {
+            this.coverageTracker.addRoute(req.path, req.method, 'burp');
+            this.coverageTracker.inferWorkflowFromRoute(req.path);
+        }
+
+        // Auto-promote
+        const promoted = this.harvester.getPromotionCandidates(5);
+        for (const p of promoted) {
+            this.coverageTracker.markPromoted(p.request.path, p.request.method);
+            this.hypothesisEngine.generateFromRequest(p.request);
+        }
+
+        return {
+            newRequests: newRequests.length,
+            promoted: promoted.map(p => ({
+                id: p.request.id,
+                method: p.request.method,
+                path: p.request.path,
+                score: p.request.interestScore,
+                classification: p.request.classification,
+                reason: p.reason,
+            })),
+            summary: this.harvester.getSummary(),
+        };
+    }
+
+    private async executeGetHypotheses(toolCall: ToolCall): Promise<any> {
+        const status = toolCall.args?.status || 'all';
+        this.log('tool', `📋 get_hypotheses (status: ${status})`);
+
+        const hypotheses = this.hypothesisEngine.getAll(status as any);
+        return {
+            count: hypotheses.length,
+            statusCounts: this.hypothesisEngine.getStatusCounts(),
+            hypotheses: hypotheses.map(h => ({
+                id: h.id,
+                type: h.type,
+                target: `${h.targetMethod} ${h.targetEndpoint}`,
+                parameter: h.parameter,
+                confidence: h.confidence,
+                status: h.status,
+                rationale: h.rationale.substring(0, 150),
+                nextAction: h.nextAction,
+                evidenceCount: h.evidence.length,
+            })),
+        };
+    }
+
+    private async executeGetCoverage(): Promise<any> {
+        this.log('tool', '📊 get_coverage');
+        return this.coverageTracker.getSummary();
+    }
+
+    private async executeRepeaterTest(toolCall: ToolCall): Promise<any> {
+        const { requestId, mutations } = toolCall.args || {};
+        if (!requestId) return { error: 'Missing required arg: requestId' };
+        if (!mutations || !Array.isArray(mutations)) return { error: 'Missing required arg: mutations (array)' };
+
+        const request = this.harvester.getById(requestId);
+        if (!request) return { error: `Request ${requestId} not found in harvest pool. Use harvest_traffic first.` };
+
+        this.log('tool', `🔬 repeater_test: ${request.method} ${request.path} (${mutations.length} mutation(s))`);
+
+        const results: any[] = [];
+
+        for (const mutation of mutations) {
+            try {
+                // Build mutated request
+                const mutatedUrl = this.applyUrlMutation(request.url, mutation.parameter, mutation.newValue);
+                const mutatedBody = this.applyBodyMutation(request.requestBody, mutation.parameter, mutation.newValue);
+                const mutatedHeaders = { ...request.requestHeaders };
+
+                // Apply header mutations (for auth bypass tests)
+                if (mutation.parameter === 'Authorization') {
+                    if (mutation.newValue) mutatedHeaders['authorization'] = mutation.newValue;
+                    else delete mutatedHeaders['authorization'];
+                }
+                if (mutation.parameter === 'Cookie') {
+                    if (mutation.newValue) mutatedHeaders['cookie'] = mutation.newValue;
+                    else delete mutatedHeaders['cookie'];
+                }
+
+                // Send through Burp
+                const response = await this.burp.callTool('send_http_request', {
+                    method: request.method,
+                    url: mutatedUrl,
+                    headers: mutatedHeaders,
+                    body: mutatedBody || '',
+                });
+
+                // Build response snapshots for diffing
+                const originalSnapshot: ResponseSnapshot = {
+                    statusCode: request.statusCode,
+                    headers: request.responseHeaders,
+                    body: request.responseBody,
+                    mimeType: request.mimeType,
+                };
+
+                // Parse response from Burp MCP
+                let mutatedSnapshot: ResponseSnapshot;
+                try {
+                    const respText = response?.content?.[0]?.text || JSON.stringify(response);
+                    const respParsed = JSON.parse(respText);
+                    mutatedSnapshot = {
+                        statusCode: respParsed.statusCode || respParsed.status || 0,
+                        headers: respParsed.headers || {},
+                        body: respParsed.body || respText.substring(0, 5000),
+                    };
+                } catch {
+                    mutatedSnapshot = {
+                        statusCode: 0,
+                        headers: {},
+                        body: JSON.stringify(response).substring(0, 5000),
+                    };
+                }
+
+                // Diff
+                const diff = diffResponses(originalSnapshot, mutatedSnapshot);
+
+                // Update hypothesis if linked
+                if (mutation.hypothesisId) {
+                    this.hypothesisEngine.updateFromDiff(mutation.hypothesisId, mutation.description, diff);
+                    this.harvester.linkHypothesis(requestId, mutation.hypothesisId);
+                    this.coverageTracker.markVulnTested(request.path, request.method, mutation.vulnType || 'unknown', mutation.hypothesisId);
+
+                    // If hypothesis confirmed, save as finding
+                    const hyp = this.hypothesisEngine.getById(mutation.hypothesisId);
+                    if (hyp && hyp.status === 'confirmed') {
+                        this.saveFinding({
+                            name: `${hyp.type} - ${hyp.targetEndpoint}${hyp.parameter ? ` (${hyp.parameter})` : ''}`,
+                            severity: this.hypothesisTypeToSeverity(hyp.type),
+                            description: hyp.rationale,
+                            evidence: hyp.evidence.map(e => `${e.action}: ${e.result}`).join('\n'),
+                            endpoint: request.url,
+                            method: request.method,
+                            cwe: this.hypothesisTypeToCWE(hyp.type),
+                        });
+                    }
+                }
+
+                results.push({
+                    mutation: mutation.description,
+                    parameter: mutation.parameter,
+                    originalValue: mutation.originalValue,
+                    newValue: mutation.newValue,
+                    diff: {
+                        significant: diff.significant,
+                        summary: diff.summary,
+                        statusChange: diff.statusCodeChanged ? `${diff.originalStatus} → ${diff.mutatedStatus}` : null,
+                        keywordSignals: diff.keywordSignals,
+                    },
+                });
+
+            } catch (e: any) {
+                results.push({
+                    mutation: mutation.description,
+                    error: e.message,
+                });
+            }
+        }
+
+        return { requestId, path: request.path, method: request.method, results };
+    }
+
+    // ── Helpers for Repeater mutations ──
+
+    private applyUrlMutation(url: string, param: string, newValue: string): string {
+        try {
+            const u = new URL(url);
+            if (u.searchParams.has(param)) {
+                u.searchParams.set(param, newValue);
+                return u.toString();
+            }
+            // Check path segments — replace numeric/UUID segments
+            const segments = u.pathname.split('/');
+            for (let i = 0; i < segments.length; i++) {
+                if (param === `path_segment_${i}` || segments[i] === param) {
+                    segments[i] = newValue;
+                }
+            }
+            u.pathname = segments.join('/');
+            return u.toString();
+        } catch {
+            return url;
+        }
+    }
+
+    private applyBodyMutation(body: string, param: string, newValue: string): string {
+        if (!body) return body;
+        try {
+            const obj = JSON.parse(body);
+            if (typeof obj === 'object' && obj !== null) {
+                obj[param] = newValue;
+                return JSON.stringify(obj);
+            }
+        } catch {
+            // Form-encoded
+            try {
+                const params = new URLSearchParams(body);
+                if (params.has(param)) {
+                    params.set(param, newValue);
+                    return params.toString();
+                }
+            } catch { /* return original */ }
+        }
+        return body;
+    }
+
+    private hypothesisTypeToSeverity(type: string): string {
+        const map: Record<string, string> = {
+            'idor': 'high', 'sqli': 'critical', 'xss-reflected': 'medium', 'xss-stored': 'high',
+            'auth-bypass': 'critical', 'csrf-bypass': 'medium', 'ssrf': 'high',
+            'privilege-escalation': 'critical', 'mass-assignment': 'high', 'path-traversal': 'high',
+            'info-disclosure': 'low', 'workflow-bypass': 'medium', 'graphql-overreach': 'medium',
+            'hidden-admin': 'high', 'tenant-crossover': 'critical', 'rate-limit-bypass': 'low',
+        };
+        return map[type] || 'medium';
+    }
+
+    private hypothesisTypeToCWE(type: string): string {
+        const map: Record<string, string> = {
+            'idor': 'CWE-639', 'sqli': 'CWE-89', 'xss-reflected': 'CWE-79', 'xss-stored': 'CWE-79',
+            'auth-bypass': 'CWE-287', 'csrf-bypass': 'CWE-352', 'ssrf': 'CWE-918',
+            'privilege-escalation': 'CWE-269', 'mass-assignment': 'CWE-915', 'path-traversal': 'CWE-22',
+            'info-disclosure': 'CWE-200', 'graphql-overreach': 'CWE-200', 'hidden-admin': 'CWE-862',
+        };
+        return map[type] || '';
+    }
+
+    /**
+     * Get v2 pentester loop state — exposed via getState for /live endpoint.
+     */
+    public getPentesterLoopState(): {
+        harvestedRequestCount: number;
+        promotedRequestCount: number;
+        hypothesisCount: Record<string, number>;
+        coverageSummary: { routesSeen: number; exercised: number; promoted: number; untested: number; coveragePercentage: number };
+    } {
+        const harvSummary = this.harvester.getSummary();
+        const covSummary = this.coverageTracker.getSummary();
+        return {
+            harvestedRequestCount: harvSummary.total,
+            promotedRequestCount: harvSummary.promoted,
+            hypothesisCount: this.hypothesisEngine.getStatusCounts(),
+            coverageSummary: {
+                routesSeen: covSummary.routesSeen,
+                exercised: covSummary.routesExercisedInBrowser,
+                promoted: covSummary.requestsPromoted,
+                untested: covSummary.untestedRoutes.length,
+                coveragePercentage: covSummary.coveragePercentage,
+            },
+        };
     }
 }

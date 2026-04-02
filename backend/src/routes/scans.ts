@@ -28,6 +28,7 @@ import { llmProvider } from '../services/LLMProviderService';
 import { activityMonitor } from '../services/ActivityMonitorService';
 import { takePendingRequest } from './penpard';
 import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
+import { browserService } from '../services/BrowserService';
 import { extractRoutes } from '../services/source-analysis/utils/route-extractor';
 import os from 'os';
 
@@ -1073,6 +1074,9 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
 
             // Don't check Burp on every poll - too many requests
             // Just report based on agent being active
+            const browserSessionId = agent.getBrowserSessionId?.() || null;
+            const browserVisibility = browserSessionId ? browserService.getSessionVisibility(browserSessionId) : null;
+
             res.json({
                 isActive: true,
                 isPool: false,
@@ -1083,6 +1087,14 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
                 logsCount: state.logsCount,
                 burpConnected: true, // Assume connected if agent is running
                 activeAgents: activeAgents.size,
+                browserSessionId,
+                browserIsHeadless: browserVisibility?.isHeadless ?? null,
+                browserTransitioning: browserVisibility?.transitioning ?? false,
+                // Pentester Loop v2 state
+                harvestedRequestCount: state.harvestedRequestCount || 0,
+                promotedRequestCount: state.promotedRequestCount || 0,
+                hypothesisCount: state.hypothesisCount || { new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 },
+                coverageSummary: state.coverageSummary || null,
             });
         } else {
             // No active agent - check memory cache first, then DB
@@ -1121,6 +1133,54 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
     } catch (error: any) {
         logger.error('Live status error', { error: error.message });
         res.status(500).json({ error: true, message: 'Failed to get live status' });
+    }
+});
+
+// Show browser (headless → visible) for an active scan's browser session
+router.post('/:id/browser/show', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        const agent = activeAgents.get(id);
+        if (!agent) {
+            res.status(400).json({ error: true, message: 'No active scan agent' });
+            return;
+        }
+
+        const browserSessionId = agent.getBrowserSessionId?.();
+        if (!browserSessionId) {
+            res.status(400).json({ error: true, message: 'No browser session for this scan' });
+            return;
+        }
+
+        await browserService.showBrowser(browserSessionId);
+        res.json({ message: 'Browser is now visible', browserSessionId, isHeadless: false });
+    } catch (error: any) {
+        logger.error('Show browser for scan failed', { error: error.message });
+        res.status(400).json({ error: true, message: error.message });
+    }
+});
+
+// Hide browser (visible → headless) for an active scan's browser session
+router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        const agent = activeAgents.get(id);
+        if (!agent) {
+            res.status(400).json({ error: true, message: 'No active scan agent' });
+            return;
+        }
+
+        const browserSessionId = agent.getBrowserSessionId?.();
+        if (!browserSessionId) {
+            res.status(400).json({ error: true, message: 'No browser session for this scan' });
+            return;
+        }
+
+        await browserService.hideBrowser(browserSessionId);
+        res.json({ message: 'Browser is now headless', browserSessionId, isHeadless: true });
+    } catch (error: any) {
+        logger.error('Hide browser for scan failed', { error: error.message });
+        res.status(400).json({ error: true, message: error.message });
     }
 });
 
