@@ -25,6 +25,7 @@ import { HypothesisEngine, VulnHypothesis, MutationTemplate } from '../services/
 import { CoverageTracker } from '../services/CoverageTracker';
 import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
 import { browserService } from '../services/BrowserService';
+import { AuthStateManager, AuthInjector } from '../services/auth';
 
 type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
 
@@ -482,6 +483,9 @@ export class OrchestratorAgent {
     private lastFrontendAnalysis: any = null;
     private frontendAnalysisVersion: number = 0;
 
+    // ── Auth State Engine ──
+    public authManager: AuthStateManager;
+
     constructor(scanId: string, targetUrl: string, config: ScanConfig, burp: BurpMCPClient) {
         this.scanId = scanId;
         this.targetUrl = targetUrl;
@@ -496,6 +500,9 @@ export class OrchestratorAgent {
         this.harvester = new RequestHarvester();
         this.hypothesisEngine = new HypothesisEngine();
         this.coverageTracker = new CoverageTracker();
+
+        // Initialize auth state engine
+        this.authManager = new AuthStateManager(scanId, targetUrl);
     }
 
     /**
@@ -1018,48 +1025,17 @@ Proceed with testing.`
             }
         }
 
-        // Resolve session cookies and auth for authenticated testing (from operator input or proxy history, newest to oldest)
-        let sessionCookieHeader = '';
-        let sessionAuthHeader = '';
-        if (this.config.sessionCookies?.trim()) {
-            const raw = this.config.sessionCookies.trim();
-            sessionCookieHeader = raw.replace(/^Cookie:\s*/i, '').trim();
-            this.log('system', '✓ Using operator-provided session cookies for authenticated requests');
-        } else {
-            try {
-                const host = new URL(this.targetUrl).hostname;
-                // First try get_cookies_and_auth_for_host (newest to oldest) for planning-phase discovery
-                const historyResult = await this.burp.callTool('get_cookies_and_auth_for_host', { host, maxItems: 50 });
-                const entries = Array.isArray(historyResult?.entries) ? historyResult.entries : [];
-                const firstWithSession = entries.find((e: any) => (e?.cookie && e.cookie.trim()) || (e?.authorization && e.authorization.trim()));
-                if (firstWithSession) {
-                    if (firstWithSession.cookie && String(firstWithSession.cookie).trim()) {
-                        sessionCookieHeader = String(firstWithSession.cookie).trim();
-                    }
-                    if (firstWithSession.authorization && String(firstWithSession.authorization).trim()) {
-                        sessionAuthHeader = String(firstWithSession.authorization).trim();
-                    }
-                    if (sessionCookieHeader || sessionAuthHeader) {
-                        this.log('system', `✓ Using cookie/auth from Burp proxy history (newest→oldest) for ${host}`);
-                    }
-                }
-                // Fallback: single most recent request
-                if (!sessionCookieHeader && !sessionAuthHeader) {
-                    const result = await this.burp.callTool('get_session_cookies', { host });
-                    const cookie = result?.cookieHeader;
-                    if (cookie && typeof cookie === 'string' && cookie.trim()) {
-                        sessionCookieHeader = cookie.trim();
-                        this.log('system', `✓ Using session cookies from Burp proxy history (last user request to ${host})`);
-                    }
-                }
-            } catch (e) {
-                // Burp may be unavailable or tool not supported; continue without cookies
-            }
-        }
-        const hasSession = !!(sessionCookieHeader || sessionAuthHeader);
-        const sessionCookiesBlock = hasSession
-            ? `\n\n═══════════════════════════════════════════════════════════════\n  SESSION COOKIES / AUTH FROM PROXY HISTORY (authenticated testing)\n═══════════════════════════════════════════════════════════════\n\nYou MUST send requests to the target domain WITH these headers so tests run in the user's session. Include them in EVERY send_http_request to the target host.\n\n${sessionCookieHeader ? `Cookie: ${sessionCookieHeader}\n\n` : ''}${sessionAuthHeader ? `Authorization: ${sessionAuthHeader}\n\n` : ''}In send_http_request always set headers to include the Cookie and/or Authorization above. Do not omit them. Test with the user's authenticated session.\n`
-            : `\n\n═══════════════════════════════════════════════════════════════\n  SESSION COOKIES\n═══════════════════════════════════════════════════════════════\n\nNone found for target. For authenticated testing: have the user browse the site (through Burp) and log in first; PenPard will use get_session_cookies or get_cookies_and_auth_for_host. Then include that Cookie/Authorization in every send_http_request.\n`;
+        // ── Auth State Engine: Initialize and capture from all sources ──
+        this.log('system', '🔐 Initializing Auth State Engine...');
+        await this.authManager.initialize(
+            { sessionCookies: this.config.sessionCookies, idorUsers: this.config.idorUsers },
+            this.burp,
+            this.browserSessionId,
+        );
+        this.log('system', `✓ Auth State Engine: ${this.authManager.identityRegistry.size} identities, ${this.authManager.getTotalCookies()} cookies, ${this.authManager.getTotalTokens()} tokens`);
+
+        // Generate the auth block for the system prompt (tells LLM auth is automatic)
+        const sessionCookiesBlock = this.authManager.getSystemPromptBlock();
 
         // Build system prompt
         const promptTemplate = await this.loadPromptTemplate();
@@ -1865,8 +1841,16 @@ Start by sending the original request as-is to get a baseline response, then beg
             };
         }
 
+        // ── Auth State Engine: Inject auth headers deterministically ──
+        const authMergedHeaders = this.authManager.mergeHeaders(
+            toolCall.args.headers,
+            url,
+            method,
+        );
+
         const result = await this.burp.callTool('send_http_request', {
             ...toolCall.args,
+            headers: authMergedHeaders,
             use_proxy: true,
             penpard_source: `Orchestrator/${this.scanId}`
         });
@@ -1914,8 +1898,30 @@ Start by sending the original request as-is to get a baseline response, then beg
             this.discoveredEndpoints.add(parsedUrl.pathname);
         } catch { /* ignore */ }
 
+        // ── Auth State Engine: Capture new auth material from response + track health ──
+        const statusCode = result?.statusCode || result?.status || 0;
+        const responseHeaders = result?.headers || {};
+        const responseBody = result?.body || result?.text || '';
+        const authHealth = this.authManager.handleResponse(
+            statusCode, responseHeaders, responseBody, url, 'primary-user'
+        );
+
+        // Auto-refresh if session expired
+        if (authHealth.needsRefresh && !authHealth.needsRelogin) {
+            this.log('system', '🔐 Auth State Engine: Session needs refresh — attempting...');
+            this.authManager.refreshSession('primary-user', this.burp).catch((e: any) => {
+                this.log('error', `Auth refresh failed: ${e.message}`);
+            });
+        }
+        if (authHealth.needsRelogin) {
+            this.log('system', '⚠️ Auth State Engine: Session is dead — re-login required');
+        }
+        if (authHealth.isCSRFFailure) {
+            this.log('system', '🛡 Auth State Engine: CSRF validation failed — token may need refresh');
+        }
+
         // Check for 429
-        if (result?.status === 429 || result?.statusCode === 429) {
+        if (statusCode === 429) {
             this.rateLimitPauseUntil = new Date(Date.now() + this.RATE_LIMIT_PAUSE_MS);
             this.log('tool', `🚫 429 Rate Limited! Pausing for 1 minute...`);
             return { ...result, rateLimited: true, message: 'Rate limited. Pausing 1 minute.' };
