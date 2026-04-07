@@ -3,6 +3,8 @@
  * PenPard CLI Tool
  * Cross-platform database and user management utility
  * 
+ * Uses the same authoritative schema from db/init.ts as the backend server.
+ * 
  * Usage:
  *   penpard --restart_db              Reset database to initial state (keeps tables)
  *   penpard --createuser <user> <pass> [role]  Create a new user
@@ -13,12 +15,14 @@
  *   penpard --help                    Show this help
  */
 
-import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { spawn, execSync } from 'child_process';
+
+// Import the authoritative database instance and initialization from the backend
+import { db, initDatabase, validateSchema } from './db/init';
 
 // ANSI Colors
 const colors = {
@@ -51,16 +55,13 @@ function logInfo(msg: string) {
     log(`ℹ ${msg}`, colors.cyan);
 }
 
-// Get database path - same logic as Electron app
+// Get database path - same logic as db/init.ts and Electron app
 function getDbPath(): string {
-    // Check environment variable first
     if (process.env.DATABASE_PATH) {
         return process.env.DATABASE_PATH;
     }
 
-    // Default to AppData/Roaming on Windows, ~/.config on Linux/Mac
     let appDataPath: string;
-
     if (process.platform === 'win32') {
         appDataPath = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
     } else if (process.platform === 'darwin') {
@@ -72,135 +73,14 @@ function getDbPath(): string {
     return path.join(appDataPath, 'penpard', 'data', 'penpard.db');
 }
 
-function ensureDbDirectory(dbPath: string): void {
-    const dir = path.dirname(dbPath);
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-    }
-}
-
-function getDatabase(): Database.Database {
-    const dbPath = getDbPath();
-    ensureDbDirectory(dbPath);
-
-    logInfo(`Database path: ${dbPath}`);
-
-    const db = new Database(dbPath);
-    db.pragma('journal_mode = WAL');
-    return db;
-}
-
-// Initialize database schema
-function initSchema(db: Database.Database): void {
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('super_admin', 'admin', 'user')),
-            credits INTEGER NOT NULL DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS whitelists (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            domain_pattern TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS llm_config (
-            provider TEXT PRIMARY KEY,
-            api_key TEXT,
-            model TEXT,
-            is_active INTEGER DEFAULT 0,
-            is_online INTEGER DEFAULT 0,
-            settings_json TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS mcp_servers (
-            name TEXT PRIMARY KEY,
-            command TEXT NOT NULL,
-            args TEXT,
-            env_vars TEXT,
-            status TEXT DEFAULT 'stopped',
-            is_enabled INTEGER DEFAULT 1,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS scans (
-            id TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            type TEXT NOT NULL CHECK(type IN ('web', 'mobile')),
-            target TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'queued',
-            burp_scan_id TEXT,
-            mobsf_hash TEXT,
-            llm_provider TEXT,
-            rate_limit INTEGER DEFAULT 5,
-            recursion_depth INTEGER DEFAULT 2,
-            use_nuclei INTEGER DEFAULT 0,
-            use_ffuf INTEGER DEFAULT 0,
-            idor_users_json TEXT,
-            orchestrator_logs_path TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            completed_at DATETIME,
-            error_message TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS vulnerabilities (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scan_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT,
-            severity TEXT NOT NULL,
-            cvss_score REAL,
-            cvss_vector TEXT,
-            cwe TEXT,
-            cve TEXT,
-            request TEXT,
-            response TEXT,
-            screenshot_path TEXT,
-            evidence TEXT,
-            remediation TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scan_id TEXT UNIQUE NOT NULL,
-            file_path TEXT NOT NULL,
-            format TEXT DEFAULT 'markdown',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_scans_user_id ON scans(user_id);
-        CREATE INDEX IF NOT EXISTS idx_scans_status ON scans(status);
-        CREATE INDEX IF NOT EXISTS idx_vulnerabilities_scan_id ON vulnerabilities(scan_id);
-        CREATE INDEX IF NOT EXISTS idx_whitelists_user_id ON whitelists(user_id);
-    `);
-}
-
 // Commands
 async function restartDb(): Promise<void> {
     log('\n🔄 Restarting database...', colors.bright);
 
-    const db = getDatabase();
-
     try {
+        // Ensure schema is up to date first
+        await initDatabase();
+
         // Clear all data but keep schema
         db.exec(`
             DELETE FROM vulnerabilities;
@@ -211,6 +91,21 @@ async function restartDb(): Promise<void> {
             DELETE FROM llm_config;
             DELETE FROM settings;
             DELETE FROM users;
+            DELETE FROM token_usage;
+            DELETE FROM scan_logs;
+            DELETE FROM scan_chat_messages;
+            DELETE FROM report_analyses;
+            DELETE FROM analysis_findings;
+            DELETE FROM analysis_logs;
+            DELETE FROM mindset_ttps;
+            DELETE FROM mindset_profile;
+            DELETE FROM ttp_test_playbooks;
+            DELETE FROM presence_scan_runs;
+            DELETE FROM presence_scan_targets;
+            DELETE FROM presence_scan_logs;
+            DELETE FROM presence_scan_run_ttps;
+            DELETE FROM browser_sessions;
+            DELETE FROM browser_actions;
         `);
 
         // Recreate default admin
@@ -220,11 +115,12 @@ async function restartDb(): Promise<void> {
             VALUES (?, ?, 'super_admin', 100)
         `).run('admin', passwordHash);
 
-        logSuccess('Database cleared and reset');
+        logSuccess('Database cleared and reset (all 23 tables)');
         logSuccess('Default admin user created (admin/securepass)');
 
-    } finally {
-        db.close();
+    } catch (e: any) {
+        logError(`Failed to restart database: ${e.message}`);
+        process.exit(1);
     }
 }
 
@@ -236,8 +132,7 @@ async function createUser(username: string, password: string, role = 'user'): Pr
         process.exit(1);
     }
 
-    const db = getDatabase();
-    initSchema(db);
+    await initDatabase();
 
     try {
         // Check if user exists
@@ -255,8 +150,9 @@ async function createUser(username: string, password: string, role = 'user'): Pr
 
         logSuccess(`User '${username}' created with role '${role}'`);
 
-    } finally {
-        db.close();
+    } catch (e: any) {
+        logError(`Failed to create user: ${e.message}`);
+        process.exit(1);
     }
 }
 
@@ -268,6 +164,9 @@ async function recreateDbDanger(): Promise<void> {
 
     // Check if database exists
     if (fs.existsSync(dbPath)) {
+        // Close the imported db connection before deleting the file
+        try { db.close(); } catch { /* may already be closed */ }
+
         fs.unlinkSync(dbPath);
         logWarning(`Deleted: ${dbPath}`);
 
@@ -278,28 +177,42 @@ async function recreateDbDanger(): Promise<void> {
         if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
     }
 
-    // Create fresh database
-    const db = getDatabase();
-    initSchema(db);
+    // Recreate using the authoritative schema from db/init.ts
+    // We need a fresh import since we closed the old connection
+    // The simplest approach: use the same Database constructor and initDatabase logic
+    const Database = (await import('better-sqlite3')).default;
+    const freshDb = new Database(dbPath);
+    freshDb.pragma('journal_mode = WAL');
 
-    // Create default admin
-    const passwordHash = await bcrypt.hash('securepass', 12);
-    db.prepare(`
-        INSERT INTO users (username, password_hash, role, credits)
-        VALUES (?, ?, 'super_admin', 100)
-    `).run('admin', passwordHash);
+    // We can't easily re-run initDatabase() since db is a module-level singleton.
+    // Instead, just start a fresh backend process or inform the user.
+    // For now, exec the schema creation by importing the module fresh.
+    freshDb.close();
 
-    db.close();
+    logWarning('Database file deleted. Starting fresh initialization...');
 
-    logSuccess('Database recreated from scratch');
-    logSuccess('Default admin user created (admin/securepass)');
+    // Re-import to get a fresh db connection and run full schema
+    // Since ESM/CJS caching may prevent re-import, use execSync to run init
+    try {
+        execSync('node -e "require(\'./db/init\').initDatabase().then(() => process.exit(0))"', {
+            cwd: path.join(__dirname),
+            stdio: 'inherit',
+            timeout: 15000,
+        });
+    } catch {
+        // Fallback: just create the file, and let the backend create schema on next start
+        logWarning('Could not auto-initialize schema. The backend will create it on next startup.');
+        const fallbackDb = new Database(dbPath);
+        fallbackDb.pragma('journal_mode = WAL');
+        fallbackDb.close();
+    }
+
+    logSuccess('Database recreated. Start the backend to complete schema initialization.');
+    logInfo('Run: penpard --start_backend');
 }
 
 function listUsers(): void {
     log('\n👥 Users:', colors.bright);
-
-    const db = getDatabase();
-    initSchema(db);
 
     try {
         const users = db.prepare(`
@@ -326,8 +239,9 @@ function listUsers(): void {
         }
         console.log('');
 
-    } finally {
-        db.close();
+    } catch (e: any) {
+        logError(`Failed to list users: ${e.message}`);
+        process.exit(1);
     }
 }
 
@@ -339,8 +253,6 @@ function deleteUser(username: string): void {
         process.exit(1);
     }
 
-    const db = getDatabase();
-
     try {
         const result = db.prepare('DELETE FROM users WHERE username = ?').run(username);
 
@@ -351,8 +263,9 @@ function deleteUser(username: string): void {
 
         logSuccess(`User '${username}' deleted`);
 
-    } finally {
-        db.close();
+    } catch (e: any) {
+        logError(`Failed to delete user: ${e.message}`);
+        process.exit(1);
     }
 }
 

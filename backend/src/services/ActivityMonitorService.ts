@@ -120,9 +120,10 @@ export class ActivityMonitorService {
         logger.info('[ActivityMonitor] Stopped');
     }
 
-    getStatus(): { running: boolean; suggestionCount: number; pendingCount: number } {
+    getStatus(): { running: boolean; enabled: boolean; suggestionCount: number; pendingCount: number } {
         return {
             running: this.isRunning,
+            enabled: ASSIST_ENABLED,
             suggestionCount: this.suggestions.length,
             pendingCount: this.suggestions.filter(s => s.status === 'pending').length
         };

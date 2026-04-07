@@ -88,12 +88,12 @@ export default function StatusFooter() {
                     <span className="uppercase">{status.mobsf}</span>
                 </div>
 
-                {/* Nuclei Status */}
-                <div className="flex items-center space-x-2 whitespace-nowrap">
-                    <div className={`w-2 h-2 rounded-full ${status.nuclei !== 'not found' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-gray-500'}`} />
+                {/* Nuclei Status — integration not yet implemented */}
+                <div className="flex items-center space-x-2 whitespace-nowrap opacity-50" title="Nuclei integration is not yet implemented">
+                    <div className="w-2 h-2 rounded-full bg-gray-600" />
                     <Activity className="w-3 h-3 text-blue-500" />
                     <span className="font-semibold text-gray-300">NUCLEI:</span>
-                    <span className="uppercase">{status.nuclei}</span>
+                    <span className="text-gray-500 text-[10px]">NOT IMPLEMENTED</span>
                 </div>
             </div>
 

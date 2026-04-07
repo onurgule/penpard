@@ -12,7 +12,7 @@
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
-import { updateScanStatus, addVulnerability, db } from '../db/init';
+import { updateScanStatus, addVulnerability, saveScanLogs, db } from '../db/init';
 import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
@@ -447,6 +447,12 @@ export class OrchestratorAgent {
 
     // Store last request/response for findings (includes raw Burp data when available)
     private lastRequestResponse: { action?: ToolCall; result?: any; rawRequest?: string; rawResponse?: string } | null = null;
+
+    // Incremental log persistence — flush to DB periodically to survive crashes
+    private lastFlushedLogIndex: number = 0;
+    private lastFlushTime: number = Date.now();
+    private static readonly LOG_FLUSH_INTERVAL_MS = 60_000; // 60 seconds
+    private static readonly LOG_FLUSH_BATCH_SIZE = 50;     // or every 50 new logs
 
     // Cached system prompt (always index 0 in conversationHistory)
     private systemPromptContent: string = '';
@@ -2801,6 +2807,50 @@ Start by sending the original request as-is to get a baseline response, then beg
         const line = `[${timestamp}] [${type.toUpperCase()}] ${message}`;
         this.logs.push(line);
         logger.info(message, { scanId: this.scanId, type });
+
+        // Check if we should flush to DB
+        this.maybeFlushLogs();
+    }
+
+    /**
+     * Periodically flush new logs to the scan_logs DB table.
+     * Called automatically from log() — flushes every LOG_FLUSH_BATCH_SIZE entries
+     * or every LOG_FLUSH_INTERVAL_MS, whichever comes first.
+     */
+    private maybeFlushLogs() {
+        const newLogCount = this.logs.length - this.lastFlushedLogIndex;
+        const timeSinceFlush = Date.now() - this.lastFlushTime;
+
+        if (newLogCount >= OrchestratorAgent.LOG_FLUSH_BATCH_SIZE ||
+            (newLogCount > 0 && timeSinceFlush >= OrchestratorAgent.LOG_FLUSH_INTERVAL_MS)) {
+            this.flushLogsToDB();
+        }
+    }
+
+    /**
+     * Flush unflushed logs to the database incrementally.
+     * Safe to call multiple times — only writes new entries since last flush.
+     * Returns the number of logs flushed.
+     */
+    public flushLogsToDB(): number {
+        const newLogs = this.logs.slice(this.lastFlushedLogIndex);
+        if (newLogs.length === 0) return 0;
+
+        try {
+            saveScanLogs(this.scanId, newLogs);
+            this.lastFlushedLogIndex = this.logs.length;
+            this.lastFlushTime = Date.now();
+            return newLogs.length;
+        } catch (e: any) {
+            // Log flush failure must not crash the scan
+            logger.error('Failed to flush logs to DB', { scanId: this.scanId, error: e.message });
+            return 0;
+        }
+    }
+
+    /** Number of logs that have NOT yet been persisted to the database. */
+    public get unflushedLogCount(): number {
+        return this.logs.length - this.lastFlushedLogIndex;
     }
 
     private saveLogs() {
@@ -2811,6 +2861,9 @@ Start by sending the original request as-is to get a baseline response, then beg
         } catch (e) {
             logger.error('Failed to save logs', { error: (e as any).message });
         }
+
+        // Final DB flush — only write logs not yet flushed
+        this.flushLogsToDB();
     }
 
     /** Normalize request for Repeater */

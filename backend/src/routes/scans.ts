@@ -276,6 +276,16 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
         useNuclei = useNuclei === 'true' || useNuclei === true;
         useFfuf = useFfuf === 'true' || useFfuf === true;
 
+        // Nuclei and FFUF integrations are not yet implemented — warn if requested
+        if (useNuclei) {
+            logger.warn('nucleiEnabled was requested but Nuclei integration is not yet implemented — ignoring', { scanId: 'pre-creation' });
+            useNuclei = false;
+        }
+        if (useFfuf) {
+            logger.warn('ffufEnabled was requested but FFUF integration is not yet implemented — ignoring', { scanId: 'pre-creation' });
+            useFfuf = false;
+        }
+
         if (!url) {
             res.status(400).json({ error: true, message: 'URL is required' });
             return;
@@ -685,7 +695,8 @@ router.post('/:id/stop', authenticateToken, async (req: AuthRequest, res: Respon
             // Cache + persist logs before stopping
             const allLogs = agent.getLogs(0);
             scanLogCache.set(id, { logs: allLogs, phase: 'stopped' });
-            saveScanLogs(id, allLogs);
+            // Flush only unflushed logs (agent handles incremental persistence)
+            agent.flushLogsToDB();
             agent.stop();
             activeAgents.delete(id);
             updateScanStatus(id, 'stopped', 'Scan stopped by user');
@@ -895,7 +906,8 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
                 const state = agent.getState();
                 const allLogs = agent.getLogs(0);
                 scanLogCache.set(id, { logs: allLogs, phase: state.phase });
-                saveScanLogs(id, allLogs);
+                // Final flush of any remaining unflushed logs
+                agent.flushLogsToDB();
                 activeAgents.delete(id);
                 burpMCP.disconnect();
             }
@@ -1202,11 +1214,6 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
             logger.warn('Burp MCP connection check failed');
         }
 
-        // Helper to cache simulation logs
-        const cacheSimLogs = (logs: string[]) => {
-            scanLogCache.set(scanId, { logs, phase: 'completed' });
-        };
-
         if (mcpAvailable) {
             logger.info('Using Burp MCP for scanning', { scanId });
 
@@ -1238,7 +1245,7 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
                     const allLogs = pool.getLogs(0);
                     scanLogCache.set(scanId, { logs: allLogs, phase: 'completed' });
 
-                    // Persist logs to database for historical access
+                    // Persist all pool logs to database (pool doesn't have incremental flush yet)
                     saveScanLogs(scanId, allLogs);
 
                     activePools.delete(scanId);
@@ -1274,8 +1281,9 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
                     const allLogs = agent.getLogs(0);
                     scanLogCache.set(scanId, { logs: allLogs, phase: state.phase });
 
-                    // Persist logs to database for historical access
-                    saveScanLogs(scanId, allLogs);
+                    // Final flush — agent handles incremental persistence internally;
+                    // this flushes any remaining unflushed logs
+                    agent.flushLogsToDB();
 
                     activeAgents.delete(scanId);
                     burpMCP.disconnect();
@@ -1287,9 +1295,11 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
                 }
             }
         } else {
-            // Fallback: simulate scan with demo vulnerabilities
-            logger.warn('Burp MCP not available, using simulated scan');
-            await simulateWebScan(scanId, targetUrl);
+            // Burp MCP is required for real scanning — fail loudly instead of simulating
+            const errorMsg = 'Burp Suite is not connected. Cannot start scan without Burp MCP. Please ensure Burp Suite is running with the PenPard extension loaded (port 9876).';
+            logger.error(errorMsg, { scanId });
+            updateScanStatus(scanId, 'failed', errorMsg);
+            return;
         }
 
         updateScanStatus(scanId, 'completed');
@@ -1315,8 +1325,11 @@ async function startMobileScan(scanId: string, apkPath: string): Promise<void> {
         if (mobsfAvailable) {
             await mobsf.analyze(scanId, apkPath);
         } else {
-            logger.warn('MobSF not available, using simulated analysis');
-            await simulateMobileScan(scanId);
+            // MobSF is required for mobile scanning — fail loudly instead of simulating
+            const errorMsg = 'MobSF is not connected. Cannot start mobile scan without MobSF. Please ensure MobSF is running and configured in Settings.';
+            logger.error(errorMsg, { scanId });
+            updateScanStatus(scanId, 'failed', errorMsg);
+            return;
         }
 
         updateScanStatus(scanId, 'completed');
@@ -1325,108 +1338,6 @@ async function startMobileScan(scanId: string, apkPath: string): Promise<void> {
         logger.error('Mobile scan error', { scanId, error: error.message });
         updateScanStatus(scanId, 'failed', error.message);
         throw error;
-    }
-}
-
-// Simulation functions for demo when tools aren't available
-async function simulateWebScan(scanId: string, targetUrl: string): Promise<string[]> {
-    const { addVulnerability } = await import('../db/init');
-    const simLogs: string[] = [];
-    const addLog = (msg: string) => {
-        simLogs.push(`[${new Date().toISOString()}] ${msg}`);
-        // Update cache in real-time so polling can see progress
-        scanLogCache.set(scanId, { logs: [...simLogs], phase: 'testing' });
-    };
-
-    addLog('[INFO] Orchestrator Agent started (simulated mode - Burp not available)');
-    addLog(`[INFO] Target: ${targetUrl}`);
-
-    // Simulate scan time
-    addLog('[PHASE] Phase: RECONNAISSANCE');
-    await new Promise(r => setTimeout(r, 3000));
-    updateScanStatus(scanId, 'auditing');
-    addLog('[PHASE] Phase: AUDITING');
-    addLog('[INFO] Running vulnerability checks...');
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Add demo vulnerabilities
-    const demoVulns = [
-        {
-            name: 'SQL Injection',
-            description: 'The application appears to be vulnerable to SQL injection attacks in the login form.',
-            severity: 'critical',
-            cvssScore: 9.8,
-            cwe: '89',
-            remediation: 'Use parameterized queries or prepared statements.',
-        },
-        {
-            name: 'Cross-Site Scripting (XSS)',
-            description: 'Reflected XSS vulnerability found in search parameter.',
-            severity: 'high',
-            cvssScore: 7.1,
-            cwe: '79',
-            remediation: 'Implement proper output encoding.',
-        },
-        {
-            name: 'Missing Security Headers',
-            description: 'The application is missing important security headers like X-Frame-Options.',
-            severity: 'medium',
-            cvssScore: 5.3,
-            cwe: '693',
-            remediation: 'Add security headers to all responses.',
-        },
-    ];
-
-    for (const vuln of demoVulns) {
-        addVulnerability({ scanId, ...vuln });
-        addLog(`[FINDING] Found: ${vuln.name} (${vuln.severity}) - CVSS ${vuln.cvssScore}`);
-    }
-
-    addLog('[PHASE] Phase: COMPLETED');
-    addLog(`[INFO] Scan finished. Found ${demoVulns.length} vulnerabilities.`);
-
-    // Update cache with final state
-    scanLogCache.set(scanId, { logs: simLogs, phase: 'completed' });
-
-    return simLogs;
-}
-
-async function simulateMobileScan(scanId: string): Promise<void> {
-    const { addVulnerability } = await import('../db/init');
-
-    await new Promise(r => setTimeout(r, 4000));
-    updateScanStatus(scanId, 'code_analysis');
-    await new Promise(r => setTimeout(r, 3000));
-
-    const demoVulns = [
-        {
-            name: 'Hardcoded API Keys',
-            description: 'API keys found hardcoded in the application source code.',
-            severity: 'high',
-            cvssScore: 7.5,
-            cwe: '798',
-            remediation: 'Store sensitive data securely using Android Keystore.',
-        },
-        {
-            name: 'Insecure Data Storage',
-            description: 'Sensitive data stored in SharedPreferences without encryption.',
-            severity: 'medium',
-            cvssScore: 5.5,
-            cwe: '922',
-            remediation: 'Use EncryptedSharedPreferences.',
-        },
-        {
-            name: 'Debug Mode Enabled',
-            description: 'Application has android:debuggable=true in manifest.',
-            severity: 'low',
-            cvssScore: 3.3,
-            cwe: '489',
-            remediation: 'Disable debug mode in production builds.',
-        },
-    ];
-
-    for (const vuln of demoVulns) {
-        addVulnerability({ scanId, ...vuln });
     }
 }
 

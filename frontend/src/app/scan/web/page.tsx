@@ -726,23 +726,25 @@ export default function WebScanPage() {
                         <div>
                             <label className="block text-gray-400 text-sm mb-2">External Tools</label>
                             <div className="flex gap-4">
-                                <label className="flex items-center gap-2 cursor-pointer card p-3 border border-dark-600 hover:border-cyan-500/50 transition-colors">
+                                <label className="flex items-center gap-2 card p-3 border border-dark-600 opacity-50 cursor-not-allowed" title="Nuclei integration is not yet implemented">
                                     <input
                                         type="checkbox"
-                                        checked={externalTools.nuclei}
-                                        onChange={(e) => setExternalTools({ ...externalTools, nuclei: e.target.checked })}
+                                        checked={false}
+                                        disabled
                                         className="checkbox"
                                     />
-                                    <span className="text-white">Nuclei Vulnerability Scanner</span>
+                                    <span className="text-gray-400">Nuclei Vulnerability Scanner</span>
+                                    <span className="text-[10px] text-yellow-500/80 font-mono ml-1">(Coming Soon)</span>
                                 </label>
-                                <label className="flex items-center gap-2 cursor-pointer card p-3 border border-dark-600 hover:border-cyan-500/50 transition-colors">
+                                <label className="flex items-center gap-2 card p-3 border border-dark-600 opacity-50 cursor-not-allowed" title="FFUF integration is not yet implemented">
                                     <input
                                         type="checkbox"
-                                        checked={externalTools.ffuf}
-                                        onChange={(e) => setExternalTools({ ...externalTools, ffuf: e.target.checked })}
+                                        checked={false}
+                                        disabled
                                         className="checkbox"
                                     />
-                                    <span className="text-white">FFUF Fuzzing</span>
+                                    <span className="text-gray-400">FFUF Fuzzing</span>
+                                    <span className="text-[10px] text-yellow-500/80 font-mono ml-1">(Coming Soon)</span>
                                 </label>
                             </div>
                         </div>

@@ -874,3 +874,50 @@ export const deleteClosedBrowserSessions = (userId: number) => {
   const result = db.prepare('DELETE FROM browser_sessions WHERE user_id = ? AND status = ?').run(userId, 'closed');
   return result.changes;
 };
+
+// ── Schema Validation ──
+
+/** All tables that must exist for the backend to function correctly. */
+const REQUIRED_TABLES = [
+  'users', 'whitelists', 'llm_config', 'mcp_servers', 'settings',
+  'scans', 'vulnerabilities', 'reports', 'token_usage', 'scan_logs',
+  'scan_chat_messages', 'report_analyses', 'analysis_findings', 'analysis_logs',
+  'mindset_ttps', 'mindset_profile', 'ttp_test_playbooks',
+  'presence_scan_runs', 'presence_scan_targets', 'presence_scan_logs', 'presence_scan_run_ttps',
+  'browser_sessions', 'browser_actions',
+];
+
+/**
+ * Validates that the database schema contains all required tables.
+ * Throws an error with a clear message listing missing tables if the schema is incomplete.
+ */
+export function validateSchema(database?: DatabaseType): void {
+  const targetDb = database || db;
+  const existing = targetDb
+    .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+    .all() as { name: string }[];
+  const existingNames = new Set(existing.map(r => r.name));
+  const missing = REQUIRED_TABLES.filter(t => !existingNames.has(t));
+
+  if (missing.length > 0) {
+    throw new Error(
+      `DATABASE SCHEMA INCOMPLETE — missing ${missing.length} required table(s): ${missing.join(', ')}. ` +
+      `Run the backend normally to auto-create all tables, or delete the DB file and restart. ` +
+      `Do NOT use the CLI --recreate_db_danger command with an outdated CLI version.`
+    );
+  }
+}
+
+/**
+ * Marks scans stuck in non-terminal states as 'interrupted' after a backend restart.
+ * Called once during startup to clean up orphaned scan records.
+ */
+export function recoverOrphanedScans(): number {
+  const nonTerminalStatuses = ['queued', 'initializing', 'testing', 'reporting', 'auditing', 'crawling', 'analyzing', 'paused'];
+  const placeholders = nonTerminalStatuses.map(() => '?').join(',');
+  const result = db.prepare(`
+    UPDATE scans SET status = 'interrupted', error_message = 'Backend restarted while scan was in progress. Scan state was lost.', completed_at = CURRENT_TIMESTAMP
+    WHERE status IN (${placeholders})
+  `).run(...nonTerminalStatuses);
+  return result.changes;
+}

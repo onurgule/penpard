@@ -6,7 +6,7 @@ import path from 'path';
 import dotenv from 'dotenv';
 
 import { logger } from './utils/logger';
-import { initDatabase } from './db/init';
+import { initDatabase, validateSchema, recoverOrphanedScans } from './db/init';
 import authRoutes from './routes/auth';
 import scanRoutes from './routes/scans';
 import adminRoutes from './routes/admin';
@@ -110,6 +110,16 @@ async function start() {
     try {
         await initDatabase();
         logger.info('Database initialized');
+
+        // Validate that all required tables exist
+        validateSchema();
+        logger.info('Database schema validated — all required tables present');
+
+        // Recover scans left in non-terminal states from a previous crash/restart
+        const orphanedCount = recoverOrphanedScans();
+        if (orphanedCount > 0) {
+            logger.warn(`Recovered ${orphanedCount} orphaned scan(s) — marked as 'interrupted'`);
+        }
 
         app.listen(PORT, () => {
             logger.info(`Server running on port ${PORT}`);
