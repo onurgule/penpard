@@ -12,7 +12,9 @@
 export type AuthCaptureSource =
     | 'operator_input'
     | 'burp_proxy_history'
+    | 'burp_initial_request'
     | 'burp_set_cookie'
+    | 'agent_explicit_request'
     | 'browser_context_cookies'
     | 'browser_local_storage'
     | 'browser_session_storage'
@@ -201,6 +203,28 @@ export interface AuthContext {
 
 export interface AuthContextHeaders {
     [key: string]: string;
+}
+
+export interface RequestAuthDiagnostics {
+    identityId: string;
+    method: string;
+    url: string;
+    likelyRequiresAuth: boolean;
+    storedAuthAvailable: boolean;
+    storedAuthorizationAvailable: boolean;
+    storedCookieAvailable: boolean;
+    storedCustomAuthAvailable: boolean;
+    explicitAuthorizationPresent: boolean;
+    explicitAuthorizationKeyPresent: boolean;
+    explicitCookiePresent: boolean;
+    explicitCookieKeyPresent: boolean;
+    explicitCustomAuthPresent: boolean;
+    explicitCustomAuthKeyPresent: boolean;
+    outgoingAuthorizationPresent: boolean;
+    outgoingCookiePresent: boolean;
+    outgoingCustomAuthPresent: boolean;
+    preserveExplicitAuth: boolean;
+    warning?: string;
 }
 
 // ═══════════════════════════════════════════════════════════

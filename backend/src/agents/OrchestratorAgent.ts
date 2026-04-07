@@ -26,6 +26,7 @@ import { CoverageTracker } from '../services/CoverageTracker';
 import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
 import { browserService } from '../services/BrowserService';
 import { AuthStateManager, AuthInjector, IdentityRegistry } from '../services/auth';
+import { getHeaderValue, parseRawBurpRequest } from '../services/burp-request';
 
 type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
 
@@ -1029,7 +1030,7 @@ Proceed with testing.`
         // ── Auth State Engine: Initialize and capture from all sources ──
         this.log('system', '🔐 Initializing Auth State Engine...');
         await this.authManager.initialize(
-            { sessionCookies: this.config.sessionCookies, idorUsers: this.config.idorUsers },
+            { sessionCookies: this.config.sessionCookies, idorUsers: this.config.idorUsers, initialRequest: this.config.initialRequest },
             this.burp,
             this.browserSessionId,
         );
@@ -1185,7 +1186,8 @@ Example call:
     "method": "${parsed.method}",
     "url": "${parsed.url}",
     "headers": ${headersJson},
-    "body": "${parsed.body || ''}"
+    "body": "${parsed.body || ''}",
+    "preserveExplicitAuth": true
   }
 }
 
@@ -1193,7 +1195,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                 });
                 this.conversationHistory.push({
                     role: 'assistant',
-                    content: `Understood. I will:\n1. Include ALL ${Object.keys(parsed.headers).length} headers in every request (Cookie, User-Agent, auth tokens, etc.)\n2. Only modify parameter values for testing — headers stay exactly as provided\n3. Start with a baseline request, then test each parameter for vulnerabilities\n\nLet me begin by analyzing the request and planning my tests.`
+                    content: `Understood. I will:\n1. Include ALL ${Object.keys(parsed.headers).length} headers in every request (Cookie, User-Agent, auth tokens, etc.)\n2. Set preserveExplicitAuth=true when replaying the Burp-derived request so PenPard preserves the supplied auth exactly\n3. Only modify parameter values for testing — headers stay exactly as provided\n4. Start with a baseline request, then test each parameter for vulnerabilities\n\nLet me begin by analyzing the request and planning my tests.`
                 });
                 this.log('system', `✓ Burp request parsed — ${parsed.method} ${parsed.url.substring(0, 80)} — ${Object.keys(parsed.headers).length} headers preserved`);
             } else {
@@ -1832,6 +1834,22 @@ Start by sending the original request as-is to get a baseline response, then beg
         return `${identityId}:${method}:${url}:${body}:${JSON.stringify(sortedEntries)}`;
     }
 
+    private hasCustomAuthHeader(headers: Record<string, string> | undefined): boolean {
+        if (!headers) return false;
+        return Object.entries(headers).some(([name, value]) => {
+            const lower = name.toLowerCase();
+            return [
+                'x-api-key',
+                'x-auth-token',
+                'x-access-token',
+                'x-session-token',
+                'api-key',
+                'apikey',
+                'x-token',
+            ].includes(lower) && typeof value === 'string' && value.trim().length > 0;
+        });
+    }
+
     private async syncAuthFromBrowser(identityId: string = 'primary-user'): Promise<void> {
         if (!this.browserSessionId || !browserService.isSessionAlive(this.browserSessionId)) {
             return;
@@ -1889,14 +1907,48 @@ Start by sending the original request as-is to get a baseline response, then beg
         }
 
         const originalBody = this.normalizeRequestBody(toolCall.args.body ?? toolCall.args.data ?? '');
-        const preparedRequest = this.authManager.prepareRequest(
-            toolCall.args.headers,
+        const originalHeaders = toolCall.args.headers as Record<string, string> | undefined;
+        const existingAuthContext = this.authManager.inject(url, method, identityId);
+        const explicitAuthorization = getHeaderValue(originalHeaders, 'authorization');
+        const explicitCookie = getHeaderValue(originalHeaders, 'cookie');
+        const explicitCustomAuth = this.hasCustomAuthHeader(originalHeaders);
+
+        if (
+            !preserveExplicitAuth &&
+            identityId !== IdentityRegistry.ANONYMOUS_ID &&
+            (
+                (!!explicitAuthorization && !existingAuthContext.authorizationHeader) ||
+                (!!explicitCookie && !existingAuthContext.cookies) ||
+                (explicitCustomAuth && Object.keys(existingAuthContext.customHeaders).length === 0)
+            )
+        ) {
+            this.authManager.captureFromStructuredRequest({
+                requestHeaders: originalHeaders || {},
+                url,
+                body: originalBody,
+            }, identityId);
+        }
+
+        let preparedRequest = this.authManager.prepareRequest(
+            originalHeaders,
             originalBody,
             url,
             method,
             identityId,
             preserveExplicitAuth,
         );
+        let requestDiagnostics = this.authManager.assessPreparedRequest({
+            originalHeaders,
+            preparedHeaders: preparedRequest.headers,
+            url,
+            method,
+            identityId,
+            preserveExplicitAuth,
+        });
+        const isBurpOriginatedRequest = !!this.config.initialRequest?.trim();
+        if (isBurpOriginatedRequest && requestDiagnostics.warning) {
+            this.log('system', `⚠️ Auth Warning: ${requestDiagnostics.warning}`);
+        }
         const requestKey = this.buildRequestHistoryKey(
             method,
             url,
@@ -1916,19 +1968,25 @@ Start by sending the original request as-is to get a baseline response, then beg
             };
         }
 
-        const requestArgs = {
-            ...toolCall.args,
-            headers: preparedRequest.headers,
-            body: preparedRequest.body,
-            identityId,
-        } as Record<string, any>;
-        delete requestArgs.data;
+        let requestArgs: Record<string, any> = {};
+        const sendThroughBurp = async (headers: Record<string, string>, body: string) => {
+            const args = {
+                ...toolCall.args,
+                headers,
+                body,
+                identityId,
+            } as Record<string, any>;
+            delete args.data;
 
-        let result = await this.burp.callTool('send_http_request', {
-            ...requestArgs,
-            use_proxy: true,
-            penpard_source: `Orchestrator/${this.scanId}`
-        });
+            requestArgs = args;
+            return await this.burp.callTool('send_http_request', {
+                ...args,
+                use_proxy: true,
+                penpard_source: `Orchestrator/${this.scanId}`
+            });
+        };
+
+        let result = await sendThroughBurp(preparedRequest.headers, preparedRequest.body);
 
         // Fetch the actual raw request/response from Burp proxy history
         // This captures ALL headers (Host, Cookie, User-Agent, etc.) as Burp sees them
@@ -1963,9 +2021,69 @@ Start by sending the original request as-is to get a baseline response, then beg
         let authHealth = this.authManager.handleResponse(
             statusCode, responseHeaders, responseBody, url, identityId
         );
+        let retriedAfterAuthInjection = false;
+
+        const shouldRetryWithManagedAuth =
+            statusCode === 401 &&
+            identityId !== IdentityRegistry.ANONYMOUS_ID &&
+            isBurpOriginatedRequest &&
+            requestDiagnostics.likelyRequiresAuth &&
+            requestDiagnostics.storedAuthAvailable &&
+            !requestDiagnostics.outgoingAuthorizationPresent &&
+            !requestDiagnostics.outgoingCookiePresent &&
+            !requestDiagnostics.outgoingCustomAuthPresent &&
+            !requestDiagnostics.explicitAuthorizationKeyPresent &&
+            !requestDiagnostics.explicitCookieKeyPresent &&
+            !requestDiagnostics.explicitCustomAuthKeyPresent;
+
+        if (shouldRetryWithManagedAuth) {
+            this.log('system', `🔐 Auth Recovery: ${method} ${url} received 401 without outgoing auth. Retrying once with stored auth material...`);
+
+            preparedRequest = this.authManager.prepareRequest(
+                originalHeaders,
+                originalBody,
+                url,
+                method,
+                identityId,
+                false,
+            );
+            requestDiagnostics = this.authManager.assessPreparedRequest({
+                originalHeaders,
+                preparedHeaders: preparedRequest.headers,
+                url,
+                method,
+                identityId,
+                preserveExplicitAuth: false,
+            });
+
+            if (
+                requestDiagnostics.outgoingAuthorizationPresent ||
+                requestDiagnostics.outgoingCookiePresent ||
+                requestDiagnostics.outgoingCustomAuthPresent
+            ) {
+                result = await sendThroughBurp(preparedRequest.headers, preparedRequest.body);
+                statusCode = result?.statusCode || result?.status || 0;
+                responseHeaders = result?.headers || {};
+                responseBody = result?.body || result?.text || '';
+                authHealth = this.authManager.handleResponse(
+                    statusCode,
+                    responseHeaders,
+                    responseBody,
+                    url,
+                    identityId,
+                );
+                retriedAfterAuthInjection = true;
+                result = {
+                    ...result,
+                    retriedAfterAuthInjection: true,
+                };
+            } else {
+                this.log('system', `⚠️ Auth Warning: Stored auth recovery was attempted for ${identityId}, but PenPard still could not prepare any auth headers for retry.`);
+            }
+        }
 
         // Auto-refresh and retry once for managed auth requests
-        if (authHealth.needsRefresh && !authHealth.needsRelogin && !preserveExplicitAuth && identityId !== IdentityRegistry.ANONYMOUS_ID) {
+        if (authHealth.needsRefresh && !authHealth.needsRelogin && (!preserveExplicitAuth || retriedAfterAuthInjection) && identityId !== IdentityRegistry.ANONYMOUS_ID) {
             this.log('system', `🔐 Auth State Engine: Session for ${identityId} needs refresh — retrying once...`);
 
             try {
@@ -1974,7 +2092,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                     await this.seedBrowserFromAuthManager(identityId);
 
                     const retryPreparedRequest = this.authManager.prepareRequest(
-                        toolCall.args.headers,
+                        originalHeaders,
                         originalBody,
                         url,
                         method,
@@ -1982,19 +2100,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                         false,
                     );
 
-                    const retryArgs = {
-                        ...toolCall.args,
-                        headers: retryPreparedRequest.headers,
-                        body: retryPreparedRequest.body,
-                        identityId,
-                    } as Record<string, any>;
-                    delete retryArgs.data;
-
-                    result = await this.burp.callTool('send_http_request', {
-                        ...retryArgs,
-                        use_proxy: true,
-                        penpard_source: `Orchestrator/${this.scanId}`
-                    });
+                    result = await sendThroughBurp(retryPreparedRequest.headers, retryPreparedRequest.body);
 
                     statusCode = result?.statusCode || result?.status || 0;
                     responseHeaders = result?.headers || {};
@@ -2015,6 +2121,12 @@ Start by sending the original request as-is to get a baseline response, then beg
             } catch (e: any) {
                 this.log('error', `Auth refresh failed: ${e.message}`);
             }
+        }
+        if (requestDiagnostics.warning) {
+            result = {
+                ...result,
+                authWarning: requestDiagnostics.warning,
+            };
         }
         if (authHealth.needsRelogin) {
             this.log('system', `⚠️ Auth State Engine: Session for ${identityId} is dead — re-login required`);
@@ -2090,51 +2202,14 @@ Start by sending the original request as-is to get a baseline response, then beg
      * Returns { method, url, headers, body } or null if parsing fails.
      */
     private parseRawHttpRequest(raw: string): { method: string; url: string; headers: Record<string, string>; body: string } | null {
-        try {
-            // Normalize line endings
-            const normalized = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-            const headerBodySplit = normalized.indexOf('\n\n');
-            const headerSection = headerBodySplit >= 0 ? normalized.substring(0, headerBodySplit) : normalized;
-            const body = headerBodySplit >= 0 ? normalized.substring(headerBodySplit + 2).trim() : '';
-
-            const lines = headerSection.split('\n');
-            if (lines.length < 1) return null;
-
-            // Parse request line: GET /path?query HTTP/1.1
-            const requestLine = lines[0].trim();
-            const parts = requestLine.split(/\s+/);
-            if (parts.length < 2) return null;
-            const method = parts[0].toUpperCase();
-            const pathAndQuery = parts[1]; // e.g. /hafifmuzik/mobile/video/likestatus?idlist=...
-
-            // Parse headers
-            const headers: Record<string, string> = {};
-            let host = '';
-            for (let i = 1; i < lines.length; i++) {
-                const line = lines[i].trim();
-                if (!line) continue;
-                const colonIdx = line.indexOf(':');
-                if (colonIdx <= 0) continue;
-                const name = line.substring(0, colonIdx).trim();
-                const value = line.substring(colonIdx + 1).trim();
-                headers[name] = value;
-                if (name.toLowerCase() === 'host') {
-                    host = value;
-                }
-            }
-
-            if (!host) return null;
-
-            // Determine scheme (assume https unless port is 80 or explicit http)
-            const isHttp = host.endsWith(':80') || host.startsWith('http://');
-            const scheme = isHttp ? 'http' : 'https';
-            const cleanHost = host.replace(/^https?:\/\//, '');
-            const url = `${scheme}://${cleanHost}${pathAndQuery}`;
-
-            return { method, url, headers, body };
-        } catch (e) {
-            return null;
-        }
+        const parsed = parseRawBurpRequest(raw);
+        if (!parsed) return null;
+        return {
+            method: parsed.method,
+            url: parsed.url,
+            headers: parsed.headers,
+            body: parsed.body,
+        };
     }
 
     // ═══════════════════════════════════════════════════════════

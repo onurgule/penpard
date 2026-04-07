@@ -329,37 +329,51 @@ export class AuthCapture {
      * Capture auth material from a harvested request (RequestHarvester output).
      * Extracts cookies, auth headers, and CSRF params.
      */
-    fromHarvestedRequest(request: {
+    fromStructuredRequest(request: {
         requestHeaders: Record<string, string>;
         params?: Array<{ name: string; value: string; location: string }>;
         url: string;
-    }, identityId: string): void {
+    }, identityId: string, source: AuthCaptureSource = 'burp_proxy_history'): {
+        cookies: CookieEntry[];
+        tokens: TokenState[];
+        csrfDetected: boolean;
+    } {
+        const cookies: CookieEntry[] = [];
+        const tokens: TokenState[] = [];
+        let csrfDetected = false;
+
         let domain: string;
         try {
             domain = new URL(request.url).hostname;
         } catch {
-            return;
+            return { cookies, tokens, csrfDetected };
         }
 
         // Capture Cookie header
         const cookie = request.requestHeaders['cookie'] || request.requestHeaders['Cookie'];
         if (cookie) {
             const jar = this.getOrCreateJar(identityId);
-            jar.parseCookieHeader(cookie, domain, 'burp_proxy_history');
+            const parsed = jar.parseCookieHeader(cookie, domain, source);
+            cookies.push(...parsed);
         }
 
         // Capture Authorization header
         const auth = request.requestHeaders['authorization'] || request.requestHeaders['Authorization'];
         if (auth) {
             const store = this.getOrCreateTokenStore(identityId);
-            store.storeFromAuthHeader(auth, 'burp_proxy_history');
+            const token = store.storeFromAuthHeader(auth, source);
+            if (token) {
+                tokens.push(token);
+                this.enrichIdentityFromToken(identityId, token);
+            }
         }
 
         // Capture custom auth headers
         for (const [name, value] of Object.entries(request.requestHeaders)) {
             if (AuthCapture.CUSTOM_AUTH_PATTERNS.some(p => p.test(name)) && value) {
                 const store = this.getOrCreateTokenStore(identityId);
-                store.storeCustomHeader(name, value, 'burp_proxy_history');
+                const token = store.storeCustomHeader(name, value, source);
+                tokens.push(token);
                 this.detectedCustomAuthHeaders.add(name.toLowerCase());
             }
         }
@@ -368,7 +382,26 @@ export class AuthCapture {
         if (request.params) {
             const csrfManager = this.getOrCreateCSRFManager(identityId);
             csrfManager.detectFromRequestParams(request.params);
+            csrfDetected = request.params.length > 0;
         }
+
+        if (cookies.length > 0 || tokens.length > 0 || csrfDetected) {
+            this.recordEvidence(source, `${cookies.length} cookies, ${tokens.length} tokens`, identityId);
+        }
+
+        return { cookies, tokens, csrfDetected };
+    }
+
+    /**
+     * Capture auth material from a harvested request (RequestHarvester output).
+     * Extracts cookies, auth headers, and CSRF params.
+     */
+    fromHarvestedRequest(request: {
+        requestHeaders: Record<string, string>;
+        params?: Array<{ name: string; value: string; location: string }>;
+        url: string;
+    }, identityId: string): void {
+        this.fromStructuredRequest(request, identityId, 'burp_proxy_history');
     }
 
     // ═══════════════════════════════════════════════════════════

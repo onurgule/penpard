@@ -16,8 +16,8 @@
  */
 
 import { 
-    AuthContext, AuthExport, AuthExportIdentity, RequestAuthBindingRules,
-    DEFAULT_NO_AUTH_PATHS, AuthEvent, AuthEventType, redactSecret,
+    AuthCaptureSource, AuthContext, AuthExport, AuthExportIdentity, RequestAuthBindingRules,
+    DEFAULT_NO_AUTH_PATHS, AuthEvent, AuthEventType, RequestAuthDiagnostics, redactSecret,
 } from './types';
 import { CookieJar } from './CookieJar';
 import { TokenStore } from './TokenStore';
@@ -27,6 +27,7 @@ import { AuthCapture } from './AuthCapture';
 import { AuthInjector } from './AuthInjector';
 import { SessionHealthMonitor } from './SessionHealthMonitor';
 import { logger } from '../../utils/logger';
+import { getHeaderValue, hasHeaderKey, parseRawBurpRequest } from '../burp-request';
 
 /** Minimal Burp MCP client interface. */
 interface BurpClient {
@@ -36,6 +37,7 @@ interface BurpClient {
 /** Minimal scan config interface. */
 interface ScanAuthConfig {
     sessionCookies?: string;
+    initialRequest?: string;
     idorUsers?: Array<{
         username?: string;
         password?: string;
@@ -63,6 +65,12 @@ export class AuthStateManager {
     private readonly targetUrl: string;
     private readonly rules: RequestAuthBindingRules;
     private initialized: boolean = false;
+    private readonly burpRequestBaselines: Map<string, {
+        url: string;
+        hasAuthorization: boolean;
+        hasCookie: boolean;
+        hasCustomAuth: boolean;
+    }> = new Map();
 
     // ── Events ──
     private events: AuthEvent[] = [];
@@ -136,7 +144,18 @@ export class AuthStateManager {
             logger.warn(`AuthStateManager: Burp history capture failed: ${e.message}`);
         }
 
-        // ── 5. Initialize health monitors ──
+        // ── 5. Capture from the exact Burp request that started the scan ──
+        if (config.initialRequest?.trim()) {
+            const seeded = this.captureFromRawRequest(config.initialRequest.trim(), 'primary-user');
+            if (seeded.cookiesCaptured > 0) {
+                this.emitEvent('cookie_captured', 'primary-user', `${seeded.cookiesCaptured} cookies from Burp initial request`);
+            }
+            if (seeded.tokensCaptured > 0) {
+                this.emitEvent('token_captured', 'primary-user', `${seeded.tokensCaptured} tokens from Burp initial request`);
+            }
+        }
+
+        // ── 6. Initialize health monitors ──
         for (const identity of this.identityRegistry.getAll()) {
             this.healthMonitor.initializeHealth(identity.id);
             this.ensureStores(identity.id);
@@ -285,6 +304,145 @@ export class AuthStateManager {
         url: string;
     }, identityId: string = 'primary-user'): void {
         this.capture.fromHarvestedRequest(request, identityId);
+    }
+
+    /**
+     * Capture auth state from a structured request before execution.
+     * Useful when an explicit Burp-derived Authorization header is present but
+     * the managed auth store has not learned it yet.
+     */
+    captureFromStructuredRequest(request: {
+        requestHeaders: Record<string, string>;
+        url: string;
+        body?: string;
+        params?: Array<{ name: string; value: string; location: string }>;
+    }, identityId: string = 'primary-user', source: AuthCaptureSource = 'agent_explicit_request'): {
+        cookies: number;
+        tokens: number;
+        csrfDetected: boolean;
+    } {
+        this.ensureStores(identityId);
+
+        const params = request.params || this.extractRequestParams(request.url, request.body || '', request.requestHeaders);
+        const captured = this.capture.fromStructuredRequest({
+            requestHeaders: request.requestHeaders,
+            params,
+            url: request.url,
+        }, identityId, source);
+
+        return {
+            cookies: captured.cookies.length,
+            tokens: captured.tokens.length,
+            csrfDetected: captured.csrfDetected,
+        };
+    }
+
+    /**
+     * Capture auth state from a raw Burp request string.
+     */
+    captureFromRawRequest(rawRequest: string, identityId: string = 'primary-user'): {
+        parsed: ReturnType<typeof parseRawBurpRequest>;
+        cookiesCaptured: number;
+        tokensCaptured: number;
+    } {
+        const parsed = parseRawBurpRequest(rawRequest);
+        if (!parsed) {
+            return { parsed: null, cookiesCaptured: 0, tokensCaptured: 0 };
+        }
+
+        const captureResult = this.captureFromStructuredRequest({
+            requestHeaders: parsed.headers,
+            url: parsed.url,
+            body: parsed.body,
+        }, identityId, 'burp_initial_request');
+
+        this.burpRequestBaselines.set(identityId, {
+            url: parsed.url,
+            hasAuthorization: !!getHeaderValue(parsed.headers, 'authorization'),
+            hasCookie: !!getHeaderValue(parsed.headers, 'cookie'),
+            hasCustomAuth: this.hasCustomAuthHeaders(parsed.headers),
+        });
+
+        return {
+            parsed,
+            cookiesCaptured: captureResult.cookies,
+            tokensCaptured: captureResult.tokens,
+        };
+    }
+
+    /**
+     * Inspect how auth material will be used for a request.
+     * Used for warnings and 401 recovery decisions.
+     */
+    assessPreparedRequest(opts: {
+        originalHeaders?: Record<string, string>;
+        preparedHeaders: Record<string, string>;
+        url: string;
+        method?: string;
+        identityId?: string;
+        preserveExplicitAuth?: boolean;
+    }): RequestAuthDiagnostics {
+        const method = opts.method || 'GET';
+        const identityId = opts.identityId || this.rules.defaultIdentityId;
+        const context = this.inject(opts.url, method, identityId);
+        const explicitAuthorizationValue = getHeaderValue(opts.originalHeaders, 'authorization');
+        const explicitCookieValue = getHeaderValue(opts.originalHeaders, 'cookie');
+        const explicitCustomAuthPresent = this.hasCustomAuthHeaders(opts.originalHeaders);
+        const outgoingAuthorizationValue = getHeaderValue(opts.preparedHeaders, 'authorization');
+        const outgoingCookieValue = getHeaderValue(opts.preparedHeaders, 'cookie');
+        const outgoingCustomAuthPresent = this.hasCustomAuthHeaders(opts.preparedHeaders);
+        const storedCustomAuthAvailable = Object.keys(context.customHeaders).length > 0;
+        const storedAuthAvailable = AuthInjector.hasAuth(context);
+        const baseline = this.burpRequestBaselines.get(identityId);
+
+        let likelyRequiresAuth = false;
+        try {
+            const parsedUrl = new URL(opts.url);
+            likelyRequiresAuth =
+                this.isHostInScope(parsedUrl.hostname) &&
+                !this.isNoAuthPath(parsedUrl.pathname) &&
+                (
+                    !!baseline?.hasAuthorization ||
+                    !!baseline?.hasCookie ||
+                    !!baseline?.hasCustomAuth ||
+                    !!explicitAuthorizationValue ||
+                    !!explicitCookieValue ||
+                    explicitCustomAuthPresent ||
+                    storedAuthAvailable ||
+                    this.matchesProtectedPath(parsedUrl.pathname)
+                );
+        } catch {
+            likelyRequiresAuth = !!baseline?.hasAuthorization || !!baseline?.hasCookie || storedAuthAvailable;
+        }
+
+        let warning: string | undefined;
+        if (likelyRequiresAuth && context.authorizationHeader && !outgoingAuthorizationValue) {
+            warning = `Request is leaving without Authorization for ${identityId} even though managed token material is available.`;
+        } else if (likelyRequiresAuth && storedAuthAvailable && !outgoingAuthorizationValue && !outgoingCookieValue && !outgoingCustomAuthPresent) {
+            warning = `Request is leaving without any auth material for ${identityId} even though PenPard has stored auth state for this target.`;
+        }
+
+        return {
+            identityId,
+            method: method.toUpperCase(),
+            url: opts.url,
+            likelyRequiresAuth,
+            storedAuthAvailable,
+            storedAuthorizationAvailable: !!context.authorizationHeader,
+            storedCookieAvailable: !!context.cookies,
+            storedCustomAuthAvailable,
+            explicitAuthorizationPresent: !!explicitAuthorizationValue,
+            explicitAuthorizationKeyPresent: hasHeaderKey(opts.originalHeaders, 'authorization'),
+            explicitCookiePresent: !!explicitCookieValue,
+            explicitCookieKeyPresent: hasHeaderKey(opts.originalHeaders, 'cookie'),
+            explicitCustomAuthPresent,
+            explicitCustomAuthKeyPresent: this.hasCustomAuthHeaderKeys(opts.originalHeaders),
+            outgoingAuthorizationPresent: !!outgoingAuthorizationValue,
+            outgoingCookiePresent: !!outgoingCookieValue,
+            outgoingCustomAuthPresent,
+            preserveExplicitAuth: opts.preserveExplicitAuth === true,
+            warning,
+        };
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -521,5 +679,83 @@ export class AuthStateManager {
             result[k.toLowerCase()] = v;
         }
         return result;
+    }
+
+    private extractRequestParams(url: string, body: string, headers: Record<string, string>): Array<{ name: string; value: string; location: string }> {
+        const params: Array<{ name: string; value: string; location: string }> = [];
+
+        try {
+            const parsedUrl = new URL(url);
+            parsedUrl.searchParams.forEach((value, name) => {
+                params.push({ name, value, location: 'query' });
+            });
+        } catch { /* ignore */ }
+
+        if (!body) return params;
+
+        try {
+            const parsedBody = JSON.parse(body);
+            if (typeof parsedBody === 'object' && parsedBody !== null) {
+                for (const [name, value] of Object.entries(parsedBody)) {
+                    params.push({ name, value: String(value), location: 'body' });
+                }
+                return params;
+            }
+        } catch { /* ignore */ }
+
+        try {
+            const encoded = new URLSearchParams(body);
+            encoded.forEach((value, name) => {
+                params.push({ name, value, location: 'body' });
+            });
+        } catch { /* ignore */ }
+
+        return params;
+    }
+
+    private isHostInScope(hostname: string): boolean {
+        const lower = hostname.toLowerCase();
+        for (const pattern of this.rules.authRequiredHosts) {
+            if (pattern === lower) return true;
+            if (pattern.startsWith('*.') && lower.endsWith(pattern.substring(1))) return true;
+            if (lower.endsWith('.' + pattern)) return true;
+        }
+        return false;
+    }
+
+    private isNoAuthPath(pathname: string): boolean {
+        const lower = pathname.toLowerCase();
+        for (const path of this.rules.noAuthPaths) {
+            if (lower === path || lower.startsWith(path + '/') || lower.startsWith(path + '?')) return true;
+        }
+        return false;
+    }
+
+    private matchesProtectedPath(pathname: string): boolean {
+        return /\/(api|graphql|account|profile|admin|billing|orders|users|me|session|settings|checkout|cart|wallet|tenant)/i.test(pathname);
+    }
+
+    private hasCustomAuthHeaders(headers: Record<string, string> | undefined): boolean {
+        if (!headers) return false;
+        return Object.entries(headers).some(([name, value]) =>
+            this.isCustomAuthHeaderName(name) && typeof value === 'string' && value.trim().length > 0
+        );
+    }
+
+    private hasCustomAuthHeaderKeys(headers: Record<string, string> | undefined): boolean {
+        if (!headers) return false;
+        return Object.keys(headers).some(name => this.isCustomAuthHeaderName(name));
+    }
+
+    private isCustomAuthHeaderName(name: string): boolean {
+        return [
+            'x-api-key',
+            'x-auth-token',
+            'x-access-token',
+            'x-session-token',
+            'api-key',
+            'apikey',
+            'x-token',
+        ].includes(name.toLowerCase());
     }
 }

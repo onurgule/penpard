@@ -12,6 +12,7 @@
         "start": "node dist/index.js",
         "cli": "tsx src/cli.ts",
         "test": "node --import tsx --test test/**/*.test.ts",
+        "test:burp-auth-regression": "node --import tsx scripts/auth-burp-regression.ts",
         "db:init": "tsx src/db/init.ts"
     },
     "dependencies": {

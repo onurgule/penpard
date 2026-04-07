@@ -33,6 +33,7 @@ import java.security.cert.X509Certificate
  * Registry of comprehensive MCP tools for Pentesting.
  */
 class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
+    private data class ParsedHttpResponse(val status: Int, val headers: List<String>, val body: kotlin.ByteArray)
     
     // Helper JSON factory
     private val jsonFactory = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true }
@@ -465,7 +466,7 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
         return buf.toByteArray()
     }
 
-    private fun parseHttpResponse(bytes: kotlin.ByteArray): Pair<Int, kotlin.ByteArray> {
+    private fun parseHttpResponse(bytes: kotlin.ByteArray): ParsedHttpResponse {
         val str = String(bytes, StandardCharsets.UTF_8)
         val crlf = str.indexOf("\r\n\r\n")
         val lf = str.indexOf("\n\n")
@@ -474,7 +475,25 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
         val statusRegex = Regex("HTTP/\\d\\.\\d\\s+(\\d+)")
         val status = statusRegex.find(str)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         val body = if (headerEnd >= 0 && bodyStart < bytes.size) bytes.copyOfRange(bodyStart, bytes.size) else bytes
-        return Pair(status, body)
+        val headerText = if (headerEnd >= 0) str.substring(0, headerEnd) else ""
+        val headers = headerText
+            .split(Regex("\r?\n"))
+            .drop(1)
+            .filter { it.contains(":") }
+        return ParsedHttpResponse(status, headers, body)
+    }
+
+    private fun buildSocketResponseResult(parsed: ParsedHttpResponse, note: String): JsonObject {
+        return buildJsonObject {
+            put("statusCode", parsed.status)
+            put("headers", buildJsonArray {
+                parsed.headers.forEach { add(it) }
+            })
+            put("body", String(parsed.body, StandardCharsets.UTF_8))
+            put("body_length", parsed.body.size)
+            put("body_preview", String(parsed.body.take(2000).toByteArray(), StandardCharsets.UTF_8))
+            put("note", note)
+        }
     }
 
     /**
@@ -607,13 +626,8 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                         sslOut.flush()
                         val responseBytes = sslIn.readBytes()
                         sslSocket.close()
-                        val (status, body) = parseHttpResponse(responseBytes)
-                        val result = buildJsonObject {
-                            put("statusCode", status)
-                            put("body_length", body.size)
-                            put("body_preview", String(body.take(2000).toByteArray()))
-                            put("note", "Routed via Proxy (raw socket)")
-                        }
+                        val parsedResponse = parseHttpResponse(responseBytes)
+                        val result = buildSocketResponseResult(parsedResponse, "Routed via Proxy (raw socket)")
                         return jsonResult(result)
                     } else {
                         // HTTP: Send full absolute URL to proxy (path has encoded query)
@@ -623,13 +637,8 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                         out.flush()
                         val responseBytes = inp.readBytes()
                         proxySocket.close()
-                        val (status, body) = parseHttpResponse(responseBytes)
-                        val result = buildJsonObject {
-                            put("statusCode", status)
-                            put("body_length", body.size)
-                            put("body_preview", String(body.take(2000).toByteArray()))
-                            put("note", "Routed via Proxy (raw socket)")
-                        }
+                        val parsedResponse = parseHttpResponse(responseBytes)
+                        val result = buildSocketResponseResult(parsedResponse, "Routed via Proxy (raw socket)")
                         return jsonResult(result)
                     }
                 } catch (e: Exception) {
@@ -652,6 +661,7 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                         add("${h.name()}: ${h.value()}")
                     }
                 })
+                put("body", response.response()?.bodyToString() ?: "")
                 put("body_length", response.response()?.body()?.length() ?: 0)
                 put("body_preview", response.response()?.bodyToString()?.take(2000) ?: "")
             }
@@ -714,13 +724,8 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                         sslOut.flush()
                         val responseBytes = sslIn.readBytes()
                         sslSocket.close()
-                        val (status, body) = parseHttpResponse(responseBytes)
-                        val result = buildJsonObject {
-                            put("statusCode", status)
-                            put("body_length", body.size)
-                            put("body_preview", String(body.take(2000).toByteArray()))
-                            put("note", "Routed via Proxy (raw socket)")
-                        }
+                        val parsedResponse = parseHttpResponse(responseBytes)
+                        val result = buildSocketResponseResult(parsedResponse, "Routed via Proxy (raw socket)")
                         return jsonResult(result)
                     } else {
                         // HTTP: Send full absolute URL to proxy
@@ -732,13 +737,8 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                         out.flush()
                         val responseBytes = inp.readBytes()
                         proxySocket.close()
-                        val (status, body) = parseHttpResponse(responseBytes)
-                        val result = buildJsonObject {
-                            put("statusCode", status)
-                            put("body_length", body.size)
-                            put("body_preview", String(body.take(2000).toByteArray()))
-                            put("note", "Routed via Proxy (raw socket)")
-                        }
+                        val parsedResponse = parseHttpResponse(responseBytes)
+                        val result = buildSocketResponseResult(parsedResponse, "Routed via Proxy (raw socket)")
                         return jsonResult(result)
                     }
                 } catch (e: Exception) {
@@ -761,6 +761,7 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                         add("${h.name()}: ${h.value()}")
                     }
                 })
+                put("body", response.response()?.bodyToString() ?: "")
                 put("body_length", response.response()?.body()?.length() ?: 0)
                 put("body_preview", response.response()?.bodyToString()?.take(2000) ?: "")
             }

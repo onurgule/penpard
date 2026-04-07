@@ -8,6 +8,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { authenticateToken } from '../middleware/auth';
 import { AuthRequest } from '../middleware/auth';
 import { logger } from '../utils/logger';
+import { parseRawBurpRequest } from '../services/burp-request';
 
 const router = Router();
 
@@ -23,18 +24,7 @@ interface PendingRequest {
 const pendingFromBurp = new Map<string, PendingRequest>();
 
 function parseUrlFromRawRequest(rawRequest: string): string | null {
-    const firstLine = rawRequest.split('\n')[0];
-    const match = firstLine?.match(/(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(https?:\/\/[^\s]+)/i);
-    if (match) return match[1];
-    const hostMatch = rawRequest.match(/\r?\nHost:\s*([^\r\n]+)/i);
-    const methodPath = firstLine?.match(/(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\S+)/i);
-    if (hostMatch && methodPath) {
-        const host = hostMatch[1].trim();
-        const path = methodPath[1];
-        const scheme = rawRequest.trimStart().toUpperCase().startsWith('GET ') ? 'http' : 'https';
-        return `${scheme}://${host}${path.startsWith('/') ? path : '/' + path}`;
-    }
-    return null;
+    return parseRawBurpRequest(rawRequest)?.url || null;
 }
 
 function cleanupPending(): void {

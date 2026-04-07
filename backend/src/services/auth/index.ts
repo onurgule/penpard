@@ -34,6 +34,7 @@ export type {
     SessionHealth,
     AuthContext,
     AuthContextHeaders,
+    RequestAuthDiagnostics,
     AuthEvidence,
     RequestAuthBindingRules,
     AuthExport,
