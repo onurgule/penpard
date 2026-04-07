@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { createSafeLocalStorage } from './persist-storage';
 
 export interface ShortcutDefinition {
     id: string;
@@ -98,6 +99,7 @@ export const useShortcutsStore = create<ShortcutsState>()(
         }),
         {
             name: 'penpard-shortcuts',
+            storage: createSafeLocalStorage(),
             partialize: (state) => ({
                 shortcuts: state.shortcuts.map(({ id, currentKey }) => ({
                     id,

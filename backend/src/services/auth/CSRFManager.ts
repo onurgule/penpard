@@ -271,7 +271,23 @@ export class CSRFManager {
      */
     getHeadersForRequest(): Record<string, string> {
         const headers: Record<string, string> = {};
-        for (const state of this.csrfStates.values()) {
+        const orderedStates = [...this.csrfStates.values()].sort((a, b) => {
+            const priority = (state: CSRFState): number => {
+                if (state.deliveryMechanism === 'cookie_to_header') return 0;
+                if (state.deliveryMechanism === 'response_header') return 1;
+                return 10;
+            };
+
+            const priorityDiff = priority(a) - priority(b);
+            if (priorityDiff !== 0) return priorityDiff;
+
+            const refreshedDiff = b.lastRefreshedAt.getTime() - a.lastRefreshedAt.getTime();
+            if (refreshedDiff !== 0) return refreshedDiff;
+
+            return a.tokenName.localeCompare(b.tokenName);
+        });
+
+        for (const state of orderedStates) {
             if (!state.tokenValue) continue;
 
             if (state.deliveryMechanism === 'cookie_to_header' && state.headerName) {
@@ -289,7 +305,23 @@ export class CSRFManager {
      */
     getBodyFieldsForRequest(): Record<string, string> {
         const fields: Record<string, string> = {};
-        for (const state of this.csrfStates.values()) {
+        const orderedStates = [...this.csrfStates.values()].sort((a, b) => {
+            const priority = (state: CSRFState): number => {
+                if (state.deliveryMechanism === 'hidden_input') return 0;
+                if (state.deliveryMechanism === 'meta_tag') return 1;
+                return 10;
+            };
+
+            const priorityDiff = priority(a) - priority(b);
+            if (priorityDiff !== 0) return priorityDiff;
+
+            const refreshedDiff = b.lastRefreshedAt.getTime() - a.lastRefreshedAt.getTime();
+            if (refreshedDiff !== 0) return refreshedDiff;
+
+            return a.tokenName.localeCompare(b.tokenName);
+        });
+
+        for (const state of orderedStates) {
             if (!state.tokenValue) continue;
 
             if (state.deliveryMechanism === 'hidden_input' || state.deliveryMechanism === 'meta_tag') {

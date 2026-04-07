@@ -201,6 +201,17 @@ export class AuthCapture {
         const csrfFromHeaders = csrfManager.detectFromResponseHeaders(headers);
         if (csrfFromHeaders) csrfDetected = true;
 
+        // Capture Authorization header returned by the server
+        const authHeader = headers['authorization'];
+        if (authHeader) {
+            const store = this.getOrCreateTokenStore(identityId);
+            const token = store.storeFromAuthHeader(authHeader, 'login_response_header');
+            if (token) {
+                newTokens.push(token);
+                this.enrichIdentityFromToken(identityId, token);
+            }
+        }
+
         // Detect custom auth headers in response (rare, but some APIs return new tokens)
         for (const [name, value] of Object.entries(headers)) {
             if (AuthCapture.CUSTOM_AUTH_PATTERNS.some(p => p.test(name)) && value) {
@@ -210,6 +221,10 @@ export class AuthCapture {
                 this.detectedCustomAuthHeaders.add(name.toLowerCase());
             }
         }
+
+        // Detect JSON body tokens from login / refresh style API responses
+        const bodyTokens = this.extractTokensFromResponseBody(response.body || '', requestUrl, identityId);
+        newTokens.push(...bodyTokens);
 
         return { newCookies, newTokens, csrfDetected };
     }
@@ -459,6 +474,74 @@ export class AuthCapture {
             }
         }
 
+        // From original object format where header values may be arrays at runtime
+        if (original && !Array.isArray(original)) {
+            for (const [name, value] of Object.entries(original as Record<string, any>)) {
+                if (name.toLowerCase() !== 'set-cookie') continue;
+
+                if (Array.isArray(value)) {
+                    for (const item of value) {
+                        const cookieValue = String(item || '').trim();
+                        if (cookieValue && !results.includes(cookieValue)) {
+                            results.push(cookieValue);
+                        }
+                    }
+                }
+            }
+        }
+
         return results;
+    }
+
+    private extractTokensFromResponseBody(body: string, requestUrl: string, identityId: string): TokenState[] {
+        if (!body || !body.trim()) return [];
+
+        try {
+            const parsed = JSON.parse(body);
+            const store = this.getOrCreateTokenStore(identityId);
+            const tokens: TokenState[] = [];
+
+            const accessToken = this.getFirstStringAtPaths(parsed, [
+                'access_token',
+                'accessToken',
+                'token',
+                'id_token',
+                'data.access_token',
+                'data.accessToken',
+                'data.token',
+            ]);
+            if (accessToken) {
+                const token = store.storeFromAuthHeader(`Bearer ${accessToken}`, 'login_response_body');
+                if (token) {
+                    tokens.push(token);
+                    this.enrichIdentityFromToken(identityId, token);
+                }
+            }
+
+            const refreshToken = this.getFirstStringAtPaths(parsed, [
+                'refresh_token',
+                'refreshToken',
+                'data.refresh_token',
+                'data.refreshToken',
+            ]);
+            if (refreshToken) {
+                tokens.push(store.storeRefreshToken(refreshToken, requestUrl, 'login_response_body'));
+            }
+
+            return tokens;
+        } catch {
+            return [];
+        }
+    }
+
+    private getFirstStringAtPaths(root: any, paths: string[]): string | null {
+        for (const path of paths) {
+            const value = path.split('.').reduce<any>((current, segment) => current?.[segment], root);
+            if (typeof value === 'string' && value.trim()) {
+                return value.trim();
+            }
+        }
+
+        return null;
     }
 }

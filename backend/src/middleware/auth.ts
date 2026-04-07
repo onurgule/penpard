@@ -1,17 +1,59 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { findUserById } from '../db/init';
 import { logger } from '../utils/logger';
 
-// JWT Secret: require env var or generate a random ephemeral one (will invalidate tokens on restart)
-let JWT_SECRET: string;
-if (process.env.JWT_SECRET && process.env.JWT_SECRET !== 'change-this-to-a-random-secret-key') {
-    JWT_SECRET = process.env.JWT_SECRET;
-} else {
-    JWT_SECRET = crypto.randomBytes(64).toString('hex');
-    logger.warn('⚠️  JWT_SECRET is not set! Using a random ephemeral secret. Sessions will be invalidated on server restart. Set JWT_SECRET in your environment for persistent sessions.');
+function getDefaultDataDir(): string {
+    let appDataPath: string;
+
+    if (process.platform === 'win32') {
+        appDataPath = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+    } else if (process.platform === 'darwin') {
+        appDataPath = path.join(os.homedir(), 'Library', 'Application Support');
+    } else {
+        appDataPath = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+    }
+
+    return path.join(appDataPath, 'penpard', 'data');
 }
+
+function resolveJwtSecret(): string {
+    if (process.env.JWT_SECRET && process.env.JWT_SECRET !== 'change-this-to-a-random-secret-key') {
+        return process.env.JWT_SECRET;
+    }
+
+    const configuredPath = process.env.JWT_SECRET_PATH;
+    const derivedPath = process.env.DATABASE_PATH
+        ? path.join(path.dirname(process.env.DATABASE_PATH), 'jwt-secret')
+        : path.join(getDefaultDataDir(), 'jwt-secret');
+    const secretPath = configuredPath || derivedPath;
+
+    try {
+        fs.mkdirSync(path.dirname(secretPath), { recursive: true });
+
+        if (fs.existsSync(secretPath)) {
+            const persistedSecret = fs.readFileSync(secretPath, 'utf8').trim();
+            if (persistedSecret) {
+                logger.warn(`JWT_SECRET is not set; using persistent local secret from ${secretPath}.`);
+                return persistedSecret;
+            }
+        }
+
+        const generatedSecret = crypto.randomBytes(64).toString('hex');
+        fs.writeFileSync(secretPath, generatedSecret, { mode: 0o600 });
+        logger.warn(`JWT_SECRET is not set; generated persistent local secret at ${secretPath}.`);
+        return generatedSecret;
+    } catch (error) {
+        logger.warn('JWT_SECRET is not set and a persistent fallback could not be initialized. Using an ephemeral secret for this process.', { error });
+        return crypto.randomBytes(64).toString('hex');
+    }
+}
+
+const JWT_SECRET = resolveJwtSecret();
 
 export interface AuthRequest extends Request {
     user?: {

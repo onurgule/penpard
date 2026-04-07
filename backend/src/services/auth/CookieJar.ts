@@ -9,8 +9,8 @@ import { CookieEntry, AuthCaptureSource, SESSION_COOKIE_PATTERNS, CSRF_COOKIE_PA
 import { logger } from '../../utils/logger';
 
 export class CookieJar {
-    /** Cookies keyed by domain → name for fast lookup. */
-    private cookies: Map<string, Map<string, CookieEntry>> = new Map();
+    /** Cookies keyed by domain → path → name to preserve RFC 6265 path variants. */
+    private cookies: Map<string, Map<string, Map<string, CookieEntry>>> = new Map();
     private readonly identityId: string;
 
     constructor(identityId: string) {
@@ -39,6 +39,7 @@ export class CookieJar {
 
             // Parse attributes
             let domain = requestDomain;
+            let hostOnly = true;
             let path = '/';
             let expires: Date | null = null;
             let maxAge: number | null = null;
@@ -50,6 +51,7 @@ export class CookieJar {
                 const lower = attr.toLowerCase();
                 if (lower.startsWith('domain=')) {
                     domain = attr.substring(7).trim().replace(/^\./, ''); // strip leading dot
+                    hostOnly = false;
                 } else if (lower.startsWith('path=')) {
                     path = attr.substring(5).trim() || '/';
                 } else if (lower.startsWith('expires=')) {
@@ -77,6 +79,7 @@ export class CookieJar {
                 name,
                 value,
                 domain: domain.toLowerCase(),
+                hostOnly,
                 path,
                 expires,
                 maxAge,
@@ -133,6 +136,7 @@ export class CookieJar {
                 name,
                 value,
                 domain: domain.toLowerCase(),
+                hostOnly: true,
                 path: '/',
                 expires: null,          // unknown from Cookie header
                 maxAge: null,
@@ -160,28 +164,70 @@ export class CookieJar {
     /** Set or update a cookie. */
     set(entry: CookieEntry): void {
         const domain = entry.domain.toLowerCase();
+        const path = entry.path || '/';
         if (!this.cookies.has(domain)) {
             this.cookies.set(domain, new Map());
         }
-        const existing = this.cookies.get(domain)!.get(entry.name);
+        const domainMap = this.cookies.get(domain)!;
+        if (!domainMap.has(path)) {
+            domainMap.set(path, new Map());
+        }
+        const pathMap = domainMap.get(path)!;
+        const existing = pathMap.get(entry.name);
         if (existing) {
             entry.capturedAt = existing.capturedAt; // preserve original capture time
         }
         entry.lastUpdatedAt = new Date();
-        this.cookies.get(domain)!.set(entry.name, entry);
+        pathMap.set(entry.name, entry);
     }
 
     /** Remove a cookie by domain + name. */
-    remove(domain: string, name: string): void {
+    remove(domain: string, name: string, path?: string): void {
         const domainMap = this.cookies.get(domain.toLowerCase());
-        if (domainMap) {
-            domainMap.delete(name);
+        if (!domainMap) return;
+
+        if (path) {
+            const pathMap = domainMap.get(path);
+            pathMap?.delete(name);
+            if (pathMap && pathMap.size === 0) {
+                domainMap.delete(path);
+            }
+        } else {
+            for (const [cookiePath, pathMap] of domainMap.entries()) {
+                pathMap.delete(name);
+                if (pathMap.size === 0) {
+                    domainMap.delete(cookiePath);
+                }
+            }
+        }
+
+        if (domainMap.size === 0) {
+            this.cookies.delete(domain.toLowerCase());
         }
     }
 
     /** Get a specific cookie. */
-    get(domain: string, name: string): CookieEntry | undefined {
-        return this.cookies.get(domain.toLowerCase())?.get(name);
+    get(domain: string, name: string, path?: string): CookieEntry | undefined {
+        const domainMap = this.cookies.get(domain.toLowerCase());
+        if (!domainMap) return undefined;
+
+        if (path) {
+            return domainMap.get(path)?.get(name);
+        }
+
+        const matches: CookieEntry[] = [];
+        for (const pathMap of domainMap.values()) {
+            const match = pathMap.get(name);
+            if (match) matches.push(match);
+        }
+
+        matches.sort((a, b) => {
+            const pathDiff = b.path.length - a.path.length;
+            if (pathDiff !== 0) return pathDiff;
+            return a.capturedAt.getTime() - b.capturedAt.getTime();
+        });
+
+        return matches[0];
     }
 
     /** Clear all cookies. */
@@ -193,8 +239,10 @@ export class CookieJar {
     getAll(): CookieEntry[] {
         const all: CookieEntry[] = [];
         for (const domainMap of this.cookies.values()) {
-            for (const entry of domainMap.values()) {
-                all.push(entry);
+            for (const pathMap of domainMap.values()) {
+                for (const entry of pathMap.values()) {
+                    all.push(entry);
+                }
             }
         }
         return all;
@@ -214,7 +262,9 @@ export class CookieJar {
     get size(): number {
         let total = 0;
         for (const domainMap of this.cookies.values()) {
-            total += domainMap.size;
+            for (const pathMap of domainMap.values()) {
+                total += pathMap.size;
+            }
         }
         return total;
     }
@@ -243,21 +293,23 @@ export class CookieJar {
 
         const matching: CookieEntry[] = [];
 
-        for (const [domain, domainMap] of this.cookies.entries()) {
-            // Domain matching: exact match or subdomain match
-            if (!this.domainMatches(hostname, domain)) continue;
+        for (const [, domainMap] of this.cookies.entries()) {
+            for (const pathMap of domainMap.values()) {
+                for (const cookie of pathMap.values()) {
+                    // Domain matching: exact match or subdomain match, with host-only support
+                    if (!this.domainMatches(hostname, cookie)) continue;
 
-            for (const cookie of domainMap.values()) {
-                // Expiration check
-                if (cookie.expires && cookie.expires < now) continue;
+                    // Expiration check
+                    if (cookie.expires && cookie.expires < now) continue;
 
-                // Secure flag check
-                if (cookie.secure && !isSecure) continue;
+                    // Secure flag check
+                    if (cookie.secure && !isSecure) continue;
 
-                // Path matching (RFC 6265 §5.1.4)
-                if (enablePathScoping && !this.pathMatches(urlPath, cookie.path)) continue;
+                    // Path matching (RFC 6265 §5.1.4)
+                    if (enablePathScoping && !this.pathMatches(urlPath, cookie.path)) continue;
 
-                matching.push(cookie);
+                    matching.push(cookie);
+                }
             }
         }
 
@@ -280,10 +332,15 @@ export class CookieJar {
         const now = new Date();
         let purged = 0;
         for (const [domain, domainMap] of this.cookies.entries()) {
-            for (const [name, cookie] of domainMap.entries()) {
-                if (cookie.expires && cookie.expires < now) {
-                    domainMap.delete(name);
-                    purged++;
+            for (const [path, pathMap] of domainMap.entries()) {
+                for (const [name, cookie] of pathMap.entries()) {
+                    if (cookie.expires && cookie.expires < now) {
+                        pathMap.delete(name);
+                        purged++;
+                    }
+                }
+                if (pathMap.size === 0) {
+                    domainMap.delete(path);
                 }
             }
             if (domainMap.size === 0) {
@@ -310,6 +367,7 @@ export class CookieJar {
                 name: pc.name,
                 value: pc.value,
                 domain: pc.domain.replace(/^\./, '').toLowerCase(),
+                hostOnly: !pc.domain.startsWith('.'),
                 path: pc.path || '/',
                 expires: pc.expires > 0 ? new Date(pc.expires * 1000) : null,
                 maxAge: null,
@@ -334,13 +392,13 @@ export class CookieJar {
         expires: number; httpOnly: boolean; secure: boolean; sameSite: 'Strict' | 'Lax' | 'None';
     }> {
         const all = domain
-            ? (this.cookies.get(domain.toLowerCase())?.values() ? [...this.cookies.get(domain.toLowerCase())!.values()] : [])
+            ? this.getAll().filter(c => c.domain === domain.toLowerCase())
             : this.getAll();
 
         return all.map(c => ({
             name: c.name,
             value: c.value,
-            domain: `.${c.domain}`,
+            domain: c.hostOnly ? c.domain : `.${c.domain}`,
             path: c.path,
             expires: c.expires ? Math.floor(c.expires.getTime() / 1000) : -1,
             httpOnly: c.httpOnly,
@@ -358,6 +416,7 @@ export class CookieJar {
 
         const lines = entries.map(c => {
             const flags = [
+                c.hostOnly ? 'HostOnly' : 'Domain',
                 c.httpOnly ? 'HttpOnly' : '',
                 c.secure ? 'Secure' : '',
                 c.isSessionCookie ? '🔑Session' : '',
@@ -377,7 +436,11 @@ export class CookieJar {
      * Domain matching per RFC 6265 §5.1.3.
      * hostname "sub.example.com" matches cookie domain "example.com".
      */
-    private domainMatches(hostname: string, cookieDomain: string): boolean {
+    private domainMatches(hostname: string, cookie: CookieEntry): boolean {
+        const cookieDomain = cookie.domain.toLowerCase();
+        if (cookie.hostOnly) {
+            return hostname === cookieDomain;
+        }
         if (hostname === cookieDomain) return true;
         if (hostname.endsWith('.' + cookieDomain)) return true;
         return false;

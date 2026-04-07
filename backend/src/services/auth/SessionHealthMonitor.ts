@@ -161,7 +161,11 @@ export class SessionHealthMonitor {
             logger.warn(`SessionHealth: ${identityId} redirected to login`);
 
             const location = headers['location'] || headers['Location'] || '';
-            this.identityRegistry.setLoginUrl(identityId, location);
+            try {
+                this.identityRegistry.setLoginUrl(identityId, new URL(location, this.targetUrl).toString());
+            } catch {
+                this.identityRegistry.setLoginUrl(identityId, location);
+            }
 
             if (health.consecutiveFailures >= 2) {
                 needsRelogin = true;
@@ -308,13 +312,15 @@ export class SessionHealthMonitor {
         refreshBodyTemplate?: string;
         newAccessTokenPath?: string;
     }): RefreshPlan {
+        const tokenStore = this.tokenStores.get(identityId);
+        const refreshToken = tokenStore?.getRefreshToken();
         const plan: RefreshPlan = {
             identityId,
             strategy,
-            refreshEndpoint: opts?.refreshEndpoint,
+            refreshEndpoint: opts?.refreshEndpoint || refreshToken?.refreshEndpoint,
             refreshTokenField: opts?.refreshTokenField,
-            refreshBodyTemplate: opts?.refreshBodyTemplate,
-            newAccessTokenPath: opts?.newAccessTokenPath,
+            refreshBodyTemplate: opts?.refreshBodyTemplate || refreshToken?.refreshBodyTemplate,
+            newAccessTokenPath: opts?.newAccessTokenPath || refreshToken?.newAccessTokenJsonPath,
             estimatedExpiryAt: null,
             refreshAttempts: 0,
             maxRefreshAttempts: 3,
@@ -323,7 +329,6 @@ export class SessionHealthMonitor {
         };
 
         // Estimate expiry from token store
-        const tokenStore = this.tokenStores.get(identityId);
         if (tokenStore) {
             const activeToken = tokenStore.getActive();
             if (activeToken?.expiresAt) {
@@ -341,15 +346,20 @@ export class SessionHealthMonitor {
     autoDetectRefreshStrategy(identityId: string): RefreshStrategy {
         const tokenStore = this.tokenStores.get(identityId);
         const identity = this.identityRegistry.get(identityId);
+        const refreshToken = tokenStore?.getRefreshToken();
 
         // Has refresh token → JWT refresh
-        if (tokenStore?.getRefreshToken()) return 'jwt_refresh';
+        if (refreshToken?.refreshEndpoint) return 'jwt_refresh';
 
         // Has credentials + login URL → API re-login
         if (identity?.credentialSet?.password && identity?.credentialSet?.loginUrl) return 'api_relogin';
 
         // Has credentials but no login URL → browser re-login
         if (identity?.credentialSet?.password) return 'browser_relogin';
+
+        if (refreshToken) {
+            logger.warn(`SessionHealth: Refresh token present for ${identityId} but no refresh endpoint detected`);
+        }
 
         // OAuth flow → browser re-login
         if (identity?.credentialSet?.oauthFlow) return 'browser_relogin';
@@ -453,6 +463,14 @@ export class SessionHealthMonitor {
         const refreshToken = tokenStore.getRefreshToken();
         if (!refreshToken || !plan.refreshEndpoint) return false;
 
+        const cookieJar = this.cookieJars.get(identityId);
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const cookieHeader = cookieJar?.resolve(plan.refreshEndpoint);
+        if (cookieHeader) headers['Cookie'] = cookieHeader;
+
+        const activeAuthHeader = tokenStore.formatAuthHeader();
+        if (activeAuthHeader) headers['Authorization'] = activeAuthHeader;
+
         // Build refresh request
         let body = plan.refreshBodyTemplate || `{"refresh_token":"${refreshToken.value}"}`;
         body = body.replace('{{refresh_token}}', refreshToken.value);
@@ -460,12 +478,14 @@ export class SessionHealthMonitor {
         const response = await burpClient.callTool('send_http_request', {
             method: 'POST',
             url: plan.refreshEndpoint,
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body,
         });
 
         const statusCode = response?.statusCode || response?.status || 0;
         if (statusCode < 200 || statusCode >= 300) return false;
+
+        this.captureResponseCookies(identityId, plan.refreshEndpoint, response?.headers);
 
         // Extract new access token from response
         const responseBody = response?.body || response?.text || '';
@@ -490,19 +510,30 @@ export class SessionHealthMonitor {
             }
 
             if (newToken) {
-                tokenStore.rotate('Authorization', newToken, 'refresh_response');
+                const current = tokenStore.getActive('Authorization');
+                if (current) {
+                    tokenStore.rotate('Authorization', newToken, 'refresh_response');
+                } else {
+                    tokenStore.storeFromAuthHeader(`Bearer ${newToken}`, 'refresh_response');
+                }
 
                 // Check for rotated refresh token
                 const newRefresh = parsed.refresh_token || parsed.refreshToken || parsed.data?.refresh_token;
                 if (typeof newRefresh === 'string' && newRefresh !== refreshToken.value) {
-                    tokenStore.storeRefreshToken(newRefresh, plan.refreshEndpoint!, 'refresh_response');
+                    tokenStore.storeRefreshToken(
+                        newRefresh,
+                        plan.refreshEndpoint!,
+                        'refresh_response',
+                        plan.refreshBodyTemplate || refreshToken.refreshBodyTemplate,
+                        plan.newAccessTokenPath || refreshToken.newAccessTokenJsonPath,
+                    );
                 }
 
                 return true;
             }
         } catch { /* response wasn't JSON */ }
 
-        return false;
+        return this.extractSetCookieHeaders(response?.headers).length > 0;
     }
 
     private async executeAPIRelogin(identityId: string, burpClient: BurpClient): Promise<boolean> {
@@ -525,6 +556,8 @@ export class SessionHealthMonitor {
         const statusCode = response?.statusCode || response?.status || 0;
         if (statusCode < 200 || statusCode >= 400) return false;
 
+        this.captureResponseCookies(identityId, creds.loginUrl!, response?.headers);
+
         // Extract tokens from response body
         const responseBody = response?.body || response?.text || '';
         try {
@@ -533,7 +566,12 @@ export class SessionHealthMonitor {
             if (tokenStore) {
                 const token = parsed.token || parsed.access_token || parsed.accessToken || parsed.data?.token;
                 if (typeof token === 'string') {
-                    tokenStore.rotate('Authorization', token, 'login_response_body');
+                    const current = tokenStore.getActive('Authorization');
+                    if (current) {
+                        tokenStore.rotate('Authorization', token, 'login_response_body');
+                    } else {
+                        tokenStore.storeFromAuthHeader(`Bearer ${token}`, 'login_response_body');
+                    }
                     return true;
                 }
             }
@@ -559,6 +597,44 @@ export class SessionHealthMonitor {
     private incrementRequestCounter(identityId: string): void {
         const count = (this.requestCounters.get(identityId) || 0) + 1;
         this.requestCounters.set(identityId, count);
+    }
+
+    private captureResponseCookies(identityId: string, requestUrl: string, headers: any): void {
+        const cookieJar = this.cookieJars.get(identityId);
+        if (!cookieJar) return;
+
+        let requestDomain: string;
+        try {
+            requestDomain = new URL(requestUrl).hostname;
+        } catch {
+            return;
+        }
+
+        const values = this.extractSetCookieHeaders(headers);
+        if (values.length > 0) {
+            cookieJar.parseMultiple(values, requestDomain, 'refresh_response');
+        }
+    }
+
+    private extractSetCookieHeaders(headers: any): string[] {
+        if (!headers) return [];
+
+        if (Array.isArray(headers)) {
+            return headers
+                .filter((line: string) => typeof line === 'string' && line.toLowerCase().startsWith('set-cookie:'))
+                .map((line: string) => line.substring(11).trim())
+                .filter(Boolean);
+        }
+
+        const setCookieValue = headers['set-cookie'] ?? headers['Set-Cookie'];
+        if (Array.isArray(setCookieValue)) {
+            return setCookieValue.map((value: any) => String(value || '').trim()).filter(Boolean);
+        }
+        if (typeof setCookieValue === 'string' && setCookieValue.trim()) {
+            return [setCookieValue.trim()];
+        }
+
+        return [];
     }
 
     /** Summary for serialization / logging. */

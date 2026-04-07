@@ -1217,8 +1217,21 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
         if (mcpAvailable) {
             logger.info('Using Burp MCP for scanning', { scanId });
 
-            const parallelAgents = config.parallelAgents || 1;
-            logger.info(`parallelAgents config value: ${parallelAgents}`, { scanId, config });
+            const explicitAuthRequested = Boolean(
+                (typeof config.sessionCookies === 'string' && config.sessionCookies.trim()) ||
+                (Array.isArray(config.idorUsers) && config.idorUsers.length > 0) ||
+                (typeof config.initialRequest === 'string' && /(^(cookie|authorization):)/im.test(config.initialRequest))
+            );
+            const requestedParallelAgents = config.parallelAgents || 1;
+            const parallelAgents = explicitAuthRequested && requestedParallelAgents > 1 ? 1 : requestedParallelAgents;
+            logger.info(`parallelAgents config value: ${requestedParallelAgents} (effective: ${parallelAgents})`, { scanId, config });
+
+            if (explicitAuthRequested && requestedParallelAgents > 1) {
+                logger.warn('Authenticated scan requested in parallel mode; forcing single-agent execution because AgentPool does not yet propagate AuthStateManager state safely.', {
+                    scanId,
+                    requestedParallelAgents,
+                });
+            }
 
             if (parallelAgents > 1) {
                 // Multi-agent parallel scanning

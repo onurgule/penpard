@@ -8,7 +8,7 @@
  * This replaces the LLM-driven header-copying approach.
  */
 
-import { AuthContext, AuthContextHeaders, RequestAuthBindingRules, DEFAULT_NO_AUTH_PATHS, LOGIN_PATH_PATTERNS } from './types';
+import { AuthContext, AuthContextHeaders, RequestAuthBindingRules, LOGIN_PATH_PATTERNS, CSRF_HEADER_NAMES } from './types';
 import { CookieJar } from './CookieJar';
 import { TokenStore } from './TokenStore';
 import { CSRFManager } from './CSRFManager';
@@ -16,6 +16,16 @@ import { IdentityRegistry } from './IdentityRegistry';
 import { logger } from '../../utils/logger';
 
 export class AuthInjector {
+    private static readonly KNOWN_CUSTOM_AUTH_HEADERS = [
+        'x-api-key',
+        'x-auth-token',
+        'x-access-token',
+        'x-session-token',
+        'api-key',
+        'apikey',
+        'x-token',
+    ];
+
     private readonly identityRegistry: IdentityRegistry;
     private readonly cookieJars: Map<string, CookieJar>;
     private readonly tokenStores: Map<string, TokenStore>;
@@ -159,6 +169,38 @@ export class AuthInjector {
         return context;
     }
 
+    /**
+     * Prepare final request components for an outgoing request.
+     * When preserveExplicit is enabled, explicit headers/body are trusted as-is
+     * and no automatic auth material is injected.
+     */
+    prepareRequest(
+        existingHeaders: Record<string, string> | undefined,
+        body: string | undefined,
+        url: string,
+        method: string = 'GET',
+        identityId?: string,
+        preserveExplicit: boolean = false,
+    ): { context: AuthContext; headers: Record<string, string>; body: string } {
+        const context = this.prepare(url, method, identityId);
+        const normalizedBody = body || '';
+
+        if (preserveExplicit) {
+            return {
+                context,
+                headers: { ...(existingHeaders || {}) },
+                body: normalizedBody,
+            };
+        }
+
+        const strippedHeaders = this.stripManagedHeaders(existingHeaders);
+        return {
+            context,
+            headers: AuthInjector.mergeHeaders(strippedHeaders, context),
+            body: AuthInjector.injectCSRFIntoBody(normalizedBody, context),
+        };
+    }
+
     // ═══════════════════════════════════════════════════════════
     //  HEADER MERGING
     // ═══════════════════════════════════════════════════════════
@@ -276,6 +318,46 @@ export class AuthInjector {
             if (lower === np || lower.startsWith(np + '/') || lower.startsWith(np + '?')) return true;
         }
         return false;
+    }
+
+    private stripManagedHeaders(existingHeaders: Record<string, string> | undefined): Record<string, string> {
+        const stripped = { ...(existingHeaders || {}) };
+        const managedHeaderNames = this.getManagedHeaderNames();
+
+        for (const key of Object.keys(stripped)) {
+            if (managedHeaderNames.has(key.toLowerCase())) {
+                delete stripped[key];
+            }
+        }
+
+        return stripped;
+    }
+
+    private getManagedHeaderNames(): Set<string> {
+        const names = new Set<string>([
+            'cookie',
+            'authorization',
+            ...CSRF_HEADER_NAMES.map(name => name.toLowerCase()),
+            ...AuthInjector.KNOWN_CUSTOM_AUTH_HEADERS,
+        ]);
+
+        for (const store of this.tokenStores.values()) {
+            for (const token of store.getAllActive()) {
+                if (token.headerName && token.headerName !== '__refresh__') {
+                    names.add(token.headerName.toLowerCase());
+                }
+            }
+        }
+
+        for (const csrfManager of this.csrfManagers.values()) {
+            for (const csrfState of csrfManager.getAll()) {
+                if (csrfState.headerName) {
+                    names.add(csrfState.headerName.toLowerCase());
+                }
+            }
+        }
+
+        return names;
     }
 
     /**

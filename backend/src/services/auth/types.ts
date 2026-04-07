@@ -122,6 +122,7 @@ export interface CookieEntry {
     name: string;
     value: string;
     domain: string;
+    hostOnly: boolean;                    // true when Domain attr was absent
     path: string;
     expires: Date | null;                   // null = session cookie
     maxAge: number | null;

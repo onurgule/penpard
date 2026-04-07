@@ -1,9 +1,9 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import path from 'path';
-import dotenv from 'dotenv';
 
 import { logger } from './utils/logger';
 import { initDatabase, validateSchema, recoverOrphanedScans } from './db/init';
@@ -20,9 +20,6 @@ import penpardRoutes from './routes/penpard';
 import reportAnalysisRoutes from './routes/report-analysis';
 import presenceScanRoutes from './routes/presence-scan';
 import browserRoutes from './routes/browser';
-
-// Load environment variables
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 4000;

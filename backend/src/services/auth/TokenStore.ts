@@ -45,8 +45,16 @@ export class TokenStore {
             }
         }
 
-        // Supersede existing tokens with same headerName (unless it's a refresh token)
-        if (!fullToken.isRefreshToken) {
+        // Supersede prior refresh tokens so rotation always advances deterministically.
+        if (fullToken.isRefreshToken) {
+            for (const existing of this.tokens.values()) {
+                if (existing.isRefreshToken && !existing.superseded) {
+                    existing.superseded = true;
+                }
+            }
+        }
+        // Supersede existing access/custom tokens with the same header name.
+        else {
             for (const [id, existing] of this.tokens.entries()) {
                 if (existing.headerName === fullToken.headerName && !existing.superseded && !existing.isRefreshToken) {
                     existing.superseded = true;

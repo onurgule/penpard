@@ -167,8 +167,22 @@ export class AuthStateManager {
      * Convenience wrapper around AuthInjector.mergeHeaders().
      */
     mergeHeaders(existingHeaders: Record<string, string> | undefined, url: string, method: string = 'GET', identityId?: string): Record<string, string> {
-        const ctx = this.inject(url, method, identityId);
-        return AuthInjector.mergeHeaders(existingHeaders, ctx);
+        return this.prepareRequest(existingHeaders, undefined, url, method, identityId).headers;
+    }
+
+    /**
+     * Prepare final outgoing request components with deterministic auth handling.
+     * Set preserveExplicitAuth=true for exact Burp request replay or auth bypass tests.
+     */
+    prepareRequest(
+        existingHeaders: Record<string, string> | undefined,
+        body: string | undefined,
+        url: string,
+        method: string = 'GET',
+        identityId?: string,
+        preserveExplicitAuth: boolean = false,
+    ): { context: AuthContext; headers: Record<string, string>; body: string } {
+        return this.injector.prepareRequest(existingHeaders, body, url, method, identityId, preserveExplicitAuth);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -348,8 +362,9 @@ export class AuthStateManager {
         if (this.getTotalCookies() > 0 || this.getTotalTokens() > 0) {
             block += 'AUTH IS HANDLED AUTOMATICALLY. PenPard injects the correct Cookie, Authorization, and CSRF headers into every request.\n';
             block += 'You do NOT need to set Cookie or Authorization headers manually in send_http_request calls.\n';
-            block += 'If you need to test without auth (auth bypass), use: repeater_test with identityId="__none__"\n';
-            block += 'If you need to test as a different user: repeater_test with identityId="idor-user-1"\n\n';
+            block += 'If you need exact Burp replay or auth bypass testing, set preserveExplicitAuth=true.\n';
+            block += 'If you need to test without auth, use identityId="__none__".\n';
+            block += 'If you need to test as a different user, use identityId="idor-user-1".\n\n';
 
             block += `Active identities: ${identities.map(i => `${i.id} (${i.label})`).join(', ')}\n`;
             block += `Cookies: ${this.getTotalCookies()} | Tokens: ${this.getTotalTokens()}\n`;

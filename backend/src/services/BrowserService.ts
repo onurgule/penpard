@@ -1093,6 +1093,41 @@ public class PenPardIconChanger {
     }
 
     /**
+     * Push cookies into a live browser context.
+     * Used to keep the browser aligned with backend-side session refreshes.
+     */
+    async syncCookiesToSession(sessionId: string, cookies: Array<{
+        name: string;
+        value: string;
+        domain: string;
+        path: string;
+        expires: number;
+        httpOnly: boolean;
+        secure: boolean;
+        sameSite: 'Strict' | 'Lax' | 'None';
+    }>): Promise<number> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        if (!cookies.length) return 0;
+
+        await session.context.addCookies(cookies as any);
+        updateBrowserSession(sessionId, {
+            last_activity_at: new Date().toISOString(),
+        });
+
+        addBrowserAction({
+            sessionId,
+            actionType: 'sync_cookies',
+            actionData: JSON.stringify({ count: cookies.length }),
+            pageUrl: session.page.url(),
+            pageTitle: await session.page.title().catch(() => ''),
+            source: 'system',
+        });
+
+        return cookies.length;
+    }
+
+    /**
      * Correlate browser-visible state with Burp MCP proxy history.
      * Merges what the browser sees with what Burp intercepted.
      */

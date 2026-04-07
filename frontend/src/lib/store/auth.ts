@@ -2,8 +2,31 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import axios from 'axios';
 import { API_URL } from '@/lib/api-config';
+import { createSafeLocalStorage } from './persist-storage';
 
 const SAVED_KEY_STORAGE = 'penpard-saved-key';
+const PERSISTED_AUTH_STORAGE = 'penpard-auth';
+const SESSION_INVALIDATION_MESSAGES = new Set([
+    'Authentication required',
+    'Invalid or expired token',
+    'User not found',
+]);
+
+export function shouldInvalidateSession(status?: number, message?: string, url?: string): boolean {
+    if (status !== 401 && status !== 403) {
+        return false;
+    }
+
+    if (url?.includes('/auth/verify-key')) {
+        return false;
+    }
+
+    if (message && SESSION_INVALIDATION_MESSAGES.has(message)) {
+        return true;
+    }
+
+    return status === 403 && !message;
+}
 
 interface AuthState {
     isAuthenticated: boolean;
@@ -91,7 +114,8 @@ export const useAuthStore = create<AuthState>()(
             },
         }),
         {
-            name: 'penpard-auth',
+            name: PERSISTED_AUTH_STORAGE,
+            storage: createSafeLocalStorage(),
             partialize: (state) => ({
                 token: state.token,
                 isAuthenticated: state.isAuthenticated,
@@ -103,7 +127,7 @@ export const useAuthStore = create<AuthState>()(
 // Setup axios defaults & interceptors
 if (typeof window !== 'undefined') {
     // Restore token from persisted storage
-    const stored = localStorage.getItem('penpard-auth');
+    const stored = localStorage.getItem(PERSISTED_AUTH_STORAGE);
     if (stored) {
         try {
             const parsed = JSON.parse(stored);
@@ -111,7 +135,8 @@ if (typeof window !== 'undefined') {
                 axios.defaults.headers.common['Authorization'] = `Bearer ${parsed.state.token}`;
             }
         } catch (e) {
-            // Invalid token data
+            localStorage.removeItem(PERSISTED_AUTH_STORAGE);
+            delete axios.defaults.headers.common['Authorization'];
         }
     }
 
@@ -120,17 +145,15 @@ if (typeof window !== 'undefined') {
         (response) => response,
         (error) => {
             const status = error?.response?.status;
+            const message = error?.response?.data?.message;
             // 401 = no/missing token, 403 = invalid/expired token
-            if (status === 401 || status === 403) {
-                const url = error?.config?.url || '';
-                // Don't intercept the lock-screen auth request itself
-                if (!url.includes('/auth/verify-key')) {
-                    const state = useAuthStore.getState();
-                    if (state.isAuthenticated) {
-                        state.lock();
-                        // Redirect to lock screen
-                        window.location.href = '/';
-                    }
+            const url = error?.config?.url || '';
+            if (shouldInvalidateSession(status, message, url)) {
+                const state = useAuthStore.getState();
+                if (state.isAuthenticated) {
+                    state.lock();
+                    // Redirect to lock screen
+                    window.location.href = '/';
                 }
             }
             return Promise.reject(error);

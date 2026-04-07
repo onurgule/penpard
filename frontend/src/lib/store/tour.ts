@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { createSafeLocalStorage } from './persist-storage';
 
 export interface TourStep {
     id: string;
@@ -127,6 +128,7 @@ export const useTourStore = create<TourState>()(
         }),
         {
             name: 'penpard-tour',
+            storage: createSafeLocalStorage(),
             partialize: (state) => ({
                 hasCompletedTour: state.hasCompletedTour,
             }),
