@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { logger } from '../utils/logger';
+import type { BrowserLifecycleState } from '../types/browserLifecycle';
 
 // Get consistent database path across CLI, Electron, and standalone backend
 function getDefaultDbPath(): string {
@@ -358,6 +359,9 @@ export async function initDatabase(): Promise<void> {
       finding_id INTEGER,
       target_url TEXT,
       status TEXT DEFAULT 'launching' CHECK(status IN ('launching','active','paused','closed')),
+      lifecycle_state TEXT DEFAULT 'launching',
+      lifecycle_detail TEXT,
+      last_error TEXT,
       mode TEXT DEFAULT 'human' CHECK(mode IN ('human','ai','mixed')),
       current_url TEXT,
       proxy_host TEXT,
@@ -453,6 +457,18 @@ export async function initDatabase(): Promise<void> {
   if (!browserCols.some((c) => c.name === 'label')) {
     db.exec('ALTER TABLE browser_sessions ADD COLUMN label TEXT');
     logger.info('Added browser_sessions.label column');
+  }
+  if (!browserCols.some((c) => c.name === 'lifecycle_state')) {
+    db.exec(`ALTER TABLE browser_sessions ADD COLUMN lifecycle_state TEXT DEFAULT 'launching'`);
+    logger.info('Added browser_sessions.lifecycle_state column');
+  }
+  if (!browserCols.some((c) => c.name === 'lifecycle_detail')) {
+    db.exec('ALTER TABLE browser_sessions ADD COLUMN lifecycle_detail TEXT');
+    logger.info('Added browser_sessions.lifecycle_detail column');
+  }
+  if (!browserCols.some((c) => c.name === 'last_error')) {
+    db.exec('ALTER TABLE browser_sessions ADD COLUMN last_error TEXT');
+    logger.info('Added browser_sessions.last_error column');
   }
 
   logger.info('Database initialized successfully');
@@ -851,8 +867,8 @@ export const createBrowserSession = (data: {
 }) => {
   const safeVal = (v: any) => (v === undefined || v === null) ? null : v;
   return db.prepare(`
-    INSERT INTO browser_sessions (id, user_id, scan_id, finding_id, target_url, status, mode, current_url, proxy_host, proxy_port)
-    VALUES (?, ?, ?, ?, ?, 'launching', 'human', ?, ?, ?)
+    INSERT INTO browser_sessions (id, user_id, scan_id, finding_id, target_url, status, lifecycle_state, mode, current_url, proxy_host, proxy_port)
+    VALUES (?, ?, ?, ?, ?, 'launching', 'launching', 'human', ?, ?, ?)
   `).run(
     data.id, data.userId, safeVal(data.scanId), safeVal(data.findingId),
     safeVal(data.targetUrl), safeVal(data.targetUrl),
@@ -874,10 +890,23 @@ export const updateBrowserSession = (id: string, updates: Record<string, any>) =
   return db.prepare(`UPDATE browser_sessions SET ${setClauses} WHERE id = ?`).run(...values, id);
 };
 
-export const closeBrowserSession = (sessionId: string) => {
-  return db.prepare(`
-    UPDATE browser_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ? AND status != 'closed'
-  `).run(sessionId);
+export const closeBrowserSession = (
+  sessionId: string,
+  updates: {
+    lifecycle_state?: BrowserLifecycleState;
+    lifecycle_detail?: string | null;
+    last_error?: string | null;
+    current_url?: string | null;
+  } = {},
+) => {
+  return updateBrowserSession(sessionId, {
+    status: 'closed',
+    lifecycle_state: updates.lifecycle_state || 'closed',
+    lifecycle_detail: updates.lifecycle_detail ?? null,
+    last_error: updates.last_error ?? null,
+    current_url: updates.current_url ?? null,
+    closed_at: new Date().toISOString(),
+  });
 };
 
 export const addBrowserAction = (data: {

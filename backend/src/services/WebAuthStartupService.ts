@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { BurpMCPClient } from './burp-mcp';
 import { browserService } from './BrowserService';
 import {
+    AUTH_BOOTSTRAP_PATH_PATTERNS,
     AuthStateManager,
     AuthStartupConfig,
     AuthStartupCredential,
@@ -31,8 +32,6 @@ const TYPE_PATTERNS: Array<[AuthSurfaceType, RegExp[]]> = [
     ['invite', [/invite/i]],
     ['magic_link', [/magic link/i]],
 ];
-
-const COMMON_AUTH_PATHS = ['/login', '/signin', '/sign-in', '/register', '/signup', '/sign-up', '/forgot-password', '/reset-password', '/auth', '/sso'];
 
 export class WebAuthStartupService {
     constructor(
@@ -140,10 +139,13 @@ export class WebAuthStartupService {
 
     private async discover(sessionId: string, inventory: AuthStartupInventory, identityId: string): Promise<void> {
         await this.captureState(sessionId, inventory, identityId, 'discovery', 'initial auth inventory');
-        const origin = new URL(this.targetUrl).origin;
-        const urls = new Set<string>(COMMON_AUTH_PATHS.map((path) => `${origin}${path}`));
-        for (const route of inventory.authRoutes) urls.add(route.startsWith('http') ? route : `${origin}${route}`);
-        for (const url of Array.from(urls).slice(0, 8)) {
+        const urls = this.buildDiscoveryNavigationUrls(inventory);
+        if (urls.length === 0) {
+            inventory.blockers.push('No auth routes were passively discovered from the target, so PenPard skipped the blind auth-route browser sweep to avoid generating noisy target traffic.');
+            return;
+        }
+
+        for (const url of urls) {
             const before = this.lastTrafficId(sessionId);
             try {
                 await browserService.executeAction(sessionId, { type: 'goto', url, timeout: 15000 });
@@ -224,13 +226,12 @@ export class WebAuthStartupService {
     private async findTypedForm(sessionId: string, inventory: AuthStartupInventory, identityId: string, type: AuthSurfaceType): Promise<AuthInventoryForm | undefined> {
         let form = inventory.forms.find((candidate) => candidate.type === type);
         if (form) return form;
-        const origin = new URL(this.targetUrl).origin;
-        const paths = type === 'login' ? ['/login', '/signin', '/auth'] : ['/register', '/signup', '/create-account'];
-        for (const path of paths) {
+
+        for (const url of this.buildTypedDiscoveryNavigationUrls(inventory, type)) {
             try {
                 const before = this.lastTrafficId(sessionId);
-                await browserService.executeAction(sessionId, { type: 'goto', url: `${origin}${path}`, timeout: 15000 });
-                await this.captureState(sessionId, inventory, identityId, 'navigate', `${type} route ${path}`, before);
+                await browserService.executeAction(sessionId, { type: 'goto', url, timeout: 15000 });
+                await this.captureState(sessionId, inventory, identityId, 'navigate', `${type} route ${url}`, before);
                 form = inventory.forms.find((candidate) => candidate.type === type);
                 if (form) return form;
             } catch {}
@@ -240,7 +241,7 @@ export class WebAuthStartupService {
 
     private async captureState(sessionId: string, inventory: AuthStartupInventory, identityId: string, type: 'navigate' | 'click' | 'submit' | 'login' | 'register' | 'discovery', label: string, afterId: number = 0): Promise<void> {
         const state = await browserService.getFullPageState(sessionId);
-        await browserService.captureJavaScriptArtifacts(sessionId).catch(() => []);
+        const frontendAnalysis = await browserService.getFrontendAnalysis(sessionId).catch(() => null);
         const forms = (Array.isArray(state.forms) ? state.forms : []).map((form: any) => this.classifyForm(form, state)).filter((form: AuthInventoryForm | null): form is AuthInventoryForm => !!form);
         const elements = this.classifyElements(state);
         forms.forEach((form: AuthInventoryForm) => {
@@ -259,6 +260,7 @@ export class WebAuthStartupService {
             if (element.href) this.addRoute(inventory, element.href);
             if (element.provider && !inventory.ssoProviders.includes(element.provider)) inventory.ssoProviders.push(element.provider);
         });
+        this.captureFrontendAuthRoutes(inventory, frontendAnalysis);
         for (const meta of Array.isArray(state.metaTags) ? state.metaTags : []) {
             const name = String(meta?.name || '');
             if (/csrf|xsrf/i.test(name) && !inventory.transport.csrfMetaNames.includes(name)) {
@@ -374,6 +376,103 @@ export class WebAuthStartupService {
         let normalized = route;
         try { normalized = new URL(route).pathname; } catch { if (!route.startsWith('/')) return; }
         if (!inventory.authRoutes.includes(normalized)) inventory.authRoutes.push(normalized);
+    }
+
+    private captureFrontendAuthRoutes(inventory: AuthStartupInventory, frontendAnalysis: any): void {
+        const frontendRoutes = Array.isArray(frontendAnalysis?.frontendRoutes) ? frontendAnalysis.frontendRoutes : [];
+        for (const route of frontendRoutes) {
+            if (!this.isAuthRouteHint(route)) continue;
+            this.addRoute(inventory, route);
+            const detected = this.detectType(route);
+            inventory.registrationAvailable ||= detected === 'register';
+            inventory.passwordResetAvailable ||= ['forgot_password', 'reset_password', 'recover_account'].includes(detected);
+        }
+    }
+
+    private normalizeRouteCandidate(route: string): { pathname: string; absoluteUrl: string } | null {
+        if (!route || typeof route !== 'string') return null;
+        try {
+            const url = new URL(route, this.targetUrl);
+            return {
+                pathname: url.pathname,
+                absoluteUrl: url.toString(),
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    private isAuthRouteHint(route: string): boolean {
+        const normalized = this.normalizeRouteCandidate(route);
+        if (!normalized) return false;
+        return AUTH_BOOTSTRAP_PATH_PATTERNS.some((pattern) => pattern.test(normalized.pathname))
+            || this.detectType(normalized.pathname) !== 'unknown';
+    }
+
+    private buildDiscoveryNavigationUrls(inventory: AuthStartupInventory): string[] {
+        const urls: string[] = [];
+        const seen = new Set<string>();
+
+        const addCandidate = (route: string) => {
+            const normalized = this.normalizeRouteCandidate(route);
+            if (
+                !normalized
+                || seen.has(normalized.absoluteUrl)
+                || !this.isAuthRouteHint(normalized.pathname)
+                || !this.isBrowserNavigableRoute(normalized.pathname)
+            ) return;
+            seen.add(normalized.absoluteUrl);
+            urls.push(normalized.absoluteUrl);
+        };
+
+        addCandidate(this.targetUrl);
+        inventory.authRoutes.forEach(addCandidate);
+
+        return urls.slice(0, 8);
+    }
+
+    private buildTypedDiscoveryNavigationUrls(inventory: AuthStartupInventory, type: AuthSurfaceType): string[] {
+        const urls: string[] = [];
+        const seen = new Set<string>();
+
+        const addCandidate = (route: string) => {
+            const normalized = this.normalizeRouteCandidate(route);
+            if (
+                !normalized
+                || seen.has(normalized.absoluteUrl)
+                || !this.matchesRouteType(normalized.pathname, type)
+                || !this.isBrowserNavigableRoute(normalized.pathname)
+            ) return;
+            seen.add(normalized.absoluteUrl);
+            urls.push(normalized.absoluteUrl);
+        };
+
+        addCandidate(this.targetUrl);
+        inventory.authRoutes.forEach(addCandidate);
+
+        return urls;
+    }
+
+    private matchesRouteType(pathname: string, type: AuthSurfaceType): boolean {
+        const detected = this.detectType(pathname);
+        if (detected === type) return true;
+
+        if (type === 'login') {
+            return /\/(auth|oauth|sso)(?:\/|$|\?)/i.test(pathname);
+        }
+
+        if (type === 'register') {
+            return /\/(register|signup|sign-up|create-account)(?:\/|$|\?)/i.test(pathname);
+        }
+
+        return false;
+    }
+
+    private isBrowserNavigableRoute(pathname: string): boolean {
+        const lower = pathname.toLowerCase();
+        if (lower.startsWith('/api/')) return false;
+        if (/\.(json|js|css|png|jpg|jpeg|gif|svg|ico|xml|txt|pdf)(?:$|\?)/i.test(lower)) return false;
+        return true;
     }
 
     private lastTrafficId(sessionId: string): number {

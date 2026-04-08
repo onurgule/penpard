@@ -18,6 +18,7 @@ release/
 .env.production
 .env.staging
 .env.*.local
+.env.test.local
 # Allow example/template env files
 !.env.example
 !.env.sample
@@ -112,3 +113,9 @@ burp-extension/build/
 
 # AI Agent config
 .agent/
+.tmp/
+tmp/
+
+# Local development-only config and secrets
+config/local.*
+secrets/*

@@ -45,7 +45,11 @@ router.post('/launch', authenticateToken, async (req: AuthRequest, res: Response
 router.get('/sessions', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
         const sessions = getUserBrowserSessions(req.user!.id);
-        const annotated = sessions.map(s => ({ ...s, isLive: browserService.isSessionAlive(s.id) }));
+        const annotated = sessions.map(s => ({
+            ...s,
+            isLive: browserService.isSessionAlive(s.id),
+            runtime: browserService.getSessionVisibility(s.id),
+        }));
         res.json({ sessions: annotated });
     } catch (error: any) {
         res.status(500).json({ error: true, message: 'Failed to list sessions' });
@@ -224,8 +228,8 @@ router.post('/sessions/:id/show', authenticateToken, async (req: AuthRequest, re
     try {
         const { id } = req.params;
         logger.info('Show browser requested', { sessionId: id });
-        await browserService.showBrowser(id);
-        res.json({ message: 'Browser is now visible', isHeadless: false });
+        const visibility = await browserService.showBrowser(id);
+        res.json(visibility);
     } catch (error: any) {
         logger.error('Show browser failed', { error: error.message });
         res.status(400).json({ error: true, message: error.message });
@@ -237,8 +241,8 @@ router.post('/sessions/:id/hide', authenticateToken, async (req: AuthRequest, re
     try {
         const { id } = req.params;
         logger.info('Hide browser requested', { sessionId: id });
-        await browserService.hideBrowser(id);
-        res.json({ message: 'Browser is now headless', isHeadless: true });
+        const visibility = await browserService.hideBrowser(id);
+        res.json(visibility);
     } catch (error: any) {
         logger.error('Hide browser failed', { error: error.message });
         res.status(400).json({ error: true, message: error.message });

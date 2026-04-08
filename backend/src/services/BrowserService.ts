@@ -29,6 +29,11 @@ import os from 'os';
 import { createHash } from 'crypto';
 import { execSync, exec } from 'child_process';
 import { normalizeProxyHistoryItems } from './burp-tool-result';
+import {
+    deriveActiveBrowserLifecycleState,
+    isLiveBrowserLifecycleState,
+    type BrowserLifecycleState,
+} from '../types/browserLifecycle';
 
 // ── Types ──
 
@@ -109,10 +114,26 @@ interface BrowserContinuitySnapshot {
     }>;
 }
 
+export interface BrowserSessionVisibility {
+    sessionId: string;
+    lifecycleState: BrowserLifecycleState;
+    isHeadless: boolean | null;
+    transitioning: boolean;
+    isLive: boolean;
+    lastKnownUrl: string | null;
+    lastError: string | null;
+    detail: string | null;
+}
+
+export interface BrowserVisibilityResult extends BrowserSessionVisibility {
+    message: string;
+    reopened: boolean;
+}
+
 interface LiveSession {
-    browser: Browser;
-    context: BrowserContext;
-    page: Page;
+    browser: Browser | null;
+    context: BrowserContext | null;
+    page: Page | null;
     sessionId: string;
     userId: number;
     userDataDir: string;
@@ -129,6 +150,20 @@ interface LiveSession {
     brandingExtPath: string | null;
     /** Lock to prevent concurrent show/hide transitions. */
     transitioning: boolean;
+    /** Runtime lifecycle contract for the current session record. */
+    lifecycleState: BrowserLifecycleState;
+    /** Last lifecycle detail or reason for invalidation. */
+    lifecycleDetail: string | null;
+    /** Last lifecycle-related error without secrets. */
+    lastError: string | null;
+    /** Last URL observed before the session became unavailable. */
+    lastKnownUrl: string | null;
+    /** Last title observed before the session became unavailable. */
+    lastKnownTitle: string | null;
+    /** Tracks whether the session has ever been shown as a real browser window. */
+    hasBeenVisible: boolean;
+    /** Generation token so late events from prior contexts do not poison replacements. */
+    generation: number;
     /** Rolling capture of browser-generated traffic for auth/session correlation. */
     networkEvents: BrowserTrafficEvent[];
     nextTrafficEventId: number;
@@ -136,10 +171,240 @@ interface LiveSession {
     jsArtifactsDir: string | null;
 }
 
+type ReadyLiveSession = LiveSession & {
+    browser: Browser;
+    context: BrowserContext;
+    page: Page;
+};
+
 // ── Service ──
 
 class BrowserService {
     private sessions: Map<string, LiveSession> = new Map();
+
+    private now(): string {
+        return new Date().toISOString();
+    }
+
+    private delay(ms: number): Promise<void> {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    private safePageUrl(session: Pick<LiveSession, 'page' | 'lastKnownUrl' | 'targetUrl'>): string | null {
+        if (session.page) {
+            try {
+                const url = session.page.url();
+                if (url) {
+                    return url;
+                }
+            } catch {
+                /* ignore */
+            }
+        }
+        return session.lastKnownUrl || session.targetUrl || null;
+    }
+
+    private async safePageTitle(session: Pick<LiveSession, 'page' | 'lastKnownTitle'>): Promise<string | null> {
+        if (session.page) {
+            try {
+                const title = await session.page.title();
+                if (title) {
+                    return title;
+                }
+            } catch {
+                /* ignore */
+            }
+        }
+        return session.lastKnownTitle || null;
+    }
+
+    private updateLastKnownPageState(session: LiveSession, page: Page | null = session.page): void {
+        if (!page) return;
+        try {
+            const currentUrl = page.url();
+            if (currentUrl) {
+                session.lastKnownUrl = currentUrl;
+            }
+        } catch {
+            /* ignore */
+        }
+
+        void page.title().then((title) => {
+            session.lastKnownTitle = title || session.lastKnownTitle;
+        }).catch(() => {});
+    }
+
+    private buildVisibilityState(session: LiveSession): BrowserSessionVisibility {
+        return {
+            sessionId: session.sessionId,
+            lifecycleState: session.lifecycleState,
+            isHeadless: session.page && session.context && session.browser ? session.isHeadless : null,
+            transitioning: session.transitioning,
+            isLive: isLiveBrowserLifecycleState(session.lifecycleState) && !!session.browser && !!session.context && !!session.page,
+            lastKnownUrl: session.lastKnownUrl || null,
+            lastError: session.lastError || null,
+            detail: session.lifecycleDetail || null,
+        };
+    }
+
+    private updateLifecycleState(
+        sessionId: string,
+        session: LiveSession,
+        lifecycleState: BrowserLifecycleState,
+        options: {
+            detail?: string | null;
+            error?: string | null;
+            status?: 'launching' | 'active' | 'paused' | 'closed';
+            currentUrl?: string | null;
+            closedAt?: string | null;
+            clearHandles?: boolean;
+            preserveTransitioning?: boolean;
+        } = {},
+    ): void {
+        session.lifecycleState = lifecycleState;
+        session.lifecycleDetail = options.detail ?? null;
+        session.lastError = options.error ?? null;
+        if (!options.preserveTransitioning) {
+            session.transitioning = lifecycleState === 'closing';
+        }
+        if (lifecycleState === 'visible_active') {
+            session.hasBeenVisible = true;
+        }
+        if (options.currentUrl !== undefined) {
+            session.lastKnownUrl = options.currentUrl;
+        }
+        if (options.clearHandles) {
+            session.browser = null;
+            session.context = null;
+            session.page = null;
+        }
+
+        const dbUpdate: Record<string, any> = {
+            lifecycle_state: lifecycleState,
+            lifecycle_detail: options.detail ?? null,
+            last_error: options.error ?? null,
+            last_activity_at: this.now(),
+        };
+
+        if (options.status) {
+            dbUpdate.status = options.status;
+        }
+        if (options.currentUrl !== undefined) {
+            dbUpdate.current_url = options.currentUrl;
+        }
+        if (options.closedAt !== undefined) {
+            dbUpdate.closed_at = options.closedAt;
+        }
+
+        updateBrowserSession(sessionId, dbUpdate);
+    }
+
+    private invalidateSession(
+        sessionId: string,
+        lifecycleState: BrowserLifecycleState,
+        detail: string,
+        error?: string | null,
+    ): BrowserSessionVisibility | null {
+        const session = this.sessions.get(sessionId);
+        if (!session) return null;
+
+        if (
+            !isLiveBrowserLifecycleState(session.lifecycleState)
+            && session.lifecycleState === lifecycleState
+            && !session.browser
+            && !session.context
+            && !session.page
+        ) {
+            return this.buildVisibilityState(session);
+        }
+
+        const currentUrl = this.safePageUrl(session);
+        this.updateLifecycleState(sessionId, session, lifecycleState, {
+            detail,
+            error: error || null,
+            status: 'closed',
+            currentUrl,
+            closedAt: this.now(),
+            clearHandles: true,
+        });
+
+        logger.warn('Browser session invalidated', {
+            sessionId,
+            lifecycleState,
+            detail,
+            error: error || undefined,
+        });
+
+        return this.buildVisibilityState(session);
+    }
+
+    private lifecycleError(sessionId: string, operation: string, session?: LiveSession): Error {
+        const lifecycleState = session?.lifecycleState || 'closed';
+        const detail = session?.lifecycleDetail ? ` (${session.lifecycleDetail})` : '';
+        return new Error(`Cannot ${operation}: browser session ${sessionId} is ${lifecycleState}${detail}`);
+    }
+
+    private assertReadySession(sessionId: string, operation: string): ReadyLiveSession {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            throw new Error(`Session ${sessionId} not found or not active`);
+        }
+
+        if (!session.browser || !session.context || !session.page) {
+            throw this.lifecycleError(sessionId, operation, session);
+        }
+
+        try {
+            const browserAny = session.browser as any;
+            if (typeof browserAny.isConnected === 'function' && !browserAny.isConnected()) {
+                this.invalidateSession(sessionId, 'crashed_or_disconnected', 'Browser disconnected');
+                throw this.lifecycleError(sessionId, operation, this.sessions.get(sessionId));
+            }
+        } catch (error) {
+            if (error instanceof Error && /Cannot .*browser session/.test(error.message)) {
+                throw error;
+            }
+        }
+
+        const pageAny = session.page as any;
+        if (typeof pageAny.isClosed === 'function' && pageAny.isClosed()) {
+            this.invalidateSession(
+                sessionId,
+                session.isHeadless ? 'stale_reference' : 'manually_closed',
+                session.isHeadless ? 'Closed page handle detected during session validation' : 'Visible browser window was closed manually',
+            );
+            throw this.lifecycleError(sessionId, operation, this.sessions.get(sessionId));
+        }
+
+        try {
+            session.context.pages();
+        } catch (error: any) {
+            this.invalidateSession(
+                sessionId,
+                session.isHeadless ? 'stale_reference' : 'crashed_or_disconnected',
+                'Browser context became unavailable',
+                error?.message || null,
+            );
+            throw this.lifecycleError(sessionId, operation, this.sessions.get(sessionId));
+        }
+
+        try {
+            const currentUrl = session.page.url();
+            if (currentUrl) {
+                session.lastKnownUrl = currentUrl;
+            }
+        } catch (error: any) {
+            this.invalidateSession(
+                sessionId,
+                session.isHeadless ? 'stale_reference' : 'manually_closed',
+                session.isHeadless ? 'Stale page reference detected' : 'Visible browser window was closed manually',
+                error?.message || null,
+            );
+            throw this.lifecycleError(sessionId, operation, this.sessions.get(sessionId));
+        }
+
+        return session as ReadyLiveSession;
+    }
 
     private recordTrafficEvent(sessionId: string, event: Omit<BrowserTrafficEvent, 'id'>): void {
         const session = this.sessions.get(sessionId);
@@ -316,7 +581,7 @@ class BrowserService {
         const content = body.toString('utf8');
         await this.persistJsArtifact(session, {
             type: 'external',
-            pageUrl: session.page.url(),
+            pageUrl: this.safePageUrl(session) || 'about:blank',
             scriptUrl,
             contentType: response.headers()['content-type'] || 'application/javascript',
             content,
@@ -324,7 +589,7 @@ class BrowserService {
         });
     }
 
-    private async captureContinuitySnapshot(session: LiveSession): Promise<BrowserContinuitySnapshot> {
+    private async captureContinuitySnapshot(session: ReadyLiveSession): Promise<BrowserContinuitySnapshot> {
         const currentUrl = (() => {
             try {
                 return session.page.url() || session.targetUrl || 'about:blank';
@@ -390,26 +655,39 @@ class BrowserService {
         }
     }
 
-    private async waitForSessionReady(sessionId: string, timeoutMs: number = 15000): Promise<LiveSession> {
+    private async waitForSessionReady(sessionId: string, timeoutMs: number = 15000, operation: string = 'use the browser session'): Promise<ReadyLiveSession> {
         const started = Date.now();
         while (Date.now() - started < timeoutMs) {
             const session = this.sessions.get(sessionId);
             if (session && !session.transitioning) {
-                return session;
+                return this.assertReadySession(sessionId, operation);
             }
-            await new Promise((resolve) => setTimeout(resolve, 100));
+            await this.delay(100);
         }
 
         const session = this.sessions.get(sessionId);
         if (!session) {
             throw new Error(`Session ${sessionId} not found or not active`);
         }
-        return session;
+        return this.assertReadySession(sessionId, operation);
     }
 
-    private attachSessionListeners(sessionId: string, page: Page, context: BrowserContext): void {
+    private attachSessionListeners(sessionId: string, page: Page, context: BrowserContext, generation: number): void {
         const session = this.sessions.get(sessionId);
         const targetOrigin = session?.targetOrigin || null;
+        const browser = context.browser();
+
+        const isCurrentGeneration = (): boolean => {
+            const current = this.sessions.get(sessionId);
+            return !!current && current.generation === generation;
+        };
+
+        const invalidateIfCurrent = (lifecycleState: BrowserLifecycleState, detail: string, error?: string | null) => {
+            if (!isCurrentGeneration()) {
+                return;
+            }
+            this.invalidateSession(sessionId, lifecycleState, detail, error);
+        };
 
         context.route('**/*', async (route: any) => {
             const request = route.request();
@@ -429,6 +707,10 @@ class BrowserService {
         page.on('framenavigated', (frame: any) => {
             if (frame === page.mainFrame()) {
                 const url = page.url();
+                const liveSession = this.sessions.get(sessionId);
+                if (liveSession) {
+                    liveSession.lastKnownUrl = url;
+                }
                 updateBrowserSession(sessionId, {
                     current_url: url,
                     last_activity_at: new Date().toISOString(),
@@ -445,6 +727,10 @@ class BrowserService {
         });
 
         page.on('request', (request: any) => {
+            const liveSession = this.sessions.get(sessionId);
+            if (liveSession) {
+                this.updateLastKnownPageState(liveSession, page);
+            }
             this.recordTrafficEvent(sessionId, {
                 kind: 'request',
                 method: request.method(),
@@ -483,17 +769,37 @@ class BrowserService {
 
             const liveSession = this.sessions.get(sessionId);
             if (liveSession) {
+                this.updateLastKnownPageState(liveSession, page);
                 void this.captureScriptResponse(liveSession, response).catch((error: any) => {
                     logger.debug('Script artifact capture failed', { sessionId, error: error.message });
                 });
             }
         });
 
-        context.on('close', () => {
-            logger.info('Browser context closed', { sessionId });
-            this.sessions.delete(sessionId);
-            dbCloseSession(sessionId);
+        page.on('close', () => {
+            const liveSession = this.sessions.get(sessionId);
+            if (!liveSession || !isCurrentGeneration()) {
+                return;
+            }
+            invalidateIfCurrent(
+                liveSession.isHeadless ? 'stale_reference' : 'manually_closed',
+                liveSession.isHeadless ? 'Headless browser page closed unexpectedly' : 'Visible browser window was closed manually',
+            );
         });
+
+        page.on('crash', () => {
+            invalidateIfCurrent('crashed_or_disconnected', 'Playwright page crashed');
+        });
+
+        context.on('close', () => {
+            invalidateIfCurrent('crashed_or_disconnected', 'Browser context closed unexpectedly');
+        });
+
+        if (browser && typeof (browser as any).on === 'function') {
+            (browser as any).on('disconnected', () => {
+                invalidateIfCurrent('crashed_or_disconnected', 'Browser disconnected');
+            });
+        }
     }
 
     /**
@@ -788,6 +1094,8 @@ public class PenPardIconChanger {
             proxyPort,
         });
 
+        let context: BrowserContext | null = null;
+        let liveSession: LiveSession | null = null;
         try {
             const executablePath = await this.resolveChromiumPath();
             const isHeadless = options.headless ?? false;
@@ -805,7 +1113,7 @@ public class PenPardIconChanger {
 
             const targetOrigin = this.getTargetOrigin(options.targetUrl);
             const jsArtifactsDir = options.scanId ? this.ensureJsArtifactsDir(options.scanId, sessionId) : null;
-            const context = await chromium.launchPersistentContext(userDataDir, {
+            context = await chromium.launchPersistentContext(userDataDir, {
                 headless: isHeadless,
                 executablePath,
                 args: launchArgs,
@@ -827,7 +1135,7 @@ public class PenPardIconChanger {
             const page = pages.length > 0 ? pages[0] : await context.newPage();
 
             // Store live session (Playwright's persistent context exposes its underlying browser instance natively)
-            const liveSession: LiveSession = {
+            liveSession = {
                 browser: context.browser() || (context as any), // Fallback map
                 context,
                 page,
@@ -842,16 +1150,24 @@ public class PenPardIconChanger {
                 executablePath: executablePath || '',
                 brandingExtPath,
                 transitioning: false,
+                lifecycleState: deriveActiveBrowserLifecycleState(isHeadless, !isHeadless),
+                lifecycleDetail: null,
+                lastError: null,
+                lastKnownUrl: null,
+                lastKnownTitle: null,
+                hasBeenVisible: !isHeadless,
+                generation: 1,
                 networkEvents: [],
                 nextTrafficEventId: 1,
                 jsArtifacts: new Map(),
                 jsArtifactsDir,
             };
+            this.updateLastKnownPageState(liveSession, page);
             this.sessions.set(sessionId, liveSession);
 
             // ── Event Listeners ──
 
-            this.attachSessionListeners(sessionId, page, context);
+            this.attachSessionListeners(sessionId, page, context, liveSession.generation);
 
             // Navigate to target URL if provided
             if (options.targetUrl) {
@@ -866,9 +1182,13 @@ public class PenPardIconChanger {
             }
 
             // Update status to active
-            const currentUrl = page.url();
+            const currentUrl = this.safePageUrl(liveSession) || 'about:blank';
             updateBrowserSession(sessionId, {
                 status: 'active',
+                lifecycle_state: liveSession.lifecycleState,
+                lifecycle_detail: null,
+                last_error: null,
+                closed_at: null,
                 current_url: currentUrl,
                 mode: 'human',
             });
@@ -892,9 +1212,24 @@ public class PenPardIconChanger {
             logger.error('Failed to launch browser session', {
                 sessionId, error: error.message,
             });
-            updateBrowserSession(sessionId, {
-                status: 'closed',
-                closed_at: new Date().toISOString(),
+            if (context) {
+                try {
+                    await context.close();
+                } catch {
+                    /* ignore */
+                }
+            }
+            if (liveSession) {
+                this.sessions.delete(sessionId);
+                liveSession.browser = null;
+                liveSession.context = null;
+                liveSession.page = null;
+            }
+            dbCloseSession(sessionId, {
+                lifecycle_state: 'closed',
+                lifecycle_detail: 'Browser launch failed',
+                last_error: error.message,
+                current_url: options.targetUrl || null,
             });
             throw error;
         }
@@ -904,11 +1239,7 @@ public class PenPardIconChanger {
      * Execute an AI-driven action on a browser session.
      */
     async executeAction(sessionId: string, action: BrowserAction): Promise<any> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) {
-            throw new Error(`Session ${sessionId} not found or not active`);
-        }
-
+        const session = await this.waitForSessionReady(sessionId, 15000, `execute browser action "${action.type}"`);
         const { page } = session;
         let result: any = null;
 
@@ -1013,31 +1344,42 @@ public class PenPardIconChanger {
                     throw new Error(`Unknown action type: ${(action as any).type}`);
             }
 
+            this.updateLastKnownPageState(session, page);
+
             // Log the action
             addBrowserAction({
                 sessionId,
                 actionType: action.type,
                 actionData: JSON.stringify(action),
-                pageUrl: page.url(),
+                pageUrl: this.safePageUrl(session) || undefined,
                 pageTitle: await page.title().catch(() => ''),
                 source: 'ai',
             });
 
             // Update session state
             updateBrowserSession(sessionId, {
-                current_url: page.url(),
-                last_activity_at: new Date().toISOString(),
+                current_url: this.safePageUrl(session),
+                last_activity_at: this.now(),
             });
 
             return result;
 
         } catch (error: any) {
+            const maybeLifecycleError = /Target page, context or browser has been closed|Target closed|Browser has been closed|closed|crash/i.test(error.message || '');
+            if (maybeLifecycleError) {
+                this.invalidateSession(
+                    sessionId,
+                    session.isHeadless ? 'stale_reference' : 'manually_closed',
+                    session.isHeadless ? 'Browser action hit a dead browser handle' : 'Visible browser window disappeared during browser action',
+                    error.message,
+                );
+            }
             // Log failed action
             addBrowserAction({
                 sessionId,
                 actionType: action.type,
                 actionData: JSON.stringify({ ...action, error: error.message }),
-                pageUrl: page.url(),
+                pageUrl: this.safePageUrl(session) || undefined,
                 pageTitle: '',
                 source: 'ai',
             });
@@ -1049,11 +1391,7 @@ public class PenPardIconChanger {
      * Get current page state for AI inspection.
      */
     async getPageState(sessionId: string): Promise<PageState> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) {
-            throw new Error(`Session ${sessionId} not found or not active`);
-        }
-
+        const session = await this.waitForSessionReady(sessionId, 15000, 'inspect the current page');
         const { page } = session;
 
         // Use string evaluate to avoid TS dom lib requirement (runs in browser context)
@@ -1077,7 +1415,7 @@ public class PenPardIconChanger {
         })()`) as { forms: any[]; links: any[]; textSummary: string };
 
         return {
-            url: page.url(),
+            url: this.safePageUrl(session) || 'about:blank',
             title: await page.title(),
             ...state,
         };
@@ -1087,18 +1425,16 @@ public class PenPardIconChanger {
      * Capture a screenshot of the current page.
      */
     async captureScreenshot(sessionId: string): Promise<{ base64: string; mimeType: string }> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) {
-            throw new Error(`Session ${sessionId} not found or not active`);
-        }
+        const session = await this.waitForSessionReady(sessionId, 15000, 'capture a screenshot');
 
         const buffer = await session.page.screenshot({ type: 'png', fullPage: false });
+        this.updateLastKnownPageState(session);
 
         addBrowserAction({
             sessionId,
             actionType: 'screenshot',
             actionData: JSON.stringify({ timestamp: new Date().toISOString() }),
-            pageUrl: session.page.url(),
+            pageUrl: this.safePageUrl(session) || undefined,
             pageTitle: await session.page.title().catch(() => ''),
             source: 'ai',
         });
@@ -1115,13 +1451,14 @@ public class PenPardIconChanger {
 
         const liveSession = this.sessions.get(sessionId);
         if (liveSession) {
-            try {
-                dbSession.current_url = liveSession.page.url();
-                dbSession.title = await liveSession.page.title().catch(() => '');
-                dbSession.isLive = true;
-            } catch {
-                dbSession.isLive = false;
-            }
+            const visibility = this.buildVisibilityState(liveSession);
+            dbSession.current_url = visibility.lastKnownUrl || dbSession.current_url;
+            dbSession.title = await this.safePageTitle(liveSession);
+            dbSession.isLive = visibility.isLive;
+            dbSession.lifecycle_state = liveSession.lifecycleState;
+            dbSession.lifecycle_detail = liveSession.lifecycleDetail;
+            dbSession.last_error = liveSession.lastError;
+            dbSession.runtime = visibility;
         } else {
             dbSession.isLive = false;
         }
@@ -1135,16 +1472,67 @@ public class PenPardIconChanger {
     async closeSession(sessionId: string): Promise<void> {
         const session = this.sessions.get(sessionId);
 
-        if (session) {
+        if (!session) {
+            dbCloseSession(sessionId, {
+                lifecycle_state: 'closed',
+                lifecycle_detail: 'Close requested after runtime already ended',
+                last_error: null,
+            });
+            logger.info('Browser session closed', { sessionId, alreadyInactive: true });
+            return;
+        }
+
+        if (session.lifecycleState === 'closed' && !session.browser && !session.context && !session.page) {
+            dbCloseSession(sessionId, {
+                lifecycle_state: 'closed',
+                lifecycle_detail: session.lifecycleDetail || 'Session was already closed',
+                last_error: session.lastError,
+                current_url: this.safePageUrl(session),
+            });
+            return;
+        }
+
+        session.transitioning = true;
+        session.generation += 1;
+        this.updateLifecycleState(sessionId, session, 'closing', {
+            detail: 'Session cleanup requested',
+            status: 'closed',
+            currentUrl: this.safePageUrl(session),
+            preserveTransitioning: true,
+        });
+
+        const browser = session.browser;
+        const context = session.context;
+        session.browser = null;
+        session.context = null;
+        session.page = null;
+
+        if (browser) {
             try {
-                await session.browser.close();
+                await browser.close();
             } catch (e: any) {
                 logger.warn('Error closing browser', { sessionId, error: e.message });
             }
-            this.sessions.delete(sessionId);
+        } else if (context) {
+            try {
+                await context.close();
+            } catch (e: any) {
+                logger.warn('Error closing browser context', { sessionId, error: e.message });
+            }
         }
 
-        dbCloseSession(sessionId);
+        this.updateLifecycleState(sessionId, session, 'closed', {
+            detail: 'Session cleanup completed',
+            status: 'closed',
+            currentUrl: this.safePageUrl(session),
+            closedAt: this.now(),
+        });
+        dbCloseSession(sessionId, {
+            lifecycle_state: 'closed',
+            lifecycle_detail: 'Session cleanup completed',
+            last_error: session.lastError,
+            current_url: this.safePageUrl(session),
+        });
         logger.info('Browser session closed', { sessionId });
     }
 
@@ -1160,7 +1548,13 @@ public class PenPardIconChanger {
      * Get count of active sessions.
      */
     getActiveSessionCount(): number {
-        return this.sessions.size;
+        let count = 0;
+        for (const session of this.sessions.values()) {
+            if (this.buildVisibilityState(session).isLive) {
+                count += 1;
+            }
+        }
+        return count;
     }
 
     /**
@@ -1168,13 +1562,9 @@ public class PenPardIconChanger {
      */
     async cleanup(): Promise<void> {
         logger.info('Cleaning up all browser sessions', { count: this.sessions.size });
-        for (const [sessionId, session] of this.sessions) {
-            try {
-                await session.browser.close();
-            } catch { /* ignore */ }
-            dbCloseSession(sessionId);
+        for (const [sessionId] of this.sessions) {
+            await this.closeSession(sessionId);
         }
-        this.sessions.clear();
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1185,8 +1575,7 @@ public class PenPardIconChanger {
      * Deep page state: DOM summary, scripts, meta, cookies, storage.
      */
     async getFullPageState(sessionId: string): Promise<any> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const session = await this.waitForSessionReady(sessionId, 15000, 'inspect loaded scripts');
         const { page, context } = session;
 
         const state = await page.evaluate(`(async () => {
@@ -1367,7 +1756,7 @@ public class PenPardIconChanger {
         try { contextCookies = await context.cookies(); } catch { /* ignore */ }
 
         return {
-            url: page.url(),
+            url: this.safePageUrl(session) || 'about:blank',
             title: await page.title(),
             ...(state as any),
             contextCookies,
@@ -1378,8 +1767,7 @@ public class PenPardIconChanger {
      * Loaded scripts analysis — all script tags with URLs and inline content.
      */
     async getLoadedScripts(sessionId: string): Promise<any> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const session = await this.waitForSessionReady(sessionId, 15000, 'capture JavaScript artifacts');
 
         return await session.page.evaluate(`(() => {
             const MAX_INLINE_LENGTH = 25000;
@@ -1405,11 +1793,10 @@ public class PenPardIconChanger {
     }
 
     async captureJavaScriptArtifacts(sessionId: string): Promise<CapturedJsArtifact[]> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const session = await this.waitForSessionReady(sessionId, 15000, 'capture JavaScript artifacts');
 
         const loadedScripts = await this.getLoadedScripts(sessionId);
-        const pageUrl = session.page.url();
+        const pageUrl = this.safePageUrl(session) || 'about:blank';
 
         for (const script of Array.isArray(loadedScripts?.scripts) ? loadedScripts.scripts : []) {
             if (script?.isInline && typeof script.content === 'string' && script.content.trim()) {
@@ -1437,8 +1824,7 @@ public class PenPardIconChanger {
      * Finds API endpoints, GraphQL, WebSockets, tokens, CSRF, routing patterns.
      */
     async getFrontendAnalysis(sessionId: string): Promise<any> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const session = await this.waitForSessionReady(sessionId, 15000, 'analyze the frontend');
         await this.captureJavaScriptArtifacts(sessionId).catch(() => {});
 
         return await session.page.evaluate(`(() => {
@@ -1565,8 +1951,7 @@ public class PenPardIconChanger {
      * Dump session storage: cookies, localStorage, sessionStorage.
      */
     async getSessionStorageData(sessionId: string): Promise<any> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const session = await this.waitForSessionReady(sessionId, 15000, 'read browser storage');
 
         const browserStorage = await session.page.evaluate(`(() => {
             let localStorageData = {};
@@ -1589,7 +1974,7 @@ public class PenPardIconChanger {
         let contextCookies: any[] = [];
         try { contextCookies = await session.context.cookies(); } catch { /* ignore */ }
 
-        return { url: session.page.url(), ...(browserStorage as any), contextCookies };
+        return { url: this.safePageUrl(session) || 'about:blank', ...(browserStorage as any), contextCookies };
     }
 
     /**
@@ -1606,8 +1991,7 @@ public class PenPardIconChanger {
         secure: boolean;
         sameSite: 'Strict' | 'Lax' | 'None';
     }>): Promise<number> {
-        const session = this.sessions.get(sessionId);
-        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const session = this.assertReadySession(sessionId, 'sync cookies into the browser session');
         if (!cookies.length) return 0;
 
         await session.context.addCookies(cookies as any);
@@ -1619,7 +2003,7 @@ public class PenPardIconChanger {
             sessionId,
             actionType: 'sync_cookies',
             actionData: JSON.stringify({ count: cookies.length }),
-            pageUrl: session.page.url(),
+            pageUrl: this.safePageUrl(session) || undefined,
             pageTitle: await session.page.title().catch(() => ''),
             source: 'system',
         });
@@ -1638,11 +2022,10 @@ public class PenPardIconChanger {
      * Merges what the browser sees with what Burp intercepted.
      */
     async correlateBrowserWithBurp(sessionId: string): Promise<any> {
-        const session = await this.waitForSessionReady(sessionId);
-        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        const session = await this.waitForSessionReady(sessionId, 15000, 'correlate browser traffic with Burp');
 
         // Get browser state
-        const currentUrl = session.page.url();
+        const currentUrl = this.safePageUrl(session) || 'about:blank';
         let host = '';
         try { host = new URL(currentUrl).hostname; } catch { /* ignore */ }
 
@@ -1719,10 +2102,8 @@ public class PenPardIconChanger {
      * Compare two browser sessions — for IDOR, BAC, multi-user testing.
      */
     async compareSessionStates(sessionIdA: string, sessionIdB: string): Promise<any> {
-        const sessionA = await this.waitForSessionReady(sessionIdA);
-        const sessionB = await this.waitForSessionReady(sessionIdB);
-        if (!sessionA) throw new Error(`Session A (${sessionIdA}) not found or not active`);
-        if (!sessionB) throw new Error(`Session B (${sessionIdB}) not found or not active`);
+        await this.waitForSessionReady(sessionIdA, 15000, 'compare browser sessions');
+        await this.waitForSessionReady(sessionIdB, 15000, 'compare browser sessions');
 
         const [stateA, stateB] = await Promise.all([
             this.getSessionStorageData(sessionIdA),
@@ -1780,13 +2161,9 @@ public class PenPardIconChanger {
         const session = this.sessions.get(sessionId);
         if (!session) return false;
         try {
-            // Playwright BrowserContext does not expose a direct "connected" check.
-            // Accessing pages() on a closed context throws.
-            session.context.pages();
+            this.assertReadySession(sessionId, 'check whether the browser session is alive');
             return true;
         } catch {
-            // Context is dead — clean up stale reference
-            this.sessions.delete(sessionId);
             return false;
         }
     }
@@ -1794,51 +2171,180 @@ public class PenPardIconChanger {
     /**
      * Get the current headless state of a session.
      */
-    getSessionVisibility(sessionId: string): { isHeadless: boolean; transitioning: boolean } | null {
+    getSessionVisibility(sessionId: string): BrowserSessionVisibility | null {
         const session = this.sessions.get(sessionId);
         if (!session) return null;
-        return { isHeadless: session.isHeadless, transitioning: session.transitioning };
+        this.isSessionAlive(sessionId);
+        return this.buildVisibilityState(session);
     }
 
     /**
      * Show a headless browser session — relaunch visible using the same userDataDir.
      * Cookies, localStorage, and sessionStorage are preserved via the persistent profile.
      */
-    async showBrowser(sessionId: string): Promise<void> {
-        await this.toggleVisibility(sessionId, false);
+    async showBrowser(sessionId: string): Promise<BrowserVisibilityResult> {
+        return await this.toggleVisibility(sessionId, false);
     }
 
     /**
      * Hide a visible browser session — relaunch headless using the same userDataDir.
      */
-    async hideBrowser(sessionId: string): Promise<void> {
-        await this.toggleVisibility(sessionId, true);
+    async hideBrowser(sessionId: string): Promise<BrowserVisibilityResult> {
+        return await this.toggleVisibility(sessionId, true);
+    }
+
+    private async relaunchUnavailableSession(session: LiveSession, targetHeadless: boolean): Promise<BrowserVisibilityResult> {
+        const label = targetHeadless ? 'headless' : 'visible';
+        const priorState = session.lifecycleState;
+        const priorDetail = session.lifecycleDetail;
+        let newContext: BrowserContext | null = null;
+
+        session.transitioning = true;
+        updateBrowserSession(session.sessionId, {
+            last_activity_at: this.now(),
+            last_error: null,
+        });
+
+        try {
+            const launchArgs = this.buildLaunchArgs(session.proxyServer, session.brandingExtPath, targetHeadless);
+            if (!fs.existsSync(session.userDataDir)) {
+                fs.mkdirSync(session.userDataDir, { recursive: true });
+            }
+
+            newContext = await chromium.launchPersistentContext(session.userDataDir, {
+                headless: targetHeadless,
+                executablePath: session.executablePath || undefined,
+                args: launchArgs,
+                ignoreHTTPSErrors: true,
+                proxy: { server: session.proxyServer },
+                viewport: targetHeadless ? { width: 1280, height: 720 } : null,
+            });
+
+            const pages = newContext.pages();
+            const newPage = pages.length > 0 ? pages[0] : await newContext.newPage();
+            const restoreUrl = (() => {
+                const preferred = session.lastKnownUrl || session.targetUrl || 'about:blank';
+                if (preferred === 'about:blank') return preferred;
+                return this.isPenPardInternalUrl(preferred, session.targetOrigin)
+                    ? (session.targetUrl || 'about:blank')
+                    : preferred;
+            })();
+
+            if (restoreUrl && restoreUrl !== 'about:blank') {
+                try {
+                    await newPage.goto(restoreUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                } catch (navErr: any) {
+                    logger.warn('Could not restore URL while relaunching unavailable browser session (non-fatal)', {
+                        sessionId: session.sessionId,
+                        restoreUrl,
+                        error: navErr.message,
+                    });
+                }
+            }
+
+            session.browser = newContext.browser() || (newContext as any);
+            session.context = newContext;
+            session.page = newPage;
+            session.isHeadless = targetHeadless;
+            session.transitioning = false;
+            session.generation += 1;
+            session.lastError = null;
+            this.updateLastKnownPageState(session, newPage);
+            this.attachSessionListeners(session.sessionId, newPage, newContext, session.generation);
+            this.updateLifecycleState(
+                session.sessionId,
+                session,
+                deriveActiveBrowserLifecycleState(targetHeadless, session.hasBeenVisible || !targetHeadless),
+                {
+                    status: 'active',
+                    currentUrl: this.safePageUrl(session),
+                    closedAt: null,
+                },
+            );
+
+            if (!targetHeadless) {
+                const browserIcoPath = this.resolveBrowserIconPath();
+                if (browserIcoPath) {
+                    this.applyWindowsIconOverride(browserIcoPath);
+                }
+            }
+
+            return {
+                ...this.buildVisibilityState(session),
+                message: targetHeadless ? 'Browser relaunched in headless mode' : 'Browser window reopened',
+                reopened: true,
+            };
+        } catch (error: any) {
+            if (newContext) {
+                try {
+                    await newContext.close();
+                } catch {
+                    /* ignore */
+                }
+            }
+            session.transitioning = false;
+            session.lifecycleState = priorState;
+            session.lifecycleDetail = priorDetail;
+            session.lastError = error.message;
+            updateBrowserSession(session.sessionId, {
+                lifecycle_state: priorState,
+                lifecycle_detail: priorDetail,
+                last_error: error.message,
+                last_activity_at: this.now(),
+            });
+            logger.error(`Failed to relaunch ${label} browser session`, { sessionId: session.sessionId, error: error.message });
+            throw new Error(`Visibility toggle failed: ${error.message}`);
+        }
     }
 
     /**
      * Core relaunch logic for visibility transitions.
      * Closes the current context and relaunches with the desired headless state.
      */
-    private async toggleVisibility(sessionId: string, targetHeadless: boolean): Promise<void> {
+    private async toggleVisibility(sessionId: string, targetHeadless: boolean): Promise<BrowserVisibilityResult> {
         const session = this.sessions.get(sessionId);
         if (!session) throw new Error(`Session ${sessionId} not found or not active`);
         if (session.transitioning) throw new Error(`Session ${sessionId} is already transitioning`);
+        if (!this.isSessionAlive(sessionId)) {
+            if (targetHeadless) {
+                return {
+                    ...this.buildVisibilityState(session),
+                    message: 'Browser is already unavailable; hide is a safe no-op',
+                    reopened: false,
+                };
+            }
+            return await this.relaunchUnavailableSession(session, targetHeadless);
+        }
         if (session.isHeadless === targetHeadless) {
             logger.info('Session already in desired visibility state', { sessionId, headless: targetHeadless });
-            return; // Already in the desired state
+            return {
+                ...this.buildVisibilityState(session),
+                message: targetHeadless ? 'Browser is already hidden' : 'Browser is already visible',
+                reopened: false,
+            };
         }
 
         session.transitioning = true;
         const label = targetHeadless ? 'headless' : 'visible';
         logger.info(`Switching browser session to ${label}`, { sessionId });
+        const previousLifecycleState = session.lifecycleState;
+        const previousLifecycleDetail = session.lifecycleDetail;
+        let newContext: BrowserContext | null = null;
 
         try {
-            const previousContext = session.context;
-            const previousBrowser = session.browser;
-            const continuitySnapshot = await this.captureContinuitySnapshot(session);
+            const readySession = this.assertReadySession(sessionId, `switch browser visibility to ${label}`);
+            const previousContext = readySession.context;
+            const previousBrowser = readySession.browser;
+            const continuitySnapshot = await this.captureContinuitySnapshot(readySession);
             const replacementUserDataDir = this.ensureVisibilityTransitionDir(session, targetHeadless);
             const launchArgs = this.buildLaunchArgs(session.proxyServer, session.brandingExtPath, targetHeadless);
-            const newContext = await chromium.launchPersistentContext(replacementUserDataDir, {
+            this.updateLifecycleState(sessionId, session, 'closing', {
+                detail: `Switching browser to ${label}`,
+                status: 'active',
+                currentUrl: this.safePageUrl(session),
+                preserveTransitioning: true,
+            });
+            newContext = await chromium.launchPersistentContext(replacementUserDataDir, {
                 headless: targetHeadless,
                 executablePath: session.executablePath,
                 args: launchArgs,
@@ -1868,25 +2374,26 @@ public class PenPardIconChanger {
                 }
             }
 
-            this.attachSessionListeners(sessionId, newPage, newContext);
-
             session.browser = newContext.browser() || (newContext as any);
             session.context = newContext;
             session.page = newPage;
             session.isHeadless = targetHeadless;
             session.userDataDir = replacementUserDataDir;
+            session.generation += 1;
             session.transitioning = false;
-
-            updateBrowserSession(sessionId, {
-                current_url: (() => {
-                    try {
-                        return newPage.url();
-                    } catch {
-                        return restoreUrl;
-                    }
-                })(),
-                last_activity_at: new Date().toISOString(),
-            });
+            session.lastError = null;
+            this.updateLastKnownPageState(session, newPage);
+            this.attachSessionListeners(sessionId, newPage, newContext, session.generation);
+            this.updateLifecycleState(
+                sessionId,
+                session,
+                deriveActiveBrowserLifecycleState(targetHeadless, session.hasBeenVisible || !targetHeadless),
+                {
+                    status: 'active',
+                    currentUrl: this.safePageUrl(session) || restoreUrl,
+                    closedAt: null,
+                },
+            );
 
             if (!targetHeadless) {
                 const browserIcoPath = this.resolveBrowserIconPath();
@@ -1915,8 +2422,29 @@ public class PenPardIconChanger {
             }
 
             logger.info(`Browser session switched to ${label}`, { sessionId, restoredUrl: restoreUrl });
+            return {
+                ...this.buildVisibilityState(session),
+                message: targetHeadless ? 'Browser hidden and continued headless' : 'Browser window opened',
+                reopened: false,
+            };
         } catch (error: any) {
+            if (newContext) {
+                try {
+                    await newContext.close();
+                } catch {
+                    /* ignore */
+                }
+            }
             session.transitioning = false;
+            session.lifecycleState = previousLifecycleState;
+            session.lifecycleDetail = previousLifecycleDetail;
+            session.lastError = error.message;
+            updateBrowserSession(sessionId, {
+                lifecycle_state: previousLifecycleState,
+                lifecycle_detail: previousLifecycleDetail,
+                last_error: error.message,
+                last_activity_at: this.now(),
+            });
             logger.error(`Failed to switch browser visibility to ${label}`, { sessionId, error: error.message });
             throw new Error(`Visibility toggle failed: ${error.message}`);
         }

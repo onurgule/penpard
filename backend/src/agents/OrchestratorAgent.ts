@@ -78,8 +78,15 @@ interface AttackPlan {
     steps: PlanStep[];
 }
 
+interface AgentReflection {
+    evaluationPreviousGoal?: string;
+    memory?: string;
+    nextGoal?: string;
+}
+
 interface LLMResponse {
     thought: string;
+    reflection?: AgentReflection;
     action?: ToolCall;
     actions?: ToolCall[];
     answer?: string;
@@ -401,7 +408,16 @@ The name MUST follow the pattern: "Vulnerability Type - /endpoint/path (paramete
 NEVER leave the "name" field empty or generic. Always include the specific vulnerability type AND the affected endpoint.
 If you need multiple requests for this step, you'll get to continue.
 
-Respond in JSON format with your action.`;
+Respond in JSON format.
+Before every action or final answer, include:
+- "evaluation_previous_goal": how the previous action or result changed the investigation
+- "memory": the most important fact to preserve for the next iteration
+- "next_goal": the exact next thing you are trying to prove
+
+Then include either:
+- "action": a single tool call
+- "answer": if the step is complete
+- optional "finding" or "findings" when you have concrete evidence.`;
 
 const REPLAN_PROMPT = `The previous plan round is complete. Review the results and create the next plan.
 {OPERATOR_INSTRUCTIONS_REMINDER}
@@ -447,6 +463,7 @@ export class OrchestratorAgent {
     private findings: any[] = [];
     private conversationHistory: { role: string; content: string }[] = [];
     private maxIterations: number;
+    private readonly emittedBudgetSignals: Set<number> = new Set();
 
     // Planning state
     private currentPlan: AttackPlan | null = null;
@@ -634,6 +651,7 @@ ${vulns}
     public async start() {
         if (this.isRunning) return;
         this.isRunning = true;
+        this.emittedBudgetSignals.clear();
         this.log('system', `Orchestrator Agent started for target: ${this.targetUrl}`);
 
         try {
@@ -681,6 +699,7 @@ ${vulns}
 
         this.isRunning = true;
         this.phase = 'planning';
+        this.emittedBudgetSignals.clear();
         const extraRounds = Math.min(Math.max(opts.iterations, 1), 20); // clamp 1-20
 
         this.log('system', `═══ CONTINUING SCAN ═══`);
@@ -876,16 +895,18 @@ Proceed with testing.`
 
                 const response = await llmQueue.enqueue({
                     systemPrompt: this.systemPromptContent,
-                    userPrompt: `${contextBlock}Execute the operator's instruction. You are in round ${round + 1} of ${maxRounds}. Use tools to test and report findings.\n\nRespond with ONLY a valid JSON object containing "action" or "finding" or "answer".`,
+                    userPrompt: `${contextBlock}Execute the operator's instruction. You are in round ${round + 1} of ${maxRounds}. Use tools to test and report findings.\n\nBefore every action or final answer, include "evaluation_previous_goal", "memory", and "next_goal". Respond with ONLY a valid JSON object containing those reflection fields plus either "action", "finding", or "answer".`,
                 });
 
                 this.conversationHistory.push({ role: 'assistant', content: response.text });
 
-                const parsed = this.extractJsonObject(response.text);
+                const parsed = this.parseAgentResponse(response.text);
                 if (!parsed) {
                     this.log('agent', `Response: ${response.text.slice(0, 200)}`);
                     continue;
                 }
+
+                this.logReflection(parsed.reflection);
 
                 // Process findings
                 if (parsed.finding) {
@@ -1538,7 +1559,7 @@ Rules for subsequent work:
                     await this.delay(2000); // Rate limiting between LLM calls
 
                     try {
-                        const response = await this.askLLMForStepExecution(step, stepToolResults);
+                        const response = await this.askLLMForStepExecution(step, stepToolResults, totalActions);
                         totalActions++;
                         stepActions++;
 
@@ -1551,6 +1572,7 @@ Rules for subsequent work:
                         if (response.thought) {
                             this.log('agent', `Thought: ${response.thought.substring(0, 200)}...`);
                         }
+                        this.logReflection(response.reflection);
 
                         // Process findings
                         if (response.finding) {
@@ -1884,7 +1906,7 @@ Rules for subsequent work:
         };
     }
 
-    private async askLLMForStepExecution(step: PlanStep, previousResults: string[]): Promise<LLMResponse | null> {
+    private async askLLMForStepExecution(step: PlanStep, previousResults: string[], totalActions: number): Promise<LLMResponse | null> {
         try {
             if (this.rateLimitPauseUntil && new Date() < this.rateLimitPauseUntil) {
                 await this.delay(30000);
@@ -1895,13 +1917,15 @@ Rules for subsequent work:
                 ? `\n\nPREVIOUS RESULTS FOR THIS STEP:\n${previousResults.slice(-3).join('\n')}\n\nContinue testing or move to next action for this step.`
                 : '';
 
+            const budgetPressureReminder = this.getBudgetPressureReminder(totalActions);
             const stepPrompt = EXECUTE_STEP_PROMPT
                 .replace('{STEP_NUM}', String(step.step))
                 .replace('{OBJECTIVE}', step.objective)
                 .replace('{APPROACH}', step.approach)
                 .replace('{TOOLS}', step.tools.join(', '))
                 .replace('{OPERATOR_INSTRUCTIONS_REMINDER}', this.getOperatorInstructionsReminder())
-                + contextFromPrevious;
+                + contextFromPrevious
+                + budgetPressureReminder;
 
             this.conversationHistory.push({ role: 'user', content: stepPrompt });
 
@@ -1976,6 +2000,46 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
     //  TOOL EXECUTION
     // ═══════════════════════════════════════════════════════════
+
+    private getBudgetPressureReminder(totalActions: number): string {
+        const remaining = Math.max(0, this.maxIterations - totalActions);
+        if (remaining <= 2) {
+            if (!this.emittedBudgetSignals.has(2)) {
+                this.emittedBudgetSignals.add(2);
+                this.log('system', `Action budget critical: only ${remaining} iteration(s) remain. Prioritize decisive validation and conclude cleanly.`);
+            }
+            return `\n\n[ACTION BUDGET WARNING]\nOnly ${remaining} iteration(s) remain before the scan must stop. Do not broaden scope. Prioritize the single highest-value validation or finish with a clear answer if the current step is already proven.\n`;
+        }
+
+        if (remaining <= 5) {
+            if (!this.emittedBudgetSignals.has(5)) {
+                this.emittedBudgetSignals.add(5);
+                this.log('system', `Action budget tightening: ${remaining} iteration(s) remain. Focus on the highest-confidence validations.`);
+            }
+            return `\n\n[ACTION BUDGET WARNING]\nOnly ${remaining} iteration(s) remain in the global action budget. Narrow to the highest-confidence proof path, reuse existing evidence, and avoid speculative expansion.\n`;
+        }
+
+        return '';
+    }
+
+    private logReflection(reflection?: AgentReflection) {
+        if (!reflection) return;
+
+        const parts: string[] = [];
+        if (reflection.evaluationPreviousGoal) {
+            parts.push(`prev=${reflection.evaluationPreviousGoal.substring(0, 120)}`);
+        }
+        if (reflection.memory) {
+            parts.push(`memory=${reflection.memory.substring(0, 120)}`);
+        }
+        if (reflection.nextGoal) {
+            parts.push(`next=${reflection.nextGoal.substring(0, 120)}`);
+        }
+
+        if (parts.length > 0) {
+            this.log('agent', `Reflection: ${parts.join(' | ')}`);
+        }
+    }
 
     private async executeToolCall(toolCall: ToolCall): Promise<any> {
         this.log('tool', `Executing: ${toolCall.tool}`);
@@ -2586,112 +2650,558 @@ Rules for subsequent work:
     }
 
     private extractJsonObject(text: string): any | null {
-        // Step 1: Strip markdown code fences (```json ... ``` or ``` ... ```)
-        let cleaned = text;
-        const codeBlockMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-        if (codeBlockMatch) {
-            cleaned = codeBlockMatch[1].trim();
+        const cleaned = this.stripMarkdownCodeFences(text).trim();
+        if (!cleaned) return null;
+
+        const direct = this.parseJsonCandidate(cleaned);
+        if (direct !== null) {
+            return direct;
         }
 
-        // Step 2: Try direct JSON.parse first (works when LLM returns clean JSON)
-        try {
-            const trimmed = cleaned.trim();
-            if (trimmed.startsWith('{')) {
-                return JSON.parse(trimmed);
-            }
-        } catch { /* fall through to bracket-matching */ }
+        for (let start = 0; start < cleaned.length; start++) {
+            const opener = cleaned[start];
+            if (opener !== '{' && opener !== '[') continue;
 
-        // Step 3: Bracket-matching extraction (handles text before/after JSON)
-        const startIdx = cleaned.indexOf('{');
-        if (startIdx === -1) return null;
+            const stack: string[] = [];
+            let inString = false;
+            let escaped = false;
 
-        let depth = 0;
-        let inString = false;
-        let escaped = false;
+            for (let end = start; end < cleaned.length; end++) {
+                const char = cleaned[end];
 
-        for (let i = startIdx; i < cleaned.length; i++) {
-            const char = cleaned[i];
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (char === '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (char === '"' && !escaped) {
+                    inString = !inString;
+                    continue;
+                }
+                if (inString) continue;
 
-            if (escaped) { escaped = false; continue; }
-            if (char === '\\') { escaped = true; continue; }
-            if (char === '"' && !escaped) { inString = !inString; continue; }
-            if (inString) continue;
+                if (char === '{' || char === '[') {
+                    stack.push(char);
+                    continue;
+                }
 
-            if (char === '{') depth++;
-            if (char === '}') {
-                depth--;
-                if (depth === 0) {
-                    const jsonStr = cleaned.substring(startIdx, i + 1);
-                    try {
-                        return JSON.parse(jsonStr);
-                    } catch {
-                        // Try next JSON object in the text
-                        const remaining = cleaned.substring(i + 1);
-                        return this.extractJsonObject(remaining);
+                if (char === '}' || char === ']') {
+                    const expected = char === '}' ? '{' : '[';
+                    if (stack[stack.length - 1] !== expected) {
+                        break;
+                    }
+                    stack.pop();
+                    if (stack.length === 0) {
+                        const candidate = this.parseJsonCandidate(cleaned.substring(start, end + 1));
+                        if (candidate !== null) {
+                            return candidate;
+                        }
+                        break;
                     }
                 }
             }
         }
 
-        // Step 4: Last resort — try to fix common LLM JSON issues (trailing commas, single quotes)
-        try {
-            const fixable = cleaned.substring(startIdx)
-                .replace(/,\s*}/g, '}')
-                .replace(/,\s*]/g, ']')
-                .replace(/'/g, '"');
-            const lastBrace = fixable.lastIndexOf('}');
-            if (lastBrace !== -1) {
-                return JSON.parse(fixable.substring(0, lastBrace + 1));
+        return null;
+    }
+
+    private stripMarkdownCodeFences(text: string): string {
+        const match = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/i);
+        return match ? match[1].trim() : text;
+    }
+
+    private parseJsonCandidate(candidate: string): any | null {
+        const trimmed = candidate.trim();
+        if (!trimmed) return null;
+
+        const attempts = [trimmed];
+        if (
+            (trimmed.startsWith('"') && trimmed.endsWith('"'))
+            || (trimmed.startsWith('\'') && trimmed.endsWith('\''))
+        ) {
+            attempts.push(trimmed.substring(1, trimmed.length - 1));
+        }
+
+        for (const attempt of attempts) {
+            try {
+                return this.unwrapJsonValue(JSON.parse(attempt));
+            } catch {
+                const repaired = attempt
+                    .replace(/,\s*([}\]])/g, '$1')
+                    .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
+                    .replace(/:\s*'([^']*?)'(?=\s*[,}])/g, ': "$1"');
+                if (repaired !== attempt) {
+                    try {
+                        return this.unwrapJsonValue(JSON.parse(repaired));
+                    } catch {
+                        // Ignore and keep searching.
+                    }
+                }
             }
-        } catch { /* give up */ }
+        }
 
         return null;
     }
 
-    private normalizeResponse(obj: any): LLMResponse | null {
-        if (!obj) return null;
+    private unwrapJsonValue(value: any, depth: number = 0): any {
+        if (depth > 5 || value === null || value === undefined) {
+            return value;
+        }
 
-        const result: LLMResponse = {
-            thought: obj.thought || obj.purpose || obj.reasoning || obj.analysis || ''
-        };
+        if (typeof value === 'string') {
+            const parsed = this.parseJsonCandidate(value);
+            return parsed !== null ? this.unwrapJsonValue(parsed, depth + 1) : value.trim();
+        }
 
-        if (obj.finding) result.finding = obj.finding;
-        if (obj.findings) result.findings = obj.findings;
-        if (obj.answer) result.answer = obj.answer;
+        if (Array.isArray(value)) {
+            return value.map((entry) => this.unwrapJsonValue(entry, depth + 1));
+        }
 
-        // Handle action formats
-        if (obj.action) {
-            if (typeof obj.action === 'string') {
-                const toolName = obj.action.toLowerCase();
-                const args = obj.parameters || obj.params || obj.args || {};
-                if (args.url || args.target || args.endpoint) {
-                    result.action = {
-                        tool: toolName,
-                        args: {
-                            url: args.url || args.target || args.endpoint,
-                            method: (args.method || 'GET').toUpperCase(),
-                            headers: args.headers || {},
-                            body: args.body || args.data || ''
-                        }
-                    };
-                } else if (toolName === 'get_proxy_history') {
-                    result.action = { tool: 'get_proxy_history', args: { count: args.count || 20, excludePenPard: true } };
-                } else {
-                    result.action = { tool: toolName, args };
-                }
-            } else if (typeof obj.action === 'object' && obj.action.tool) {
-                result.action = obj.action;
+        if (typeof value !== 'object') {
+            return value;
+        }
+
+        const obj = value as Record<string, any>;
+
+        if (Array.isArray(obj.choices) && obj.choices[0]?.message) {
+            return this.unwrapJsonValue(obj.choices[0].message, depth + 1);
+        }
+
+        if (obj.message) {
+            return this.unwrapJsonValue(obj.message, depth + 1);
+        }
+
+        if (Array.isArray(obj.tool_calls) && obj.tool_calls[0]?.function) {
+            return this.unwrapJsonValue(obj.tool_calls[0].function, depth + 1);
+        }
+
+        if (obj.name === 'AgentOutput' && obj.arguments !== undefined) {
+            return this.unwrapJsonValue(obj.arguments, depth + 1);
+        }
+
+        if (obj.type === 'function' && obj.function) {
+            return this.unwrapJsonValue(obj.function, depth + 1);
+        }
+
+        if (obj.function?.name && obj.function?.arguments !== undefined) {
+            const functionName = String(obj.function.name);
+            const args = this.unwrapJsonValue(obj.function.arguments, depth + 1);
+            if (this.isKnownToolName(functionName)) {
+                return { ...obj, action: { tool: functionName, args } };
+            }
+            if (functionName === 'AgentOutput') {
+                return this.unwrapJsonValue(args, depth + 1);
             }
         }
 
-        if (!result.action && obj.tool) {
-            result.action = { tool: obj.tool, args: obj.args || obj.parameters || {} };
+        if (
+            typeof obj.content === 'string'
+            && !obj.action
+            && !obj.actions
+            && !obj.tool
+            && !obj.name
+        ) {
+            const parsedContent = this.extractJsonObject(obj.content);
+            if (parsedContent !== null) {
+                return this.unwrapJsonValue(parsedContent, depth + 1);
+            }
         }
 
-        if (result.thought || result.action || result.answer || result.finding || result.findings) {
+        if (obj.name && obj.arguments !== undefined && this.isKnownToolName(String(obj.name))) {
+            return {
+                ...obj,
+                action: {
+                    tool: String(obj.name),
+                    args: this.unwrapJsonValue(obj.arguments, depth + 1),
+                },
+            };
+        }
+
+        if (obj.arguments !== undefined && !obj.action && !obj.actions) {
+            const parsedArgs = this.unwrapJsonValue(obj.arguments, depth + 1);
+            if (parsedArgs && typeof parsedArgs === 'object' && !Array.isArray(parsedArgs)) {
+                return { ...obj, ...parsedArgs };
+            }
+        }
+
+        return obj;
+    }
+
+    private normalizeResponse(obj: any): LLMResponse | null {
+        const resolved = this.unwrapJsonValue(obj);
+        if (!resolved) return null;
+
+        const result: LLMResponse = {
+            thought: '',
+        };
+
+        const addAction = (action: ToolCall | null) => {
+            if (!action) return;
+            if (!result.action) {
+                result.action = action;
+                return;
+            }
+            result.actions = result.actions || [result.action];
+            result.actions.push(action);
+            delete result.action;
+        };
+
+        if (Array.isArray(resolved)) {
+            for (const entry of resolved) {
+                addAction(this.normalizeToolCall(entry));
+            }
+            return result.action || result.actions?.length ? result : null;
+        }
+
+        if (typeof resolved !== 'object') {
+            return null;
+        }
+
+        const source = resolved as Record<string, any>;
+        const reflection = this.extractReflection(source);
+
+        result.thought = this.firstString(
+            source.thought,
+            source.thinking,
+            source.purpose,
+            source.reasoning,
+            source.analysis,
+            source.rationale,
+        ) || '';
+
+        if (reflection) {
+            result.reflection = reflection;
+        }
+
+        if (source.finding) result.finding = source.finding;
+        if (Array.isArray(source.findings)) result.findings = source.findings;
+        else if (source.findings && typeof source.findings === 'object') result.findings = [source.findings];
+
+        result.answer = this.firstString(source.answer, source.final_answer, source.summary, source.result);
+
+        if (source.action !== undefined) {
+            addAction(this.normalizeToolCall(source.action, source));
+        }
+
+        if (Array.isArray(source.actions)) {
+            for (const action of source.actions) {
+                addAction(this.normalizeToolCall(action, source));
+            }
+        }
+
+        if (!result.action && !result.actions?.length) {
+            addAction(this.normalizeToolCall(source));
+        }
+
+        if (result.actions?.length === 1) {
+            result.action = result.actions[0];
+            delete result.actions;
+        }
+
+        if (
+            result.thought
+            || result.reflection
+            || result.action
+            || result.actions?.length
+            || result.answer
+            || result.finding
+            || result.findings?.length
+        ) {
             return result;
         }
+
         return null;
+    }
+
+    private extractReflection(obj: Record<string, any>): AgentReflection | undefined {
+        const reflectionSource = (obj.reflection && typeof obj.reflection === 'object')
+            ? obj.reflection as Record<string, any>
+            : obj;
+
+        const reflection: AgentReflection = {
+            evaluationPreviousGoal: this.firstString(
+                reflectionSource.evaluation_previous_goal,
+                reflectionSource.evaluationPreviousGoal,
+                reflectionSource.evaluation,
+                reflectionSource.previous_goal,
+            ),
+            memory: this.firstString(
+                reflectionSource.memory,
+                reflectionSource.remember,
+                reflectionSource.notes,
+            ),
+            nextGoal: this.firstString(
+                reflectionSource.next_goal,
+                reflectionSource.nextGoal,
+                reflectionSource.goal,
+                reflectionSource.plan,
+            ),
+        };
+
+        return reflection.evaluationPreviousGoal || reflection.memory || reflection.nextGoal
+            ? reflection
+            : undefined;
+    }
+
+    private normalizeToolCall(rawAction: any, context?: Record<string, any>): ToolCall | null {
+        const action = this.unwrapJsonValue(rawAction);
+
+        if (typeof action === 'string') {
+            const tool = this.canonicalizeToolName(action);
+            if (!this.isKnownToolName(tool)) return null;
+            return {
+                tool,
+                args: this.coerceToolArgs(tool, context?.args ?? context?.parameters ?? context?.params ?? context?.input ?? context?.arguments ?? context ?? {}),
+            };
+        }
+
+        if (action === null || action === undefined) {
+            return null;
+        }
+
+        if (typeof action !== 'object') {
+            return null;
+        }
+
+        const actionObj = action as Record<string, any>;
+
+        const explicitToolName = this.firstString(actionObj.tool, actionObj.name);
+        if (explicitToolName) {
+            const tool = this.canonicalizeToolName(explicitToolName);
+            if (!this.isKnownToolName(tool)) return null;
+            return {
+                tool,
+                args: this.coerceToolArgs(
+                    tool,
+                    actionObj.args ?? actionObj.arguments ?? actionObj.parameters ?? actionObj.params ?? actionObj.input ?? actionObj.tool_input ?? actionObj,
+                    context,
+                ),
+            };
+        }
+
+        const entries = Object.entries(actionObj);
+        if (entries.length === 1) {
+            const [toolName, toolArgs] = entries[0];
+            const tool = this.canonicalizeToolName(toolName);
+            if (this.isKnownToolName(tool)) {
+                return {
+                    tool,
+                    args: this.coerceToolArgs(tool, toolArgs, context),
+                };
+            }
+        }
+
+        if (actionObj.url || actionObj.target || actionObj.endpoint || actionObj.href) {
+            return {
+                tool: 'send_http_request',
+                args: this.coerceToolArgs('send_http_request', actionObj, context),
+            };
+        }
+
+        return null;
+    }
+
+    private coerceToolArgs(tool: string, rawArgs: any, context?: Record<string, any>): Record<string, any> {
+        const args = this.unwrapJsonValue(
+            rawArgs !== undefined
+                ? rawArgs
+                : context?.args ?? context?.arguments ?? context?.parameters ?? context?.params ?? context?.input ?? context?.tool_input,
+        );
+
+        if (args === null || args === undefined || args === '') {
+            return tool === 'get_proxy_history' ? { count: 20, excludePenPard: true } : {};
+        }
+
+        if (typeof args === 'string') {
+            const trimmed = args.trim();
+            switch (tool) {
+                case 'send_http_request':
+                case 'send_to_scanner':
+                case 'spider_url':
+                case 'extract_links':
+                case 'browser_navigate':
+                    return { url: trimmed, method: tool === 'send_http_request' ? 'GET' : undefined };
+                case 'browser_evaluate_js':
+                    return { script: trimmed };
+                case 'get_session_cookies':
+                case 'get_cookies_and_auth_for_host':
+                    return { host: trimmed };
+                case 'get_proxy_history': {
+                    const parsedCount = Number(trimmed);
+                    return {
+                        count: Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : 20,
+                        excludePenPard: true,
+                    };
+                }
+                case 'repeater_test':
+                    return { requestId: trimmed };
+                default:
+                    return {};
+            }
+        }
+
+        if (typeof args === 'number') {
+            if (tool === 'get_proxy_history') {
+                return { count: args, excludePenPard: true };
+            }
+            return {};
+        }
+
+        if (Array.isArray(args)) {
+            if (tool === 'browser_fill_and_submit') {
+                return { fields: args };
+            }
+            return {};
+        }
+
+        if (typeof args !== 'object') {
+            return {};
+        }
+
+        const normalized = { ...(args as Record<string, any>) };
+
+        if (tool === 'send_http_request') {
+            normalized.url = normalized.url || normalized.target || normalized.endpoint || normalized.href;
+            normalized.method = String(normalized.method || 'GET').toUpperCase();
+            normalized.headers = normalized.headers && typeof normalized.headers === 'object' ? normalized.headers : {};
+            if (normalized.body === undefined && normalized.data !== undefined) {
+                normalized.body = normalized.data;
+            }
+            if (normalized.body === undefined) {
+                normalized.body = '';
+            }
+            return normalized;
+        }
+
+        if (tool === 'get_proxy_history') {
+            return {
+                ...normalized,
+                count: normalized.count || 20,
+                excludePenPard: normalized.excludePenPard ?? true,
+            };
+        }
+
+        if (tool === 'browser_fill_and_submit' && normalized.submitSelector && normalized.submit_selector === undefined) {
+            normalized.submit_selector = normalized.submitSelector;
+        }
+
+        if (tool === 'send_to_scanner' || tool === 'spider_url' || tool === 'extract_links' || tool === 'browser_navigate') {
+            normalized.url = normalized.url || normalized.target || normalized.endpoint || normalized.href;
+        }
+
+        if (tool === 'browser_evaluate_js' && normalized.script === undefined && typeof normalized.code === 'string') {
+            normalized.script = normalized.code;
+        }
+
+        if ((tool === 'get_session_cookies' || tool === 'get_cookies_and_auth_for_host') && normalized.host === undefined && typeof normalized.url === 'string') {
+            try {
+                normalized.host = new URL(normalized.url).hostname;
+            } catch {
+                normalized.host = normalized.url;
+            }
+        }
+
+        return normalized;
+    }
+
+    private canonicalizeToolName(toolName: string): string {
+        const normalized = toolName
+            .trim()
+            .replace(/^tools?\./i, '')
+            .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+            .replace(/[\s-]+/g, '_')
+            .toLowerCase();
+
+        const aliases: Record<string, string> = {
+            sendhttprequest: 'send_http_request',
+            send_http_request: 'send_http_request',
+            send_to_scanner: 'send_to_scanner',
+            sendtoscanner: 'send_to_scanner',
+            getproxyhistory: 'get_proxy_history',
+            get_proxy_history: 'get_proxy_history',
+            getsessioncookies: 'get_session_cookies',
+            get_session_cookie: 'get_session_cookies',
+            get_session_cookies: 'get_session_cookies',
+            getcookiesandauthforhost: 'get_cookies_and_auth_for_host',
+            get_cookies_and_auth_for_host: 'get_cookies_and_auth_for_host',
+            getsitemap: 'get_sitemap',
+            get_sitemap: 'get_sitemap',
+            spiderurl: 'spider_url',
+            spider_url: 'spider_url',
+            checkauthorization: 'check_authorization',
+            check_authorization: 'check_authorization',
+            generatepayloads: 'generate_payloads',
+            generate_payloads: 'generate_payloads',
+            extractlinks: 'extract_links',
+            extract_links: 'extract_links',
+            browsernavigate: 'browser_navigate',
+            browser_navigate: 'browser_navigate',
+            browsergetpagestate: 'browser_get_page_state',
+            browser_get_page_state: 'browser_get_page_state',
+            browser_page_state: 'browser_get_page_state',
+            browser_get_state: 'browser_get_page_state',
+            browsergetfrontendanalysis: 'browser_get_frontend_analysis',
+            browser_get_frontend_analysis: 'browser_get_frontend_analysis',
+            browser_frontend_analysis: 'browser_get_frontend_analysis',
+            browserfillandsubmit: 'browser_fill_and_submit',
+            browser_fill_and_submit: 'browser_fill_and_submit',
+            browser_fill_submit: 'browser_fill_and_submit',
+            browserevaluatejs: 'browser_evaluate_js',
+            browser_evaluate_js: 'browser_evaluate_js',
+            browserscreenshot: 'browser_screenshot',
+            browser_screenshot: 'browser_screenshot',
+            browsercorrelateburp: 'browser_correlate_burp',
+            browser_correlate_burp: 'browser_correlate_burp',
+            harvesttraffic: 'harvest_traffic',
+            harvest_traffic: 'harvest_traffic',
+            gethypotheses: 'get_hypotheses',
+            get_hypotheses: 'get_hypotheses',
+            getcoverage: 'get_coverage',
+            get_coverage: 'get_coverage',
+            repeatertest: 'repeater_test',
+            repeater_test: 'repeater_test',
+        };
+
+        return aliases[normalized] || aliases[normalized.replace(/_/g, '')] || normalized;
+    }
+
+    private isKnownToolName(toolName: string): boolean {
+        return new Set([
+            'send_http_request',
+            'send_to_scanner',
+            'get_proxy_history',
+            'get_session_cookies',
+            'get_cookies_and_auth_for_host',
+            'get_sitemap',
+            'spider_url',
+            'check_authorization',
+            'generate_payloads',
+            'extract_links',
+            'analyze_response',
+            'browser_navigate',
+            'browser_get_page_state',
+            'browser_get_frontend_analysis',
+            'browser_fill_and_submit',
+            'browser_evaluate_js',
+            'browser_screenshot',
+            'browser_correlate_burp',
+            'harvest_traffic',
+            'get_hypotheses',
+            'get_coverage',
+            'repeater_test',
+        ]).has(this.canonicalizeToolName(toolName));
+    }
+
+    private firstString(...values: unknown[]): string | undefined {
+        for (const value of values) {
+            if (typeof value === 'string' && value.trim()) {
+                return value.trim();
+            }
+        }
+        return undefined;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -3105,6 +3615,13 @@ Rules for subsequent work:
     private async ensureBrowserSession(): Promise<string> {
         if (this.browserSessionId && browserService.isSessionAlive(this.browserSessionId)) {
             return this.browserSessionId;
+        }
+
+        if (this.browserSessionId) {
+            const visibility = browserService.getSessionVisibility(this.browserSessionId);
+            if (visibility && !visibility.isLive) {
+                this.log('system', `Browser session became unavailable (${visibility.lifecycleState}). Continuing in HTTP-only mode until browser features are needed again.`);
+            }
         }
 
         // Session is dead or was never created — attempt relaunch

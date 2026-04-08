@@ -1157,6 +1157,9 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
                 browserSessionId,
                 browserIsHeadless: browserVisibility?.isHeadless ?? null,
                 browserTransitioning: browserVisibility?.transitioning ?? false,
+                browserLifecycleState: browserVisibility?.lifecycleState ?? null,
+                browserIsLive: browserVisibility?.isLive ?? false,
+                browserStatusDetail: browserVisibility?.detail ?? null,
                 // Pentester Loop v2 state
                 harvestedRequestCount: state.harvestedRequestCount || 0,
                 promotedRequestCount: state.promotedRequestCount || 0,
@@ -1221,8 +1224,8 @@ router.post('/:id/browser/show', authenticateToken, async (req: AuthRequest, res
             return;
         }
 
-        await browserService.showBrowser(browserSessionId);
-        res.json({ message: 'Browser is now visible', browserSessionId, isHeadless: false });
+        const visibility = await browserService.showBrowser(browserSessionId);
+        res.json({ ...visibility, browserSessionId });
     } catch (error: any) {
         logger.error('Show browser for scan failed', { error: error.message });
         res.status(400).json({ error: true, message: error.message });
@@ -1245,8 +1248,8 @@ router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res
             return;
         }
 
-        await browserService.hideBrowser(browserSessionId);
-        res.json({ message: 'Browser is now headless', browserSessionId, isHeadless: true });
+        const visibility = await browserService.hideBrowser(browserSessionId);
+        res.json({ ...visibility, browserSessionId });
     } catch (error: any) {
         logger.error('Hide browser for scan failed', { error: error.message });
         res.status(400).json({ error: true, message: error.message });

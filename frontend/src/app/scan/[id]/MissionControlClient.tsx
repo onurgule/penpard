@@ -113,6 +113,8 @@ export default function MissionControlClient() {
     const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
     const [browserIsHeadless, setBrowserIsHeadless] = useState<boolean | null>(null);
     const [browserTransitioning, setBrowserTransitioning] = useState(false);
+    const [browserLifecycleState, setBrowserLifecycleState] = useState<string | null>(null);
+    const [browserIsLive, setBrowserIsLive] = useState(false);
 
     // Pentester Loop v2 state
     const [hypothesisCount, setHypothesisCount] = useState<Record<string, number>>({ new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 });
@@ -227,8 +229,14 @@ export default function MissionControlClient() {
                 setBrowserSessionId(data.browserSessionId);
                 setBrowserIsHeadless(data.browserIsHeadless ?? null);
                 setBrowserTransitioning(data.browserTransitioning ?? false);
+                setBrowserLifecycleState(data.browserLifecycleState ?? null);
+                setBrowserIsLive(Boolean(data.browserIsLive));
             } else {
                 setBrowserSessionId(null);
+                setBrowserIsHeadless(null);
+                setBrowserTransitioning(false);
+                setBrowserLifecycleState(null);
+                setBrowserIsLive(false);
             }
 
             // Track pentester loop v2 state
@@ -507,6 +515,66 @@ User Question: ${userQuestion}`;
 
     // Show loading until scanId is resolved from URL
     const endpointRows = buildEndpointDisplayRows(endpointInventory, 24);
+    const browserToggleAction = browserLifecycleState === 'visible_active' ? 'hide' : 'show';
+    const browserStatusLabel = (() => {
+        switch (browserLifecycleState) {
+            case 'visible_active':
+                return 'Visible';
+            case 'headless_active':
+                return 'Headless';
+            case 'hidden':
+                return 'Hidden';
+            case 'manually_closed':
+                return 'Closed';
+            case 'crashed_or_disconnected':
+                return 'Unavailable';
+            case 'stale_reference':
+                return 'Stale';
+            case 'closing':
+                return 'Closing';
+            default:
+                return browserIsHeadless ? 'Headless' : 'Visible';
+        }
+    })();
+    const browserStatusDotClass = (() => {
+        switch (browserLifecycleState) {
+            case 'visible_active':
+                return 'bg-green-500';
+            case 'headless_active':
+            case 'hidden':
+                return 'bg-purple-500';
+            case 'manually_closed':
+            case 'crashed_or_disconnected':
+            case 'stale_reference':
+                return 'bg-amber-500';
+            case 'closing':
+                return 'bg-slate-500';
+            default:
+                return browserIsHeadless ? 'bg-purple-500' : 'bg-green-500';
+        }
+    })();
+    const browserButtonLabel = (() => {
+        if (browserTransitioning) return 'Switching...';
+        switch (browserLifecycleState) {
+            case 'visible_active':
+                return 'Hide Browser';
+            case 'manually_closed':
+            case 'crashed_or_disconnected':
+            case 'stale_reference':
+            case 'closed':
+                return 'Reopen Browser';
+            default:
+                return 'Show Browser';
+        }
+    })();
+    const browserButtonClass = browserLifecycleState === 'visible_active'
+        ? 'bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20'
+        : browserLifecycleState === 'manually_closed'
+            || browserLifecycleState === 'crashed_or_disconnected'
+            || browserLifecycleState === 'stale_reference'
+            || browserLifecycleState === 'closed'
+            ? 'bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20'
+            : 'bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:bg-purple-500/20';
 
     if (!scanId) {
         return (
@@ -544,12 +612,19 @@ User Question: ${userQuestion}`;
                                     if (browserTransitioning) return;
                                     setBrowserTransitioning(true);
                                     try {
-                                        const endpoint = browserIsHeadless ? 'show' : 'hide';
-                                        await axios.post(`${API_URL}/scans/${scanIdRef.current}/browser/${endpoint}`, {}, {
+                                        const endpoint = browserToggleAction;
+                                        const response = await axios.post(`${API_URL}/scans/${scanIdRef.current}/browser/${endpoint}`, {}, {
                                             headers: { Authorization: `Bearer ${token}` }
                                         });
-                                        setBrowserIsHeadless(!browserIsHeadless);
-                                        toast.success(browserIsHeadless ? 'Browser window opened' : 'Browser hidden');
+                                        const visibility = response.data || {};
+                                        setBrowserIsHeadless(visibility.isHeadless ?? null);
+                                        setBrowserTransitioning(Boolean(visibility.transitioning));
+                                        setBrowserLifecycleState(visibility.lifecycleState ?? null);
+                                        setBrowserIsLive(Boolean(visibility.isLive));
+                                        toast.success(
+                                            visibility.message
+                                                || (endpoint === 'show' ? 'Browser window opened' : 'Browser hidden')
+                                        );
                                     } catch (e: any) {
                                         toast.error(e.response?.data?.message || 'Failed to toggle browser');
                                     } finally {
@@ -557,21 +632,17 @@ User Question: ${userQuestion}`;
                                     }
                                 }}
                                 disabled={browserTransitioning}
-                                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                                    browserIsHeadless
-                                        ? 'bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:bg-purple-500/20'
-                                        : 'bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20'
-                                } disabled:opacity-50`}
-                                title={browserIsHeadless ? 'Show the Chromium browser window' : 'Hide browser back to headless mode'}
+                                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${browserButtonClass} disabled:opacity-50`}
+                                title={browserToggleAction === 'show' ? 'Show or reopen the Chromium browser window' : 'Hide browser back to headless mode'}
                             >
                                 {browserTransitioning ? (
                                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                ) : browserIsHeadless ? (
+                                ) : browserToggleAction === 'show' ? (
                                     <Eye className="w-3.5 h-3.5" />
                                 ) : (
                                     <EyeOff className="w-3.5 h-3.5" />
                                 )}
-                                {browserTransitioning ? 'Switching...' : browserIsHeadless ? 'Show Browser' : 'Hide Browser'}
+                                {browserButtonLabel}
                             </button>
                         )}
                         {/* Pause / Resume Button */}
@@ -908,11 +979,9 @@ User Question: ${userQuestion}`;
                             {/* Browser status indicator */}
                             {isAgentActive && browserSessionId && (
                                 <span className="flex items-center gap-1">
-                                    <div className={`w-1.5 h-1.5 rounded-full ${
-                                        browserIsHeadless ? 'bg-purple-500' : 'bg-green-500'
-                                    }`}></div>
+                                    <div className={`w-1.5 h-1.5 rounded-full ${browserStatusDotClass}`}></div>
                                     <Globe className="w-3 h-3 text-slate-500" />
-                                    {browserIsHeadless ? 'Headless' : 'Visible'}
+                                    {browserStatusLabel}{browserIsLive ? '' : ' (offline)'}
                                 </span>
                             )}
                             {/* Hypothesis status badges */}
