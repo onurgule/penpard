@@ -8,7 +8,15 @@
  * This replaces the LLM-driven header-copying approach.
  */
 
-import { AuthContext, AuthContextHeaders, RequestAuthBindingRules, LOGIN_PATH_PATTERNS, CSRF_HEADER_NAMES } from './types';
+import {
+    AuthContext,
+    AuthContextHeaders,
+    RequestAuthBindingRules,
+    LOGIN_PATH_PATTERNS,
+    CSRF_HEADER_NAMES,
+    AUTH_BOOTSTRAP_PATH_PATTERNS,
+    RequestAuthIntent,
+} from './types';
 import { CookieJar } from './CookieJar';
 import { TokenStore } from './TokenStore';
 import { CSRFManager } from './CSRFManager';
@@ -59,7 +67,7 @@ export class AuthInjector {
      * @param identityId - Which identity to use (default: primary). Use '__none__' for anonymous.
      * @returns AuthContext with all headers to inject
      */
-    prepare(url: string, method: string = 'GET', identityId?: string): AuthContext {
+    prepare(url: string, method: string = 'GET', identityId?: string, intent: RequestAuthIntent = 'authenticated'): AuthContext {
         const resolvedIdentityId = identityId || this.rules.defaultIdentityId;
 
         // Anonymous / unauthenticated request — return empty context
@@ -97,6 +105,13 @@ export class AuthInjector {
         }
 
         // ── COOKIE ASSEMBLY ──
+        if (this.shouldSuppressManagedAuth(parsedUrl.pathname, intent)) {
+            return this.emptyContext(
+                resolvedIdentityId,
+                `Managed auth suppressed for ${intent} on ${parsedUrl.pathname}`,
+            );
+        }
+
         const jar = this.cookieJars.get(resolvedIdentityId);
         const cookies = jar ? jar.resolve(url, this.rules.cookiePathScopingEnabled) : '';
 
@@ -181,8 +196,9 @@ export class AuthInjector {
         method: string = 'GET',
         identityId?: string,
         preserveExplicit: boolean = false,
+        intent: RequestAuthIntent = 'authenticated',
     ): { context: AuthContext; headers: Record<string, string>; body: string } {
-        const context = this.prepare(url, method, identityId);
+        const context = this.prepare(url, method, identityId, intent);
         const normalizedBody = body || '';
 
         if (preserveExplicit) {
@@ -318,6 +334,18 @@ export class AuthInjector {
             if (lower === np || lower.startsWith(np + '/') || lower.startsWith(np + '?')) return true;
         }
         return false;
+    }
+
+    isAuthBootstrapPath(pathname: string): boolean {
+        const lower = pathname.toLowerCase();
+        return AUTH_BOOTSTRAP_PATH_PATTERNS.some((pattern) => pattern.test(lower));
+    }
+
+    private shouldSuppressManagedAuth(pathname: string, intent: RequestAuthIntent): boolean {
+        if (!['anonymous_auth_probe', 'account_creation'].includes(intent)) {
+            return false;
+        }
+        return this.isAuthBootstrapPath(pathname);
     }
 
     private stripManagedHeaders(existingHeaders: Record<string, string> | undefined): Record<string, string> {

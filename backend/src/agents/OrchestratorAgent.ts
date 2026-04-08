@@ -12,7 +12,7 @@
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
-import { updateScanStatus, addVulnerability, saveScanLogs, db } from '../db/init';
+import { updateScanStatus, addVulnerability, saveScanLogs, db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
 import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
@@ -25,12 +25,16 @@ import { HypothesisEngine, VulnHypothesis, MutationTemplate } from '../services/
 import { CoverageTracker } from '../services/CoverageTracker';
 import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
 import { browserService } from '../services/BrowserService';
-import { AuthStateManager, AuthInjector, IdentityRegistry } from '../services/auth';
+import { AuthStateManager, AuthInjector, IdentityRegistry, AuthStartupConfig, AuthStartupInventory, RequestAuthIntent } from '../services/auth';
 import { getHeaderValue, parseRawBurpRequest } from '../services/burp-request';
+import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
+import { WebAuthStartupService } from '../services/WebAuthStartupService';
+import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
 
 type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
 
 interface ScanConfig {
+    userId?: number;
     rateLimit: number;
     maxIterations?: number;
     /** Max planning rounds. 0 or undefined = no fixed limit (model decides when to finish). */
@@ -50,6 +54,8 @@ interface ScanConfig {
     sourcePackagePath?: string;
     /** Source analysis mode: 'version_aware' or 'full_source_aware'. */
     sourceAnalysisMode?: string;
+    /** Explicit startup auth discovery/login strategy for Web Scans. */
+    authStartup?: AuthStartupConfig;
 }
 
 interface ToolCall {
@@ -348,6 +354,12 @@ CURRENT STATE:
 - Endpoints discovered: {ENDPOINTS_SUMMARY}
 - Previous plan results: {PREVIOUS_RESULTS}
 
+AUTH STARTUP INVENTORY:
+{AUTH_STARTUP_SUMMARY}
+
+ROUND PRIORITY:
+{AUTH_STARTUP_DIRECTIVE}
+
 LEARNED ATTACK PATTERNS (from past Red Team reports):
 {MINDSET_TTPS}
 If any learned patterns match discovered endpoints or parameters, PRIORITIZE testing them.
@@ -356,10 +368,13 @@ Include the TTP id in your thought when a step is derived from a learned pattern
 RULES:
 1. **OPERATOR INSTRUCTIONS ARE LAW.** If operator instructions specify endpoints, vulnerability types, or scope — your ENTIRE plan MUST stay within those boundaries. Do NOT test anything outside the operator's scope. Do NOT do general recon if the operator told you exactly what to test.
 2. If operator instructions specify exact endpoints and vuln types → Skip discovery. Go DIRECTLY to testing those endpoints for those vulns in Round 1. Every step should be an attack on the specified scope.
-3. Each step must be concrete and actionable (specific endpoint + specific test)
-4. Don't repeat tests that were already done
-5. Only do discovery/mapping if NO operator instructions are present
-6. If the operator says to finish after testing → respond with completion after thorough testing of the defined scope
+3. In planning round 1 for Web Scans, continue auth-surface-first work before generic crawling or fuzzing. Use the startup inventory, browser evidence, and Burp traffic correlation as the primary source of truth.
+4. If credentials were not supplied, prioritize registration, password reset, onboarding, OTP/MFA, SSO, invite, and recovery surfaces before broader discovery.
+5. If credentials were supplied, prioritize browser-driven login completion, auth route inventory, and session transport understanding before broader testing.
+6. Each step must be concrete and actionable (specific endpoint + specific test)
+7. Don't repeat tests that were already done
+8. Only do discovery/mapping if NO operator instructions are present
+9. If the operator says to finish after testing → respond with completion after thorough testing of the defined scope
 
 Respond with ONLY a JSON object in this exact format:
 {
@@ -477,6 +492,8 @@ export class OrchestratorAgent {
     // Browser session for AI-driven browser testing
     private browserSessionId: string | null = null;
     private browserLock: boolean = false;
+    private startupAuthInventory: AuthStartupInventory | null = null;
+    private endpointInventory: EndpointInventorySnapshot | null = null;
 
     // ── Pentester Loop Services (v2) ──
     private harvester: RequestHarvester;
@@ -1009,7 +1026,30 @@ Proceed with testing.`
             }
         }
 
-        // Run source analysis if configured
+        // ── Auth State Engine: Initialize and capture from all sources ──
+        this.log('system', '🔐 Initializing Auth State Engine...');
+        const authStartup = this.config.authStartup || {
+            mode: 'no_credentials' as const,
+            credentials: [],
+            allowAccountCreation: false,
+            preferSharedPassword: true,
+        };
+        await this.authManager.initialize(
+            {
+                sessionCookies: this.config.sessionCookies,
+                idorUsers: this.config.idorUsers,
+                initialRequest: this.config.initialRequest,
+                authStartup,
+            },
+            this.burp,
+            this.browserSessionId,
+        );
+        this.log('system', `✓ Auth State Engine: ${this.authManager.identityRegistry.size} identities, ${this.authManager.getTotalCookies()} cookies, ${this.authManager.getTotalTokens()} tokens`);
+
+        // ── Browser-first auth discovery and session acquisition must complete before normal planning ──
+        await this.runAuthFirstStartup(authStartup);
+
+        // Run source analysis after startup auth inventory is complete so planning always sees auth intelligence first
         let sourceContextBlock = '';
         if (this.config.sourcePackagePath && this.config.sourceAnalysisMode) {
             try {
@@ -1027,21 +1067,14 @@ Proceed with testing.`
             }
         }
 
-        // ── Auth State Engine: Initialize and capture from all sources ──
-        this.log('system', '🔐 Initializing Auth State Engine...');
-        await this.authManager.initialize(
-            { sessionCookies: this.config.sessionCookies, idorUsers: this.config.idorUsers, initialRequest: this.config.initialRequest },
-            this.burp,
-            this.browserSessionId,
-        );
-        this.log('system', `✓ Auth State Engine: ${this.authManager.identityRegistry.size} identities, ${this.authManager.getTotalCookies()} cookies, ${this.authManager.getTotalTokens()} tokens`);
-
         // Generate the auth block for the system prompt (tells LLM auth is automatic)
         const sessionCookiesBlock = this.authManager.getSystemPromptBlock();
+        const startupAuthBlock = this.buildStartupAuthPromptBlock();
+        const endpointInventoryBlock = this.buildEndpointInventoryPromptBlock();
 
         // Build system prompt
         const promptTemplate = await this.loadPromptTemplate();
-        const accountsJson = JSON.stringify(this.config.idorUsers || [], null, 2);
+        const accountsJson = JSON.stringify(this.buildAccountPromptContext(), null, 2);
         let systemPrompt: string;
 
         const basePrompt = promptTemplate
@@ -1054,6 +1087,8 @@ Proceed with testing.`
             systemPrompt = basePrompt;
         }
         systemPrompt += sessionCookiesBlock;
+        systemPrompt += startupAuthBlock;
+        systemPrompt += endpointInventoryBlock;
 
         if (sourceContextBlock) {
             systemPrompt += sourceContextBlock;
@@ -1076,11 +1111,21 @@ Proceed with testing.`
             content: systemPrompt
         });
 
+        if (this.startupAuthInventory) {
+            this.conversationHistory.push({
+                role: 'user',
+                content: `[SYSTEM] Web Scan auth startup completed before planning.\n${this.buildStartupAuthSummary(this.startupAuthInventory)}\nTreat this inventory as established evidence and keep planning auth-surface-first in round 1 before generic crawling or fuzzing.`,
+            });
+        }
+        if (this.endpointInventory) {
+            this.conversationHistory.push({
+                role: 'user',
+                content: `[SYSTEM] Endpoint intelligence captured before planning.\n${this.buildEndpointInventorySummary(this.endpointInventory)}\nUse this for round 1 auth-surface-first planning and avoid already-filtered noise.`,
+            });
+        }
+
         this.log('system', '✓ System prompt loaded');
         await this.delay(500);
-
-        // ── Auto-launch headless browser + frontend analysis ──
-        await this.initBrowserAndAnalyze();
 
         // Analyze operator instructions with LLM to determine scope
         if (this.config.customSystemPrompt) {
@@ -1207,6 +1252,211 @@ Start by sending the original request as-is to get a baseline response, then beg
                 this.log('system', '⚠ Could not parse Burp request — injected raw');
             }
         }
+    }
+
+    private buildAccountPromptContext(): any[] {
+        const startupAccounts = (this.config.authStartup?.credentials || []).map((credential, index) => ({
+            identityId: index === 0 ? 'primary-user' : `provided-user-${index}`,
+            username: credential.username,
+            email: credential.email,
+            label: credential.label,
+            role: credential.role,
+            privilege: credential.privilege || 'unknown',
+            source: 'scan_start',
+        }));
+
+        const legacyAccounts = (this.config.idorUsers || []).map((account: any, index: number) => ({
+            identityId: account.identityId || `idor-user-${index + 1}`,
+            username: account.username,
+            email: account.email,
+            label: account.label,
+            role: account.role,
+            privilege: account.privilege || 'unknown',
+            source: 'idor_pool',
+        }));
+
+        const seen = new Set<string>();
+        return [...startupAccounts, ...legacyAccounts].filter((account) => {
+            const key = JSON.stringify([account.identityId, account.username, account.email, account.role, account.label]);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
+    private async runAuthFirstStartup(authStartup: AuthStartupConfig): Promise<void> {
+        this.log('system', '🔍 Starting browser-first auth discovery before normal planning...');
+        const service = new WebAuthStartupService(
+            this.scanId,
+            this.config.userId || 1,
+            this.targetUrl,
+            this.burp,
+            this.authManager,
+            (kind, message) => this.log(kind === 'debug' ? 'debug' : kind, message),
+        );
+        const { browserSessionId, inventory } = await service.run(authStartup);
+        this.browserSessionId = browserSessionId;
+        this.startupAuthInventory = inventory;
+
+        try {
+            saveScanAuthInventory(this.scanId, JSON.stringify(inventory));
+        } catch (error: any) {
+            this.log('error', `Failed to persist auth startup inventory: ${error.message}`);
+        }
+
+        inventory.authRoutes.forEach((route) => {
+            if (typeof route !== 'string' || !route.trim()) return;
+            try {
+                const absolute = route.startsWith('http') ? route : new URL(route, this.targetUrl).toString();
+                this.discoveredEndpoints.add(absolute);
+                this.coverageTracker.addRoute(new URL(absolute).pathname, 'GET', 'browser-navigation');
+            } catch {
+                this.discoveredEndpoints.add(route);
+            }
+        });
+
+        inventory.traffic.forEach((entry) => {
+            if (!entry?.url) return;
+            this.discoveredEndpoints.add(entry.url);
+            try {
+                const parsed = new URL(entry.url);
+                this.coverageTracker.addRoute(parsed.pathname, entry.method || 'GET', entry.source === 'browser' ? 'browser-navigation' : 'burp');
+            } catch {
+                /* ignore malformed URLs */
+            }
+        });
+
+        this.log('system', `✓ Auth startup inventory captured: ${inventory.summary}`);
+        await this.refreshEndpointInventory('startup', true);
+    }
+
+    private async refreshEndpointInventory(trigger: string, allowAiClassification: boolean = false): Promise<void> {
+        if (!this.browserSessionId) return;
+
+        try {
+            const service = new EndpointIntelligenceService(
+                this.scanId,
+                this.targetUrl,
+                this.burp,
+                (level, message) => this.log(level === 'error' ? 'error' : level === 'system' ? 'system' : 'debug', message),
+            );
+            const inventory = await service.buildInventory({
+                browserSessionId: this.browserSessionId,
+                authInventory: this.startupAuthInventory,
+                allowAiClassification,
+            });
+            this.endpointInventory = inventory;
+            saveScanEndpointInventory(this.scanId, JSON.stringify(inventory));
+            this.log('system', `✓ Endpoint intelligence refreshed (${trigger}): ${inventory.summary}`);
+        } catch (error: any) {
+            this.log('error', `Endpoint intelligence refresh failed (${trigger}): ${error.message}`);
+        }
+    }
+
+    private buildStartupAuthPromptBlock(): string {
+        if (!this.startupAuthInventory) return '';
+        return `\n\n═══════════════════════════════════════════════════════════════
+  WEB AUTH STARTUP INVENTORY (captured before planning)
+═══════════════════════════════════════════════════════════════
+
+${this.buildStartupAuthSummary(this.startupAuthInventory)}
+
+Rules for subsequent work:
+- Browser-driven auth discovery already ran before the first plan.
+- Use this inventory as evidence, not as a guess.
+- Reuse captured cookies, tokens, CSRF values, and identity state instead of rebuilding auth assumptions.
+- Keep round 1 auth-surface-first unless operator instructions explicitly narrow scope elsewhere.
+`;
+    }
+
+    private buildEndpointInventoryPromptBlock(): string {
+        if (!this.endpointInventory) return '';
+        return `\n\n═══════════════════════════════════════════════════════════════
+  ENDPOINT INTELLIGENCE (browser + JS + Burp)
+═══════════════════════════════════════════════════════════════
+
+${this.buildEndpointInventorySummary(this.endpointInventory)}
+
+Rules for subsequent work:
+- Treat these endpoints and classifications as structured evidence gathered from rendered DOM, loaded JavaScript, browser execution, and Burp traffic.
+- Prioritize auth-relevant endpoints early, especially login/register/reset/session-bootstrap/auth-refresh/admin routes.
+- Do not waste time on socket polling, HMR, or other noise already filtered from this inventory.
+`;
+    }
+
+    private buildEndpointInventorySummary(inventory: EndpointInventorySnapshot): string {
+        const endpointLines = inventory.records.slice(0, 20).map((record) => {
+            const method = record.methods.join(', ') || 'GET';
+            const observed = `${record.observedInBurp ? 'burp' : 'no-burp'} / ${record.exercisedInBrowser ? 'browser' : 'not-browser'}`;
+            return `- [${record.classification}] ${method} ${record.path} source=${record.primarySource} confidence=${record.confidence} observed=${observed} inferredOnly=${record.inferredOnly ? 'yes' : 'no'}`;
+        }).join('\n') || '- none';
+
+        const authLines = inventory.records
+            .filter((record) => record.likelyAuthRelevant)
+            .slice(0, 12)
+            .map((record) => `- ${record.path} (${record.classification})`)
+            .join('\n') || '- none';
+
+        return [
+            `Summary: ${inventory.summary}`,
+            `JS artifacts: ${inventory.jsArtifacts.count} captured, ${inventory.jsArtifacts.totalBytes} bytes analyzed`,
+            `Auth-relevant endpoints:\n${authLines}`,
+            `Top records:\n${endpointLines}`,
+        ].join('\n');
+    }
+
+    private buildStartupAuthSummary(inventory: AuthStartupInventory): string {
+        const formLines = inventory.forms.slice(0, 8).map((form) => {
+            const visibleFields = form.fields
+                .slice(0, 8)
+                .map((field) => `${field.name || field.id || 'unnamed'}:${field.type}`)
+                .join(', ') || 'no fields';
+            const hidden = form.hiddenInputs
+                .slice(0, 5)
+                .map((field) => field.name || field.id || 'hidden')
+                .join(', ') || 'none';
+            return `- [${form.type}] ${form.method} ${form.action || '(same page)'} fields=${visibleFields} hidden=${hidden}`;
+        }).join('\n') || '- none';
+
+        const elementLines = inventory.domElements.slice(0, 10).map((element) =>
+            `- [${element.type}] ${element.tagName} text="${element.text}" selector=${element.selector || 'n/a'} href=${element.href || element.action || ''}`
+        ).join('\n') || '- none';
+
+        const credentialLines = inventory.discoveredCredentials.slice(0, 10).map((credential) =>
+            `- ${credential.identityId || 'unknown'} ${credential.label || credential.username || credential.email || 'credential'} created=${credential.created ? 'yes' : 'no'} success=${credential.success ? 'yes' : 'no'} role=${credential.role || 'unknown'} privilege=${credential.privilege || 'unknown'}`
+        ).join('\n') || '- none';
+
+        const blockerLines = inventory.blockers.slice(0, 8).map((blocker) => `- ${blocker}`).join('\n') || '- none';
+
+        return [
+            `Startup mode: ${inventory.mode}`,
+            `Summary: ${inventory.summary}`,
+            `Browser session: ${inventory.browserSessionId || 'not available'}`,
+            `Registration available: ${inventory.registrationAvailable ? 'yes' : 'no'}`,
+            `Password reset available: ${inventory.passwordResetAvailable ? 'yes' : 'no'}`,
+            `Activation gate observed: ${inventory.activationRequired ? 'yes' : 'no'}`,
+            `SSO providers: ${inventory.ssoProviders.join(', ') || 'none'}`,
+            `Transport: authorization=${inventory.transport.authorizationSchemes.join(', ') || 'none'} | cookies=${inventory.transport.cookieNames.join(', ') || 'none'} | localStorage=${inventory.transport.localStorageKeys.join(', ') || 'none'} | sessionStorage=${inventory.transport.sessionStorageKeys.join(', ') || 'none'} | indexedDB=${inventory.transport.indexedDbNames.join(', ') || 'none'} | csrfHeaders=${inventory.transport.csrfHeaders.join(', ') || 'none'} | csrfFields=${inventory.transport.csrfFormFields.join(', ') || 'none'} | csrfMeta=${inventory.transport.csrfMetaNames.join(', ') || 'none'} | csrfCookies=${inventory.transport.csrfCookieNames.join(', ') || 'none'}`,
+            `Auth routes:\n${inventory.authRoutes.slice(0, 20).map((route) => `- ${route}`).join('\n') || '- none'}`,
+            `Forms:\n${formLines}`,
+            `Auth controls:\n${elementLines}`,
+            `Credentials:\n${credentialLines}`,
+            `Traffic samples captured: ${inventory.traffic.length}`,
+            `Blockers:\n${blockerLines}`,
+        ].join('\n');
+    }
+
+    private buildAuthStartupDirective(): string {
+        const mode = this.config.authStartup?.mode || 'no_credentials';
+        if (this.planRound > 1) {
+            return 'Auth startup already executed. Reuse its inventory and only expand into generic crawling when auth surfaces, session transport, and created identities are already understood.';
+        }
+
+        if (mode === 'provided_credentials') {
+            return 'Round 1 MUST stay auth-surface-first: verify the login entry point, confirm browser-driven sign-in/session carry, inventory auth routes/forms/buttons, and reuse the normalized session state before generic recon.';
+        }
+
+        return 'Round 1 MUST stay auth-surface-first: inventory login/register/reset/SSO/onboarding flows, attempt safe self-registration when available, preserve any created identities, and only then widen into generic recon.';
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1465,6 +1715,8 @@ Start by sending the original request as-is to get a baseline response, then beg
                 .replace('{FINDINGS_COUNT}', String(this.findings.length))
                 .replace('{ENDPOINTS_SUMMARY}', endpointsSummary)
                 .replace('{PREVIOUS_RESULTS}', previousResults)
+                .replace('{AUTH_STARTUP_SUMMARY}', this.startupAuthInventory ? this.buildStartupAuthSummary(this.startupAuthInventory) : 'No startup auth inventory was captured.')
+                .replace('{AUTH_STARTUP_DIRECTIVE}', this.buildAuthStartupDirective())
                 .replace('{OPERATOR_INSTRUCTIONS_REMINDER}', this.getOperatorInstructionsReminder())
                 .replace('{MINDSET_TTPS}', this.mindsetTTPs.length > 0
                     ? mindsetService.formatTTPsForPlanning(this.mindsetTTPs)
@@ -1542,6 +1794,8 @@ Start by sending the original request as-is to get a baseline response, then beg
 
     private createFallbackPlan(): AttackPlan {
         const baseUrl = this.targetUrl.replace(/\/$/, '');
+        const startupInventory = this.startupAuthInventory;
+        const authMode = this.config.authStartup?.mode || 'no_credentials';
 
         // Use LLM-analyzed instruction data if available
         if (this.instructionAnalysis?.is_focused) {
@@ -1577,17 +1831,42 @@ Start by sending the original request as-is to get a baseline response, then beg
             };
         }
 
-        // No operator instructions — use generic recon plan
+        // No operator instructions — force auth-surface-first in the first round
         if (this.planRound <= 1) {
+            const authTargets = startupInventory?.authRoutes?.slice(0, 6).map((route) => {
+                try {
+                    return route.startsWith('http') ? route : new URL(route, this.targetUrl).toString();
+                } catch {
+                    return route;
+                }
+            }) || [];
+            const primaryAuthRoute = authTargets[0] || `${baseUrl}/login`;
+            const registrationRoute = authTargets.find((route) => /register|sign[\s-]?up|create-account/i.test(route)) || `${baseUrl}/register`;
+            const resetRoute = authTargets.find((route) => /forgot|reset|recover/i.test(route)) || `${baseUrl}/forgot-password`;
+
+            if (authMode === 'provided_credentials') {
+                return {
+                    round: this.planRound,
+                    analysis: 'Fallback: round-one auth startup continuation with provided credentials',
+                    steps: [
+                        { step: 1, objective: 'Validate discovered login surface and auth controls', approach: `Review startup auth inventory and revisit ${primaryAuthRoute} in the browser to confirm login fields, DOM triggers, hidden inputs, and CSRF handling`, tools: ['browser_navigate', 'browser_get_page_state', 'browser_correlate_burp'], status: 'pending' },
+                        { step: 2, objective: 'Complete browser-driven login with supplied identity', approach: 'Use the discovered login form and real browser session to confirm authenticated state instead of replaying blind raw requests', tools: ['browser_fill_and_submit', 'browser_get_page_state'], status: 'pending' },
+                        { step: 3, objective: 'Harvest and normalize auth traffic', approach: 'Pull Burp history and harvested requests for the login flow to capture cookies, Authorization headers, CSRF values, redirect chains, and storage-backed session data', tools: ['get_proxy_history', 'harvest_traffic'], status: 'pending' },
+                        { step: 4, objective: 'Validate authenticated reachability with managed auth state', approach: 'Replay an authenticated endpoint using the normalized auth/session model captured during startup', tools: ['send_http_request'], status: 'pending' },
+                        { step: 5, objective: 'Map secondary identities for later authorization tests', approach: 'Prepare alternate provided users and confirm whether role or privilege differences exist for later IDOR/BAC testing', tools: ['browser_get_page_state', 'send_http_request'], status: 'pending' },
+                    ],
+                };
+            }
+
             return {
                 round: this.planRound,
-                analysis: 'Fallback: Initial reconnaissance plan',
+                analysis: 'Fallback: round-one auth-surface-first startup continuation without credentials',
                 steps: [
-                    { step: 1, objective: 'Check robots.txt', approach: `GET ${baseUrl}/robots.txt`, tools: ['send_http_request'], status: 'pending' },
-                    { step: 2, objective: 'Check sitemap', approach: `GET ${baseUrl}/sitemap.xml`, tools: ['send_http_request'], status: 'pending' },
-                    { step: 3, objective: 'Spider target', approach: 'Crawl main page for links', tools: ['spider_url'], status: 'pending' },
-                    { step: 4, objective: 'Check common paths', approach: 'Test /admin, /api, /login, /.env', tools: ['send_http_request'], status: 'pending' },
-                    { step: 5, objective: 'Get proxy history', approach: 'Review discovered endpoints', tools: ['get_proxy_history'], status: 'pending' },
+                    { step: 1, objective: 'Revisit discovered auth entry points in the browser', approach: `Use the startup inventory to review ${primaryAuthRoute}, ${registrationRoute}, and other discovered auth routes for forms, buttons, hidden inputs, CSRF, validation, and SSO triggers`, tools: ['browser_navigate', 'browser_get_page_state', 'browser_correlate_burp'], status: 'pending' },
+                    { step: 2, objective: 'Attempt safe self-registration or onboarding identity creation', approach: `If registration or invite onboarding exists, try to create one or more test accounts starting at ${registrationRoute} and preserve the resulting credentials and roles`, tools: ['browser_fill_and_submit', 'browser_get_page_state'], status: 'pending' },
+                    { step: 3, objective: 'Inventory password reset, recovery, OTP, and activation gates', approach: `Examine ${resetRoute} and other recovery checkpoints to understand recovery routes, email verification, MFA/TOTP, and session bootstrap requirements`, tools: ['browser_navigate', 'browser_get_page_state'], status: 'pending' },
+                    { step: 4, objective: 'Harvest proxied auth traffic and session transport evidence', approach: 'Use Burp history and harvested requests to capture Set-Cookie behavior, redirect chains, storage-backed tokens, Authorization headers, and CSRF transport from real browser execution', tools: ['get_proxy_history', 'harvest_traffic'], status: 'pending' },
+                    { step: 5, objective: 'Carry normalized auth intelligence into the first authenticated checks', approach: 'Replay a startup-discovered auth or post-auth endpoint with the managed auth/session state to validate that later scan rounds can reuse the captured identities safely', tools: ['send_http_request'], status: 'pending' },
                 ],
             };
         }
@@ -1727,16 +2006,24 @@ Start by sending the original request as-is to get a baseline response, then beg
 
                 case 'get_proxy_history':
                     // Always exclude PenPard agent requests — only show user's real traffic
-                    return await this.burp.callTool('get_proxy_history', { ...toolCall.args, excludePenPard: true });
+                    return {
+                        items: normalizeProxyHistoryItems(
+                            await this.burp.callTool('get_proxy_history', { ...toolCall.args, excludePenPard: true }),
+                        ),
+                    };
 
                 case 'get_session_cookies':
-                    return await this.burp.callTool('get_session_cookies', { host: toolCall.args?.host || new URL(this.targetUrl).hostname });
+                    return normalizeSessionCookieResult(
+                        await this.burp.callTool('get_session_cookies', { host: toolCall.args?.host || new URL(this.targetUrl).hostname }),
+                    );
 
                 case 'get_cookies_and_auth_for_host':
-                    return await this.burp.callTool('get_cookies_and_auth_for_host', {
-                        host: toolCall.args?.host || new URL(this.targetUrl).hostname,
-                        maxItems: toolCall.args?.maxItems ?? 50
-                    });
+                    return {
+                        entries: normalizeCookiesAndAuthEntries(await this.burp.callTool('get_cookies_and_auth_for_host', {
+                            host: toolCall.args?.host || new URL(this.targetUrl).hostname,
+                            maxItems: toolCall.args?.maxItems ?? 50
+                        })),
+                    };
 
                 case 'send_to_scanner':
                     return await this.burp.callTool('send_to_scanner', toolCall.args);
@@ -1834,6 +2121,49 @@ Start by sending the original request as-is to get a baseline response, then beg
         return `${identityId}:${method}:${url}:${body}:${JSON.stringify(sortedEntries)}`;
     }
 
+    private normalizeBurpHttpResult(result: any): {
+        result: any;
+        statusCode: number;
+        responseHeaders: Record<string, any> | Array<string>;
+        responseBody: string;
+    } {
+        const normalized = normalizeSendHttpResponse(result);
+        const baseResult = normalized.raw && typeof normalized.raw === 'object'
+            ? normalized.raw
+            : { rawResult: normalized.raw };
+
+        return {
+            result: {
+                ...baseResult,
+                statusCode: normalized.statusCode,
+                headers: normalized.headers,
+                body: normalized.body,
+            },
+            statusCode: normalized.statusCode,
+            responseHeaders: normalized.headers,
+            responseBody: normalized.body,
+        };
+    }
+
+    private async getLatestProxyEvidence(url: string): Promise<{ rawRequest?: string; rawResponse?: string }> {
+        try {
+            await this.delay(200);
+            const proxyHistory = await this.burp.callTool('get_proxy_history', {
+                count: 1,
+                includeDetails: true,
+                urlRegex: url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\?.*/, ''),
+            });
+            const entry = normalizeProxyHistoryItems(proxyHistory)[0];
+            return {
+                rawRequest: typeof entry?.request === 'string' ? entry.request : undefined,
+                rawResponse: typeof entry?.response === 'string' ? entry.response : undefined,
+            };
+        } catch (e: any) {
+            this.log('debug', `Could not fetch raw proxy data: ${e.message}`);
+            return {};
+        }
+    }
+
     private hasCustomAuthHeader(headers: Record<string, string> | undefined): boolean {
         if (!headers) return false;
         return Object.entries(headers).some(([name, value]) => {
@@ -1848,6 +2178,28 @@ Start by sending the original request as-is to get a baseline response, then beg
                 'x-token',
             ].includes(lower) && typeof value === 'string' && value.trim().length > 0;
         });
+    }
+
+    private resolveRequestAuthIntent(url: string, method: string, requestedIntent?: unknown, identityId?: string): RequestAuthIntent {
+        if (typeof requestedIntent === 'string') {
+            const normalized = requestedIntent.trim().toLowerCase() as RequestAuthIntent;
+            if ([
+                'authenticated',
+                'anonymous_auth_probe',
+                'account_creation',
+                'session_refresh',
+                'browser_sync',
+                'unknown',
+            ].includes(normalized)) {
+                return normalized;
+            }
+        }
+
+        const inferred = this.authManager.inferRequestIntent(url, method);
+        if (identityId === IdentityRegistry.ANONYMOUS_ID && inferred === 'authenticated') {
+            return 'unknown';
+        }
+        return inferred;
     }
 
     private async syncAuthFromBrowser(identityId: string = 'primary-user'): Promise<void> {
@@ -1908,7 +2260,8 @@ Start by sending the original request as-is to get a baseline response, then beg
 
         const originalBody = this.normalizeRequestBody(toolCall.args.body ?? toolCall.args.data ?? '');
         const originalHeaders = toolCall.args.headers as Record<string, string> | undefined;
-        const existingAuthContext = this.authManager.inject(url, method, identityId);
+        const requestIntent = this.resolveRequestAuthIntent(url, method, toolCall.args.requestIntent, identityId);
+        const existingAuthContext = this.authManager.inject(url, method, identityId, requestIntent);
         const explicitAuthorization = getHeaderValue(originalHeaders, 'authorization');
         const explicitCookie = getHeaderValue(originalHeaders, 'cookie');
         const explicitCustomAuth = this.hasCustomAuthHeader(originalHeaders);
@@ -1936,6 +2289,7 @@ Start by sending the original request as-is to get a baseline response, then beg
             method,
             identityId,
             preserveExplicitAuth,
+            requestIntent,
         );
         let requestDiagnostics = this.authManager.assessPreparedRequest({
             originalHeaders,
@@ -1944,11 +2298,16 @@ Start by sending the original request as-is to get a baseline response, then beg
             method,
             identityId,
             preserveExplicitAuth,
+            intent: requestIntent,
         });
         const isBurpOriginatedRequest = !!this.config.initialRequest?.trim();
         if (isBurpOriginatedRequest && requestDiagnostics.warning) {
             this.log('system', `⚠️ Auth Warning: ${requestDiagnostics.warning}`);
         }
+        if (requestDiagnostics.authSuppressedForIntent) {
+            this.log('system', `Auth Guardrail: suppressing stored auth for ${requestIntent} on ${method} ${url}`);
+        }
+
         const requestKey = this.buildRequestHistoryKey(
             method,
             url,
@@ -1986,40 +2345,16 @@ Start by sending the original request as-is to get a baseline response, then beg
             });
         };
 
-        let result = await sendThroughBurp(preparedRequest.headers, preparedRequest.body);
-
-        // Fetch the actual raw request/response from Burp proxy history
-        // This captures ALL headers (Host, Cookie, User-Agent, etc.) as Burp sees them
-        let rawRequest: string | undefined;
-        let rawResponse: string | undefined;
-        try {
-            // Small delay to ensure Burp has logged the request
-            await this.delay(200);
-            const proxyHistory = await this.burp.callTool('get_proxy_history', {
-                count: 1,
-                includeDetails: true,
-                urlRegex: url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\?.*/, ''), // match base URL
-            });
-
-            if (proxyHistory && Array.isArray(proxyHistory) && proxyHistory.length > 0) {
-                const entry = proxyHistory[0];
-                if (entry.request) rawRequest = entry.request;
-                if (entry.response) rawResponse = entry.response;
-            } else if (proxyHistory?.items && Array.isArray(proxyHistory.items) && proxyHistory.items.length > 0) {
-                const entry = proxyHistory.items[0];
-                if (entry.request) rawRequest = entry.request;
-                if (entry.response) rawResponse = entry.response;
-            }
-        } catch (e: any) {
-            // Non-critical — fall back to reconstructed request
-            this.log('debug', `Could not fetch raw proxy data: ${e.message}`);
-        }
-
-        let statusCode = result?.statusCode || result?.status || 0;
-        let responseHeaders = result?.headers || {};
-        let responseBody = result?.body || result?.text || '';
+        let normalizedResult = this.normalizeBurpHttpResult(
+            await sendThroughBurp(preparedRequest.headers, preparedRequest.body),
+        );
+        let result = normalizedResult.result;
+        let { rawRequest, rawResponse } = await this.getLatestProxyEvidence(url);
+        let statusCode = normalizedResult.statusCode;
+        let responseHeaders = normalizedResult.responseHeaders;
+        let responseBody = normalizedResult.responseBody;
         let authHealth = this.authManager.handleResponse(
-            statusCode, responseHeaders, responseBody, url, identityId
+            statusCode, responseHeaders, responseBody, url, identityId, requestIntent
         );
         let retriedAfterAuthInjection = false;
 
@@ -2046,6 +2381,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                 method,
                 identityId,
                 false,
+                requestIntent,
             );
             requestDiagnostics = this.authManager.assessPreparedRequest({
                 originalHeaders,
@@ -2054,6 +2390,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                 method,
                 identityId,
                 preserveExplicitAuth: false,
+                intent: requestIntent,
             });
 
             if (
@@ -2061,16 +2398,20 @@ Start by sending the original request as-is to get a baseline response, then beg
                 requestDiagnostics.outgoingCookiePresent ||
                 requestDiagnostics.outgoingCustomAuthPresent
             ) {
-                result = await sendThroughBurp(preparedRequest.headers, preparedRequest.body);
-                statusCode = result?.statusCode || result?.status || 0;
-                responseHeaders = result?.headers || {};
-                responseBody = result?.body || result?.text || '';
+                normalizedResult = this.normalizeBurpHttpResult(
+                    await sendThroughBurp(preparedRequest.headers, preparedRequest.body),
+                );
+                result = normalizedResult.result;
+                statusCode = normalizedResult.statusCode;
+                responseHeaders = normalizedResult.responseHeaders;
+                responseBody = normalizedResult.responseBody;
                 authHealth = this.authManager.handleResponse(
                     statusCode,
                     responseHeaders,
                     responseBody,
                     url,
                     identityId,
+                    requestIntent,
                 );
                 retriedAfterAuthInjection = true;
                 result = {
@@ -2098,19 +2439,23 @@ Start by sending the original request as-is to get a baseline response, then beg
                         method,
                         identityId,
                         false,
+                        requestIntent,
                     );
 
-                    result = await sendThroughBurp(retryPreparedRequest.headers, retryPreparedRequest.body);
-
-                    statusCode = result?.statusCode || result?.status || 0;
-                    responseHeaders = result?.headers || {};
-                    responseBody = result?.body || result?.text || '';
+                    normalizedResult = this.normalizeBurpHttpResult(
+                        await sendThroughBurp(retryPreparedRequest.headers, retryPreparedRequest.body),
+                    );
+                    result = normalizedResult.result;
+                    statusCode = normalizedResult.statusCode;
+                    responseHeaders = normalizedResult.responseHeaders;
+                    responseBody = normalizedResult.responseBody;
                     authHealth = this.authManager.handleResponse(
                         statusCode,
                         responseHeaders,
                         responseBody,
                         url,
                         identityId,
+                        requestIntent,
                     );
 
                     result = {
@@ -2143,28 +2488,7 @@ Start by sending the original request as-is to get a baseline response, then beg
         }
 
         // Refresh raw request/response after any retry so evidence matches the final request.
-        rawRequest = undefined;
-        rawResponse = undefined;
-        try {
-            await this.delay(200);
-            const proxyHistory = await this.burp.callTool('get_proxy_history', {
-                count: 1,
-                includeDetails: true,
-                urlRegex: url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\?.*/, ''),
-            });
-
-            if (proxyHistory && Array.isArray(proxyHistory) && proxyHistory.length > 0) {
-                const entry = proxyHistory[0];
-                if (entry.request) rawRequest = entry.request;
-                if (entry.response) rawResponse = entry.response;
-            } else if (proxyHistory?.items && Array.isArray(proxyHistory.items) && proxyHistory.items.length > 0) {
-                const entry = proxyHistory.items[0];
-                if (entry.request) rawRequest = entry.request;
-                if (entry.response) rawResponse = entry.response;
-            }
-        } catch (e: any) {
-            this.log('debug', `Could not refresh raw proxy data: ${e.message}`);
-        }
+        ({ rawRequest, rawResponse } = await this.getLatestProxyEvidence(url));
 
         // Track request using the final response after any refresh retry
         this.requestHistory.set(requestKey, {
@@ -2671,7 +2995,7 @@ Start by sending the original request as-is to get a baseline response, then beg
     private async initBrowserAndAnalyze(): Promise<void> {
         this.log('system', '🌐 Launching headless PenPard Browser...');
         try {
-            this.browserSessionId = await browserService.launchSession(1, {
+            this.browserSessionId = await browserService.launchSession(this.config.userId || 1, {
                 targetUrl: this.targetUrl,
                 scanId: this.scanId,
                 headless: true,
@@ -2786,7 +3110,7 @@ Start by sending the original request as-is to get a baseline response, then beg
         // Session is dead or was never created — attempt relaunch
         this.log('system', '🌐 Browser session not found. Re-launching headless browser...');
         try {
-            this.browserSessionId = await browserService.launchSession(1, {
+            this.browserSessionId = await browserService.launchSession(this.config.userId || 1, {
                 targetUrl: this.targetUrl,
                 scanId: this.scanId,
                 headless: true,
@@ -2879,6 +3203,7 @@ Start by sending the original request as-is to get a baseline response, then beg
         if (analysis.apiEndpoints?.length > 0) {
             analysis.apiEndpoints.forEach((ep: string) => this.discoveredEndpoints.add(ep));
         }
+        await this.refreshEndpointInventory('browser-tool', false);
 
         return analysis;
     }
@@ -3263,7 +3588,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                 this.log('system', `✓ Delta analysis: ${newEndpoints.length} new endpoint(s) discovered`);
                 this.conversationHistory.push({
                     role: 'user',
-                    content: `[SYSTEM] Frontend analysis update (after ${trigger}): New endpoints: ${newEndpoints.join(', ')}`
+                    content: `[SYSTEM] Frontend analysis update (after ${trigger}): New endpoints: ${newEndpoints.join(', ')}` 
                 });
             }
 
@@ -3274,6 +3599,9 @@ Start by sending the original request as-is to get a baseline response, then beg
 
             this.lastFrontendAnalysis = newAnalysis;
             this.frontendAnalysisVersion++;
+            if (newEndpoints.length > 0) {
+                await this.refreshEndpointInventory(`delta-${trigger}`, false);
+            }
         } catch (e: any) {
             this.log('error', `Delta frontend analysis failed (non-fatal): ${e.message}`);
         }
@@ -3303,6 +3631,7 @@ Start by sending the original request as-is to get a baseline response, then beg
             this.coverageTracker.addRoute(req.path, req.method, 'burp');
             this.coverageTracker.inferWorkflowFromRoute(req.path);
         }
+        await this.refreshEndpointInventory('harvest', false);
 
         // 3. Promote top candidates
         const promoted = this.harvester.getPromotionCandidates(5);
@@ -3460,22 +3789,12 @@ Start by sending the original request as-is to get a baseline response, then beg
                 };
 
                 // Parse response from Burp MCP
-                let mutatedSnapshot: ResponseSnapshot;
-                try {
-                    const respText = response?.content?.[0]?.text || JSON.stringify(response);
-                    const respParsed = JSON.parse(respText);
-                    mutatedSnapshot = {
-                        statusCode: respParsed.statusCode || respParsed.status || 0,
-                        headers: respParsed.headers || {},
-                        body: respParsed.body || respText.substring(0, 5000),
-                    };
-                } catch {
-                    mutatedSnapshot = {
-                        statusCode: 0,
-                        headers: {},
-                        body: JSON.stringify(response).substring(0, 5000),
-                    };
-                }
+                const normalizedResponse = normalizeSendHttpResponse(response);
+                const mutatedSnapshot: ResponseSnapshot = {
+                    statusCode: normalizedResponse.statusCode,
+                    headers: normalizedResponse.headers as Record<string, string>,
+                    body: normalizedResponse.body.substring(0, 5000),
+                };
 
                 // Diff
                 const diff = diffResponses(originalSnapshot, mutatedSnapshot);
@@ -3598,6 +3917,7 @@ Start by sending the original request as-is to get a baseline response, then beg
         promotedRequestCount: number;
         hypothesisCount: Record<string, number>;
         coverageSummary: { routesSeen: number; exercised: number; promoted: number; untested: number; coveragePercentage: number };
+        endpointInventory: EndpointInventorySnapshot | null;
     } {
         const harvSummary = this.harvester.getSummary();
         const covSummary = this.coverageTracker.getSummary();
@@ -3612,6 +3932,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                 untested: covSummary.untestedRoutes.length,
                 coveragePercentage: covSummary.coveragePercentage,
             },
+            endpointInventory: this.endpointInventory,
         };
     }
 }

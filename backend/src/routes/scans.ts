@@ -17,6 +17,8 @@ import {
     getScanLogs,
     saveChatMessage,
     getChatMessages,
+    saveScanConfig,
+    getScanEndpointInventory,
 } from '../db/init';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
 import { logger, logApiUsage } from '../utils/logger';
@@ -30,6 +32,7 @@ import { takePendingRequest } from './penpard';
 import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
 import { browserService } from '../services/BrowserService';
 import { extractRoutes } from '../services/source-analysis/utils/route-extractor';
+import { defaultAuthStartupConfig, redactAuthStartupConfig, resolveAuthStartupConfig, toLegacyIdorUsers } from '../services/web-auth-startup-config';
 import os from 'os';
 
 export const activeAgents = new Map<string, OrchestratorAgent>();
@@ -267,7 +270,27 @@ router.get('/system/select-directory', authenticateToken, async (req: AuthReques
 
 router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: AuthRequest, res: Response) => {
     try {
-        let { url, rateLimit, useNuclei, useFfuf, idorUsers, parallelAgents, scanInstructions, sessionCookies, iterations, maxPlanRounds: reqMaxPlanRounds, sourcePackagePath, sourceAnalysisMode, sourceType, sourceGitUrl, sourceGitToken } = req.body;
+        let {
+            url,
+            rateLimit,
+            useNuclei,
+            useFfuf,
+            idorUsers,
+            parallelAgents,
+            scanInstructions,
+            sessionCookies,
+            iterations,
+            maxPlanRounds: reqMaxPlanRounds,
+            sourcePackagePath,
+            sourceAnalysisMode,
+            sourceType,
+            sourceGitUrl,
+            sourceGitToken,
+            authStartupMode,
+            authCredentials,
+            allowAccountCreation,
+            preferSharedPassword,
+        } = req.body;
         const user = req.user!;
 
         if (typeof idorUsers === 'string') {
@@ -352,11 +375,22 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
         const maxPlanRounds = reqMaxPlanRounds === undefined || reqMaxPlanRounds === null || reqMaxPlanRounds === ''
             ? 0
             : Math.max(0, Math.min(99, Number(reqMaxPlanRounds)));
+        const authStartup = resolveAuthStartupConfig({
+            authStartupMode,
+            authCredentials,
+            allowAccountCreation,
+            preferSharedPassword,
+            idorUsers,
+        });
+        const legacyIdorUsers = authStartup.credentials.length > 0
+            ? toLegacyIdorUsers(authStartup)
+            : (Array.isArray(idorUsers) ? idorUsers : []);
         const scanConfig = {
+            userId: user.id,
             rateLimit: Number(rateLimit) || 5,
             useNuclei: !!useNuclei,
             useFfuf: !!useFfuf,
-            idorUsers: idorUsers || [],
+            idorUsers: legacyIdorUsers,
             parallelAgents: Number(parallelAgents) || 1,
             maxIterations,
             maxPlanRounds,
@@ -364,7 +398,16 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
             sessionCookies: typeof sessionCookies === 'string' ? sessionCookies.trim() || undefined : undefined,
             sourcePackagePath: finalSourcePath,
             sourceAnalysisMode: resolvedSourceMode,
+            authStartup,
         };
+        saveScanConfig(scanId, JSON.stringify({
+            ...scanConfig,
+            idorUsers: legacyIdorUsers.map((entry: any) => ({
+                ...entry,
+                password: entry?.password ? '[REDACTED]' : undefined,
+            })),
+            authStartup: redactAuthStartupConfig(authStartup),
+        }));
 
         // Start scan asynchronously
         startWebScan(scanId, targetUrl, scanConfig).catch(err => {
@@ -493,7 +536,9 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
         const maxPlanRounds = reqMaxPlanRounds === undefined || reqMaxPlanRounds === null || reqMaxPlanRounds === ''
             ? 0
             : Math.max(0, Math.min(99, Number(reqMaxPlanRounds)));
+        const authStartup = defaultAuthStartupConfig();
         const scanConfig = {
+            userId: user.id,
             rateLimit,
             useNuclei: false,
             useFfuf: false,
@@ -506,7 +551,12 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
             initialRequest: entry.rawRequest,
             sourcePackagePath: finalSourcePath,
             sourceAnalysisMode: resolvedSourceMode,
+            authStartup,
         };
+        saveScanConfig(scanId, JSON.stringify({
+            ...scanConfig,
+            authStartup: redactAuthStartupConfig(authStartup),
+        }));
         startWebScan(scanId, targetUrl, scanConfig).catch(err => {
             logger.error('From-Burp scan failed', { scanId, error: err.message });
             updateScanStatus(scanId, 'failed', err.message);
@@ -540,6 +590,8 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
         }
 
         const vulnerabilities = getVulnerabilitiesByScan(id);
+        const agent = activeAgents.get(id);
+        const endpointInventory = agent?.getState?.().endpointInventory || getScanEndpointInventory(id);
 
         res.json({
             id: scan.id,
@@ -551,6 +603,7 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
             message: scan.error_message,
             sourcePackagePath: scan.source_package_path || null,
             sourceAnalysisMode: scan.source_analysis_mode || null,
+            endpointInventory,
             vulnerabilities: vulnerabilities.map(v => ({
                 id: v.id,
                 name: v.name,
@@ -869,6 +922,7 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
         // Create a new agent for continuation (include original Burp request if scan was started from Send to PenPard)
         const initialRequest = (scan.initial_request && String(scan.initial_request).trim()) ? String(scan.initial_request).trim() : undefined;
         const agentConfig = {
+            userId: scan.user_id,
             rateLimit: 5,
             useNuclei: false,
             useFfuf: false,
@@ -1077,7 +1131,8 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
                 burpConnected: true,
                 activeAgents: state.workerCount,
                 workers: state.workers,
-                stats: state.stats
+                stats: state.stats,
+                endpointInventory: null,
             });
         } else if (agent) {
             // Agent is active - return live data
@@ -1107,6 +1162,7 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
                 promotedRequestCount: state.promotedRequestCount || 0,
                 hypothesisCount: state.hypothesisCount || { new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 },
                 coverageSummary: state.coverageSummary || null,
+                endpointInventory: state.endpointInventory || null,
             });
         } else {
             // No active agent - check memory cache first, then DB
@@ -1140,6 +1196,7 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
                 burpConnected: isCompleted ? null : false,
                 activeAgents: activeAgents.size + activePools.size,
                 scanCompleted: isCompleted,
+                endpointInventory: getScanEndpointInventory(id),
             });
         }
     } catch (error: any) {
@@ -1199,7 +1256,17 @@ router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res
 // Async scan functions
 
 async function startWebScan(scanId: string, targetUrl: string, config: any = {}): Promise<void> {
-    logger.info('Starting web scan', { scanId, targetUrl, config });
+    logger.info('Starting web scan', {
+        scanId,
+        targetUrl,
+        config: {
+            ...config,
+            idorUsers: Array.isArray(config.idorUsers)
+                ? config.idorUsers.map((entry: any) => ({ ...entry, password: entry?.password ? '[REDACTED]' : undefined }))
+                : [],
+            authStartup: config.authStartup ? redactAuthStartupConfig(config.authStartup) : undefined,
+        },
+    });
 
     updateScanStatus(scanId, 'initializing');
 
@@ -1217,17 +1284,13 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
         if (mcpAvailable) {
             logger.info('Using Burp MCP for scanning', { scanId });
 
-            const explicitAuthRequested = Boolean(
-                (typeof config.sessionCookies === 'string' && config.sessionCookies.trim()) ||
-                (Array.isArray(config.idorUsers) && config.idorUsers.length > 0) ||
-                (typeof config.initialRequest === 'string' && /(^(cookie|authorization):)/im.test(config.initialRequest))
-            );
             const requestedParallelAgents = config.parallelAgents || 1;
-            const parallelAgents = explicitAuthRequested && requestedParallelAgents > 1 ? 1 : requestedParallelAgents;
+            const authFirstStartupRequired = true;
+            const parallelAgents = authFirstStartupRequired ? 1 : requestedParallelAgents;
             logger.info(`parallelAgents config value: ${requestedParallelAgents} (effective: ${parallelAgents})`, { scanId, config });
 
-            if (explicitAuthRequested && requestedParallelAgents > 1) {
-                logger.warn('Authenticated scan requested in parallel mode; forcing single-agent execution because AgentPool does not yet propagate AuthStateManager state safely.', {
+            if (requestedParallelAgents > 1) {
+                logger.warn('Web Scan startup now requires a single orchestrator so browser-driven auth inventory, Burp traffic correlation, and session state stay consistent across the scan lifecycle.', {
                     scanId,
                     requestedParallelAgents,
                 });
@@ -1271,6 +1334,7 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
             } else {
                 // Single agent mode (original behavior)
                 const agentConfig = {
+                    userId: config.userId,
                     rateLimit: config.rateLimit || 5,
                     maxIterations: config.maxIterations,
                     maxPlanRounds: config.maxPlanRounds,
@@ -1281,6 +1345,7 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
                     initialRequest: config.initialRequest,
                     sourcePackagePath: config.sourcePackagePath,
                     sourceAnalysisMode: config.sourceAnalysisMode,
+                    authStartup: config.authStartup || defaultAuthStartupConfig(),
                 };
 
                 const agent = new OrchestratorAgent(scanId, targetUrl, agentConfig, burpMCP);
@@ -1315,7 +1380,6 @@ async function startWebScan(scanId: string, targetUrl: string, config: any = {})
             return;
         }
 
-        updateScanStatus(scanId, 'completed');
         logger.info('Web scan completed', { scanId });
     } catch (error: any) {
         logger.error('Web scan error', { scanId, error: error.message });

@@ -246,3 +246,57 @@ test('warning is emitted when a Burp-originated request leaves without Authoriza
     assert.match(String(result.authWarning || ''), /without Authorization/i);
     assert.ok(agent.getLogs().some(line => line.includes('Auth Warning')));
 });
+
+test('round-one fallback plan stays auth-first for no-credential web startup', () => {
+    const burp = new FakeBurp();
+    const agent = createAgent({
+        authStartup: {
+            mode: 'no_credentials',
+            credentials: [],
+            allowAccountCreation: true,
+            preferSharedPassword: true,
+        },
+    }, burp);
+
+    (agent as any).planRound = 1;
+    (agent as any).startupAuthInventory = {
+        mode: 'no_credentials',
+        status: 'completed',
+        browserSessionId: 'browser-1',
+        authRoutes: ['/login', '/register', '/forgot-password'],
+        forms: [],
+        domElements: [],
+        traffic: [],
+        actions: [],
+        discoveredCredentials: [],
+        ssoProviders: ['Google'],
+        blockers: [],
+        registrationAvailable: true,
+        passwordResetAvailable: true,
+        activationRequired: false,
+        transport: {
+            carriesAuthorizationHeader: false,
+            authorizationSchemes: [],
+            cookieNames: ['session'],
+            localStorageKeys: [],
+            sessionStorageKeys: [],
+            indexedDbNames: [],
+            csrfHeaders: ['x-csrf-token'],
+            csrfFormFields: ['_csrf'],
+            csrfMetaNames: ['csrf-token'],
+            csrfCookieNames: [],
+            mixedTransport: false,
+            evidence: ['traffic=3'],
+        },
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        summary: 'Auth-first startup summary',
+    };
+
+    const plan = (agent as any).createFallbackPlan();
+
+    assert.match(plan.analysis, /auth/i);
+    assert.match(plan.steps[0].objective, /auth|register|login/i);
+    assert.ok(plan.steps[0].tools.includes('browser_navigate'));
+    assert.ok(plan.steps[1].tools.includes('browser_fill_and_submit'));
+});

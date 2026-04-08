@@ -111,6 +111,9 @@ export async function initDatabase(): Promise<void> {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       completed_at DATETIME,
       error_message TEXT,
+      scan_config_json TEXT,
+      auth_inventory_json TEXT,
+      endpoint_inventory_json TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
@@ -432,6 +435,18 @@ export async function initDatabase(): Promise<void> {
     db.exec('ALTER TABLE scans ADD COLUMN source_analysis_result_json TEXT');
     logger.info('Added scans.source_analysis_result_json column');
   }
+  if (!scanCols.some((c) => c.name === 'scan_config_json')) {
+    db.exec('ALTER TABLE scans ADD COLUMN scan_config_json TEXT');
+    logger.info('Added scans.scan_config_json column');
+  }
+  if (!scanCols.some((c) => c.name === 'auth_inventory_json')) {
+    db.exec('ALTER TABLE scans ADD COLUMN auth_inventory_json TEXT');
+    logger.info('Added scans.auth_inventory_json column');
+  }
+  if (!scanCols.some((c) => c.name === 'endpoint_inventory_json')) {
+    db.exec('ALTER TABLE scans ADD COLUMN endpoint_inventory_json TEXT');
+    logger.info('Added scans.endpoint_inventory_json column');
+  }
 
   // Migration: browser_sessions.label (user-friendly session names for multi-session testing)
   const browserCols = db.prepare('PRAGMA table_info(browser_sessions)').all() as { name: string }[];
@@ -486,6 +501,24 @@ export const setScanInitialRequest = (scanId: string, rawRequest: string | null)
 
 export const saveSourceAnalysisResult = (scanId: string, resultJson: string) => {
   return db.prepare('UPDATE scans SET source_analysis_result_json = ? WHERE id = ?').run(resultJson, scanId);
+};
+
+export const saveScanConfig = (scanId: string, configJson: string) => {
+  return db.prepare('UPDATE scans SET scan_config_json = ? WHERE id = ?').run(configJson, scanId);
+};
+
+export const saveScanAuthInventory = (scanId: string, inventoryJson: string) => {
+  return db.prepare('UPDATE scans SET auth_inventory_json = ? WHERE id = ?').run(inventoryJson, scanId);
+};
+
+export const saveScanEndpointInventory = (scanId: string, inventoryJson: string) => {
+  return db.prepare('UPDATE scans SET endpoint_inventory_json = ? WHERE id = ?').run(inventoryJson, scanId);
+};
+
+export const getScanEndpointInventory = (scanId: string): any | null => {
+  const row = db.prepare('SELECT endpoint_inventory_json FROM scans WHERE id = ?').get(scanId) as any;
+  if (!row?.endpoint_inventory_json) return null;
+  try { return JSON.parse(row.endpoint_inventory_json); } catch { return null; }
 };
 
 export const getSourceAnalysisResult = (scanId: string): any | null => {

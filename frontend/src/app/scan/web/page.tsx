@@ -78,6 +78,29 @@ interface ScanStatus {
     vulnerabilities: any[];
 }
 
+type AuthStartupMode = 'no_credentials' | 'provided_credentials';
+type CredentialPrivilege = 'low' | 'high' | 'unknown';
+
+interface StartupCredentialRow {
+    username: string;
+    email: string;
+    password: string;
+    role: string;
+    privilege: CredentialPrivilege;
+    label: string;
+}
+
+function createEmptyCredentialRow(): StartupCredentialRow {
+    return {
+        username: '',
+        email: '',
+        password: '',
+        role: 'user',
+        privilege: 'unknown',
+        label: '',
+    };
+}
+
 export default function WebScanPage() {
     const router = useRouter();
     const { isAuthenticated } = useAuthStore();
@@ -85,11 +108,14 @@ export default function WebScanPage() {
     const [targetUrl, setTargetUrl] = useState('');
     const [scanInstructions, setScanInstructions] = useState('');
     const [sessionCookies, setSessionCookies] = useState('');
+    const [authStartupMode, setAuthStartupMode] = useState<AuthStartupMode>('no_credentials');
+    const [allowAccountCreation, setAllowAccountCreation] = useState(false);
+    const [preferSharedPassword, setPreferSharedPassword] = useState(true);
     const [rateLimit, setRateLimit] = useState(() => getDefaultScanOptions().rateLimit);
     const [parallelAgents, setParallelAgents] = useState(() => getDefaultScanOptions().parallelAgents);
     const [iterations, setIterations] = useState(() => getDefaultScanOptions().iterations);
     const [maxPlanRounds, setMaxPlanRounds] = useState(() => getDefaultScanOptions().maxPlanRounds);
-    const [userAccounts, setUserAccounts] = useState([{ username: '', password: '', role: 'user' }]);
+    const [userAccounts, setUserAccounts] = useState<StartupCredentialRow[]>([createEmptyCredentialRow()]);
     const [sourcePackagePath, setSourcePackagePath] = useState('');
     const [sourceAnalysisMode, setSourceAnalysisMode] = useState<string | null>(null);
     const [sourceType, setSourceType] = useState<SourceType>('local');
@@ -236,6 +262,22 @@ export default function WebScanPage() {
         }
 
         const fullUrl = targetUrl.startsWith('http') ? targetUrl : `https://${targetUrl}`;
+        const providedCredentials = userAccounts
+            .map((account) => ({
+                username: account.username.trim(),
+                email: account.email.trim(),
+                password: account.password,
+                role: account.role,
+                privilege: account.privilege,
+                label: account.label.trim(),
+            }))
+            .filter((account) => (account.username || account.email) && account.password.trim());
+        const startupCredentials = authStartupMode === 'provided_credentials' ? providedCredentials : [];
+
+        if (authStartupMode === 'provided_credentials' && startupCredentials.length === 0) {
+            toast.error('Add at least one username/email and password for "Start with provided credentials".');
+            return;
+        }
 
         setScanStatus({
             id: null,
@@ -255,7 +297,11 @@ export default function WebScanPage() {
             formData.append('maxPlanRounds', String(maxPlanRounds));
             formData.append('useNuclei', String(externalTools.nuclei));
             formData.append('useFfuf', String(externalTools.ffuf));
-            formData.append('idorUsers', JSON.stringify(userAccounts.filter(u => u.username && u.password)));
+            formData.append('authStartupMode', authStartupMode);
+            formData.append('authCredentials', JSON.stringify(startupCredentials));
+            formData.append('allowAccountCreation', String(allowAccountCreation));
+            formData.append('preferSharedPassword', String(preferSharedPassword));
+            formData.append('idorUsers', JSON.stringify(startupCredentials));
             if (scanInstructions.trim()) formData.append('scanInstructions', scanInstructions.trim());
             if (sessionCookies.trim()) formData.append('sessionCookies', sessionCookies.trim());
 
@@ -496,9 +542,70 @@ export default function WebScanPage() {
                         />
                     </div>
 
+                    <div className="mt-4">
+                        <label className="block text-gray-400 text-sm mb-3">Auth Startup Mode</label>
+                        <div className="grid gap-3 md:grid-cols-2">
+                            <button
+                                type="button"
+                                disabled={isScanning}
+                                onClick={() => setAuthStartupMode('no_credentials')}
+                                className={`text-left rounded-lg border px-4 py-3 transition-colors ${
+                                    authStartupMode === 'no_credentials'
+                                        ? 'border-cyan-500/60 bg-cyan-500/10 text-white'
+                                        : 'border-dark-600 bg-dark-900 text-gray-300 hover:border-cyan-500/30'
+                                }`}
+                            >
+                                <div className="font-medium">Start without credentials</div>
+                                <div className="mt-1 text-xs text-gray-400">PenPard begins with browser-first discovery of login, register, reset, SSO, MFA, onboarding, and recovery surfaces.</div>
+                            </button>
+                            <button
+                                type="button"
+                                disabled={isScanning}
+                                onClick={() => setAuthStartupMode('provided_credentials')}
+                                className={`text-left rounded-lg border px-4 py-3 transition-colors ${
+                                    authStartupMode === 'provided_credentials'
+                                        ? 'border-cyan-500/60 bg-cyan-500/10 text-white'
+                                        : 'border-dark-600 bg-dark-900 text-gray-300 hover:border-cyan-500/30'
+                                }`}
+                            >
+                                <div className="font-medium">Start with provided credentials</div>
+                                <div className="mt-1 text-xs text-gray-400">PenPard still locates the auth entry point in-browser first, then signs in and captures the real session transport from browser and Burp evidence.</div>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="mt-4 grid gap-3 md:grid-cols-2">
+                        <label className="flex items-start gap-3 rounded-lg border border-dark-600 bg-dark-900 px-4 py-3 text-sm text-gray-300">
+                            <input
+                                type="checkbox"
+                                checked={allowAccountCreation}
+                                onChange={(e) => setAllowAccountCreation(e.target.checked)}
+                                disabled={isScanning}
+                                className="mt-0.5"
+                            />
+                            <span>
+                                <span className="block font-medium text-white">Allow account creation</span>
+                                <span className="mt-1 block text-xs text-gray-400">If registration or onboarding is available, PenPard may create test accounts during startup and preserve them for later authz testing.</span>
+                            </span>
+                        </label>
+                        <label className="flex items-start gap-3 rounded-lg border border-dark-600 bg-dark-900 px-4 py-3 text-sm text-gray-300">
+                            <input
+                                type="checkbox"
+                                checked={preferSharedPassword}
+                                onChange={(e) => setPreferSharedPassword(e.target.checked)}
+                                disabled={isScanning}
+                                className="mt-0.5"
+                            />
+                            <span>
+                                <span className="block font-medium text-white">Prefer shared password for generated users</span>
+                                <span className="mt-1 block text-xs text-gray-400">When PenPard creates multiple accounts, it reuses one password unless the target blocks that pattern.</span>
+                            </span>
+                        </label>
+                    </div>
+
                     {/* Authenticated testing tip */}
                     <div className="mt-4 p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-sm text-gray-300">
-                        <strong className="text-cyan-400">Authenticated test:</strong> Browse the target in your browser through Burp and log in first; PenPard will use cookies from proxy history for authenticated requests. You can also paste a Cookie header below.
+                        <strong className="text-cyan-400">Browser-first auth startup:</strong> PenPard launches its Burp-proxied browser before normal planning, inventories auth routes/forms/buttons, correlates the resulting traffic, and captures reusable session state. Paste cookies below only if you already have a known session you want to seed.
                     </div>
 
                     {/* Session cookies (authenticated testing, e.g. Google login) */}
@@ -581,7 +688,7 @@ export default function WebScanPage() {
                             <label className="block text-gray-400 text-sm mb-2 flex items-center gap-2">
                                 <Zap className="w-4 h-4 text-amber-400" />
                                 Parallel Agents: <span className="text-cyan-400 font-bold">{parallelAgents}</span>
-                                {parallelAgents > 1 && <span className="text-amber-400 text-xs">(Multi-Agent Mode)</span>}
+                                <span className="text-amber-400 text-xs">(Web auth-first startup runs single-orchestrator)</span>
                             </label>
                             <div className="flex items-center gap-4">
                                 <input
@@ -617,10 +724,7 @@ export default function WebScanPage() {
                                 </div>
                             </div>
                             <p className="text-gray-500 text-xs mt-2">
-                                {parallelAgents === 1
-                                    ? 'Standard single-agent scan'
-                                    : `${parallelAgents} agents scanning in parallel (faster but uses more resources)`
-                                }
+                                Web Scan startup now keeps one orchestrator so browser-driven auth discovery, Burp traffic correlation, and captured session state stay consistent across the full run.
                             </p>
                         </div>
 
@@ -656,70 +760,120 @@ export default function WebScanPage() {
                             <p className="text-gray-500 text-xs mt-1">0 = model decides when to finish; 1–99 = fixed number of planning rounds.</p>
                         </div>
 
-                        {/* User Accounts */}
+                        {/* Provided Credentials */}
                         <div>
                             <div className="flex items-center justify-between mb-3">
-                                <label className="block text-gray-400 text-sm">User Accounts (IDOR Testing)</label>
+                                <label className="block text-gray-400 text-sm">Provided Credentials</label>
                                 <button
-                                    onClick={() => setUserAccounts([...userAccounts, { username: '', password: '', role: 'user' }])}
+                                    type="button"
+                                    onClick={() => setUserAccounts([...userAccounts, createEmptyCredentialRow()])}
+                                    disabled={isScanning || authStartupMode !== 'provided_credentials'}
                                     className="text-cyan-400 text-xs hover:underline"
                                 >
-                                    + Add Account
+                                    + Add Credential
                                 </button>
                             </div>
-                            <div className="space-y-3">
-                                {userAccounts.map((acc, idx) => (
-                                    <div key={idx} className="grid grid-cols-[1fr_1fr_auto_auto] gap-3 items-center">
-                                        <input
-                                            type="text"
-                                            placeholder="Username or email"
-                                            value={acc.username}
-                                            onChange={(e) => {
-                                                const newAccs = [...userAccounts];
-                                                newAccs[idx].username = e.target.value;
-                                                setUserAccounts(newAccs);
-                                            }}
-                                            className="input-field text-sm w-full min-w-0"
-                                        />
-                                        <input
-                                            type="password"
-                                            placeholder="Password / Token / Cookie"
-                                            value={acc.password}
-                                            onChange={(e) => {
-                                                const newAccs = [...userAccounts];
-                                                newAccs[idx].password = e.target.value;
-                                                setUserAccounts(newAccs);
-                                            }}
-                                            className="input-field text-sm w-full min-w-0"
-                                        />
-                                        <select
-                                            value={acc.role}
-                                            onChange={(e) => {
-                                                const newAccs = [...userAccounts];
-                                                newAccs[idx].role = e.target.value;
-                                                setUserAccounts(newAccs);
-                                            }}
-                                            className="input-field text-sm w-28"
-                                        >
-                                            <option value="user">User</option>
-                                            <option value="admin">Admin</option>
-                                        </select>
-                                        {userAccounts.length > 1 ? (
-                                            <button
-                                                onClick={() => setUserAccounts(userAccounts.filter((_, i) => i !== idx))}
-                                                className="text-red-400 hover:bg-red-500/10 p-2 rounded flex-shrink-0"
-                                            >
-                                                <XCircle className="w-4 h-4" />
-                                            </button>
-                                        ) : (
-                                            <div className="w-8" />
-                                        )}
+                            {authStartupMode === 'provided_credentials' ? (
+                                <>
+                                    <div className="space-y-3">
+                                        {userAccounts.map((acc, idx) => (
+                                            <div key={idx} className="rounded-lg border border-dark-700 bg-dark-900/70 p-3">
+                                                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1.2fr_1.2fr_1fr_0.9fr_0.9fr_auto]">
+                                                    <input
+                                                        type="text"
+                                                        placeholder="Username"
+                                                        value={acc.username}
+                                                        onChange={(e) => {
+                                                            const newAccs = [...userAccounts];
+                                                            newAccs[idx].username = e.target.value;
+                                                            setUserAccounts(newAccs);
+                                                        }}
+                                                        className="input-field text-sm w-full min-w-0"
+                                                    />
+                                                    <input
+                                                        type="email"
+                                                        placeholder="Email"
+                                                        value={acc.email}
+                                                        onChange={(e) => {
+                                                            const newAccs = [...userAccounts];
+                                                            newAccs[idx].email = e.target.value;
+                                                            setUserAccounts(newAccs);
+                                                        }}
+                                                        className="input-field text-sm w-full min-w-0"
+                                                    />
+                                                    <input
+                                                        type="password"
+                                                        placeholder="Password"
+                                                        value={acc.password}
+                                                        onChange={(e) => {
+                                                            const newAccs = [...userAccounts];
+                                                            newAccs[idx].password = e.target.value;
+                                                            setUserAccounts(newAccs);
+                                                        }}
+                                                        className="input-field text-sm w-full min-w-0"
+                                                    />
+                                                    <input
+                                                        type="text"
+                                                        placeholder="Label (optional)"
+                                                        value={acc.label}
+                                                        onChange={(e) => {
+                                                            const newAccs = [...userAccounts];
+                                                            newAccs[idx].label = e.target.value;
+                                                            setUserAccounts(newAccs);
+                                                        }}
+                                                        className="input-field text-sm w-full min-w-0"
+                                                    />
+                                                    <select
+                                                        value={acc.role}
+                                                        onChange={(e) => {
+                                                            const newAccs = [...userAccounts];
+                                                            newAccs[idx].role = e.target.value;
+                                                            setUserAccounts(newAccs);
+                                                        }}
+                                                        className="input-field text-sm"
+                                                    >
+                                                        <option value="user">User</option>
+                                                        <option value="admin">Admin</option>
+                                                        <option value="manager">Manager</option>
+                                                        <option value="unknown">Unknown</option>
+                                                    </select>
+                                                    <select
+                                                        value={acc.privilege}
+                                                        onChange={(e) => {
+                                                            const newAccs = [...userAccounts];
+                                                            newAccs[idx].privilege = e.target.value as CredentialPrivilege;
+                                                            setUserAccounts(newAccs);
+                                                        }}
+                                                        className="input-field text-sm"
+                                                    >
+                                                        <option value="unknown">Unknown Priv</option>
+                                                        <option value="low">Low Priv</option>
+                                                        <option value="high">High Priv</option>
+                                                    </select>
+                                                    {userAccounts.length > 1 ? (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setUserAccounts(userAccounts.filter((_, i) => i !== idx))}
+                                                            className="text-red-400 hover:bg-red-500/10 p-2 rounded flex-shrink-0"
+                                                        >
+                                                            <XCircle className="w-4 h-4" />
+                                                        </button>
+                                                    ) : (
+                                                        <div className="w-8" />
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ))}
                                     </div>
-                                ))}
-                            </div>
-                            <p className="text-gray-500 text-xs mt-2">
-                                Add multiple user accounts to test for IDOR and privilege escalation vulnerabilities
-                            </p>
+                                    <p className="text-gray-500 text-xs mt-2">
+                                        Supply one or more identities for startup login. PenPard will use them to locate the real auth flow, sign in in-browser, capture session transport, and preserve users for later authorization testing.
+                                    </p>
+                                </>
+                            ) : (
+                                <div className="rounded-lg border border-dark-700 bg-dark-900/50 px-4 py-3 text-sm text-gray-400">
+                                    Startup is set to <span className="text-cyan-400 font-medium">Start without credentials</span>. PenPard will begin by discovering login, register, reset, SSO, MFA, onboarding, and recovery surfaces before generic crawling.
+                                </div>
+                            )}
                         </div>
 
                         {/* External Tools */}

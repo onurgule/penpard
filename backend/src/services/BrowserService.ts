@@ -26,7 +26,9 @@ import {
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { createHash } from 'crypto';
 import { execSync, exec } from 'child_process';
+import { normalizeProxyHistoryItems } from './burp-tool-result';
 
 // ── Types ──
 
@@ -58,6 +60,55 @@ export interface PageState {
     textSummary: string;
 }
 
+export interface BrowserTrafficEvent {
+    id: number;
+    kind: 'request' | 'response';
+    method: string;
+    url: string;
+    timestamp: string;
+    originCategory?: 'target' | 'internal' | 'external';
+    resourceType?: string;
+    requestHeaders?: Record<string, string>;
+    responseHeaders?: Record<string, string>;
+    requestBody?: string;
+    statusCode?: number;
+}
+
+export interface CapturedJsArtifact {
+    id: string;
+    sessionId: string;
+    scanId?: string;
+    pageUrl: string;
+    scriptUrl?: string;
+    origin: string;
+    type: 'external' | 'inline';
+    contentType: string;
+    contentHash: string;
+    bytes: number;
+    storedAt: string;
+    filePath: string;
+    evidence: string[];
+}
+
+interface BrowserContinuitySnapshot {
+    url: string;
+    cookies: Array<{
+        name: string;
+        value: string;
+        domain: string;
+        path: string;
+        expires: number;
+        httpOnly: boolean;
+        secure: boolean;
+        sameSite: 'Strict' | 'Lax' | 'None';
+    }>;
+    storage: Array<{
+        origin: string;
+        localStorageData: Record<string, string>;
+        sessionStorageData: Record<string, string>;
+    }>;
+}
+
 interface LiveSession {
     browser: Browser;
     context: BrowserContext;
@@ -65,6 +116,9 @@ interface LiveSession {
     sessionId: string;
     userId: number;
     userDataDir: string;
+    scanId?: string;
+    targetUrl?: string;
+    targetOrigin: string | null;
     /** Whether this session is currently running in headless mode. */
     isHeadless: boolean;
     /** Proxy server string for relaunches (e.g. "http://127.0.0.1:8080"). */
@@ -75,12 +129,372 @@ interface LiveSession {
     brandingExtPath: string | null;
     /** Lock to prevent concurrent show/hide transitions. */
     transitioning: boolean;
+    /** Rolling capture of browser-generated traffic for auth/session correlation. */
+    networkEvents: BrowserTrafficEvent[];
+    nextTrafficEventId: number;
+    jsArtifacts: Map<string, CapturedJsArtifact>;
+    jsArtifactsDir: string | null;
 }
 
 // ── Service ──
 
 class BrowserService {
     private sessions: Map<string, LiveSession> = new Map();
+
+    private recordTrafficEvent(sessionId: string, event: Omit<BrowserTrafficEvent, 'id'>): void {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+
+        session.networkEvents.push({
+            id: session.nextTrafficEventId++,
+            ...event,
+        });
+
+        if (session.networkEvents.length > 500) {
+            session.networkEvents.splice(0, session.networkEvents.length - 500);
+        }
+    }
+
+    private getTargetOrigin(targetUrl?: string): string | null {
+        if (!targetUrl) return null;
+        try {
+            return new URL(targetUrl).origin;
+        } catch {
+            return null;
+        }
+    }
+
+    private ensureJsArtifactsDir(scanId: string, sessionId: string): string {
+        const dir = path.join(os.homedir(), '.penpard', 'scan_runtime', scanId, 'js-artifacts', sessionId);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        return dir;
+    }
+
+    private ensureVisibilityTransitionDir(session: LiveSession, targetHeadless: boolean): string {
+        const parentDir = path.dirname(session.userDataDir);
+        const dirName = `${session.sessionId}-${targetHeadless ? 'headless' : 'visible'}-${Date.now()}`;
+        const nextDir = path.join(parentDir, dirName);
+        if (!fs.existsSync(nextDir)) {
+            fs.mkdirSync(nextDir, { recursive: true });
+        }
+        return nextDir;
+    }
+
+    private buildLaunchArgs(proxyServer: string, brandingExtPath: string | null, headless: boolean): string[] {
+        const launchArgs: string[] = [
+            `--proxy-server=${proxyServer}`,
+            '--ignore-certificate-errors',
+            '--ignore-certificate-errors-spki-list',
+            '--disable-web-security',
+            '--allow-running-insecure-content',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-blink-features=AutomationControlled',
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        ];
+
+        if (brandingExtPath && !headless) {
+            launchArgs.push(
+                `--disable-extensions-except=${brandingExtPath}`,
+                `--load-extension=${brandingExtPath}`,
+            );
+        }
+
+        return launchArgs;
+    }
+
+    private categorizeUrl(url: string, targetOrigin: string | null): 'target' | 'internal' | 'external' {
+        if (!url) return 'external';
+        try {
+            const parsed = new URL(url);
+            if (targetOrigin && parsed.origin === targetOrigin) {
+                return 'target';
+            }
+            if (this.isPenPardInternalUrl(url, targetOrigin)) {
+                return 'internal';
+            }
+        } catch {
+            return 'external';
+        }
+        return 'external';
+    }
+
+    private isPenPardInternalUrl(url: string, targetOrigin: string | null): boolean {
+        if (!url) return false;
+        try {
+            const parsed = new URL(url);
+            if (targetOrigin && parsed.origin === targetOrigin) {
+                return false;
+            }
+            if (parsed.protocol === 'file:' || parsed.protocol === 'app:' || parsed.protocol === 'electron:') {
+                return true;
+            }
+            const host = parsed.hostname.toLowerCase();
+            const port = parsed.port;
+            const isLocalHost = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+            const isPenPardPort = port === '3000' || port === '4000';
+            const looksLikeApi = parsed.pathname.startsWith('/api/');
+            return (isLocalHost && isPenPardPort) || (isLocalHost && looksLikeApi);
+        } catch {
+            return false;
+        }
+    }
+
+    private async persistJsArtifact(session: LiveSession, artifact: {
+        type: 'external' | 'inline';
+        pageUrl: string;
+        scriptUrl?: string;
+        contentType?: string;
+        content: string;
+        evidence?: string[];
+    }): Promise<CapturedJsArtifact | null> {
+        if (!session.jsArtifactsDir || !artifact.content || !artifact.content.trim()) {
+            return null;
+        }
+
+        const contentHash = createHash('sha256').update(artifact.content).digest('hex');
+        const existing = session.jsArtifacts.get(contentHash);
+        if (existing) {
+            return existing;
+        }
+
+        const ext = artifact.type === 'inline' ? 'inline.js' : 'bundle.js';
+        const filePath = path.join(session.jsArtifactsDir, `${contentHash}.${ext}`);
+        if (!fs.existsSync(filePath)) {
+            fs.writeFileSync(filePath, artifact.content, 'utf8');
+        }
+
+        const record: CapturedJsArtifact = {
+            id: `js-${contentHash.slice(0, 16)}`,
+            sessionId: session.sessionId,
+            scanId: session.scanId,
+            pageUrl: artifact.pageUrl,
+            scriptUrl: artifact.scriptUrl,
+            origin: (() => {
+                try {
+                    return new URL(artifact.scriptUrl || artifact.pageUrl).origin;
+                } catch {
+                    return '';
+                }
+            })(),
+            type: artifact.type,
+            contentType: artifact.contentType || 'application/javascript',
+            contentHash,
+            bytes: Buffer.byteLength(artifact.content, 'utf8'),
+            storedAt: new Date().toISOString(),
+            filePath,
+            evidence: artifact.evidence || [],
+        };
+
+        session.jsArtifacts.set(contentHash, record);
+        return record;
+    }
+
+    private async captureScriptResponse(session: LiveSession, response: any): Promise<void> {
+        if (!session.jsArtifactsDir) return;
+
+        const request = response.request();
+        if (request.resourceType() !== 'script') return;
+
+        const scriptUrl = response.url();
+        if (this.isPenPardInternalUrl(scriptUrl, session.targetOrigin)) {
+            return;
+        }
+
+        let body: Buffer;
+        try {
+            body = await response.body();
+        } catch {
+            return;
+        }
+
+        if (!body || body.length === 0 || body.length > 1_500_000) {
+            return;
+        }
+
+        const content = body.toString('utf8');
+        await this.persistJsArtifact(session, {
+            type: 'external',
+            pageUrl: session.page.url(),
+            scriptUrl,
+            contentType: response.headers()['content-type'] || 'application/javascript',
+            content,
+            evidence: [`resourceType=script`, `status=${response.status()}`],
+        });
+    }
+
+    private async captureContinuitySnapshot(session: LiveSession): Promise<BrowserContinuitySnapshot> {
+        const currentUrl = (() => {
+            try {
+                return session.page.url() || session.targetUrl || 'about:blank';
+            } catch {
+                return session.targetUrl || 'about:blank';
+            }
+        })();
+
+        let cookies: BrowserContinuitySnapshot['cookies'] = [];
+        try {
+            cookies = await session.context.cookies();
+        } catch {
+            cookies = [];
+        }
+
+        const storage = await session.page.evaluate(`(() => {
+            const localStorageData = {};
+            const sessionStorageData = {};
+            try {
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key) localStorageData[key] = localStorage.getItem(key) || '';
+                }
+            } catch {}
+            try {
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const key = sessionStorage.key(i);
+                    if (key) sessionStorageData[key] = sessionStorage.getItem(key) || '';
+                }
+            } catch {}
+            return [{
+                origin: window.location.origin,
+                localStorageData,
+                sessionStorageData,
+            }];
+        })()`).catch(() => []);
+
+        return {
+            url: currentUrl,
+            cookies: cookies as BrowserContinuitySnapshot['cookies'],
+            storage: Array.isArray(storage) ? storage : [],
+        };
+    }
+
+    private async applyContinuitySnapshot(context: BrowserContext, snapshot: BrowserContinuitySnapshot): Promise<void> {
+        if (snapshot.cookies.length > 0) {
+            await context.addCookies(snapshot.cookies as any).catch(() => {});
+        }
+
+        if (snapshot.storage.length > 0) {
+            await context.addInitScript((origins: BrowserContinuitySnapshot['storage']) => {
+                const browserGlobal = globalThis as any;
+                for (const originState of origins) {
+                    if (browserGlobal.location?.origin !== originState.origin) continue;
+                    for (const [key, value] of Object.entries(originState.localStorageData || {})) {
+                        try { browserGlobal.localStorage?.setItem(key, value); } catch {}
+                    }
+                    for (const [key, value] of Object.entries(originState.sessionStorageData || {})) {
+                        try { browserGlobal.sessionStorage?.setItem(key, value); } catch {}
+                    }
+                }
+            }, snapshot.storage as any).catch(() => {});
+        }
+    }
+
+    private async waitForSessionReady(sessionId: string, timeoutMs: number = 15000): Promise<LiveSession> {
+        const started = Date.now();
+        while (Date.now() - started < timeoutMs) {
+            const session = this.sessions.get(sessionId);
+            if (session && !session.transitioning) {
+                return session;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            throw new Error(`Session ${sessionId} not found or not active`);
+        }
+        return session;
+    }
+
+    private attachSessionListeners(sessionId: string, page: Page, context: BrowserContext): void {
+        const session = this.sessions.get(sessionId);
+        const targetOrigin = session?.targetOrigin || null;
+
+        context.route('**/*', async (route: any) => {
+            const request = route.request();
+            const requestUrl = request.url();
+            if (this.isPenPardInternalUrl(requestUrl, targetOrigin)) {
+                logger.warn('Blocked internal-origin browser request from scan session', {
+                    sessionId,
+                    requestUrl,
+                    resourceType: request.resourceType(),
+                });
+                await route.abort();
+                return;
+            }
+            await route.continue();
+        }).catch(() => {});
+
+        page.on('framenavigated', (frame: any) => {
+            if (frame === page.mainFrame()) {
+                const url = page.url();
+                updateBrowserSession(sessionId, {
+                    current_url: url,
+                    last_activity_at: new Date().toISOString(),
+                });
+                addBrowserAction({
+                    sessionId,
+                    actionType: 'page_load',
+                    actionData: JSON.stringify({ url }),
+                    pageUrl: url,
+                    pageTitle: '',
+                    source: 'system',
+                });
+            }
+        });
+
+        page.on('request', (request: any) => {
+            this.recordTrafficEvent(sessionId, {
+                kind: 'request',
+                method: request.method(),
+                url: request.url(),
+                timestamp: new Date().toISOString(),
+                originCategory: this.categorizeUrl(request.url(), targetOrigin),
+                resourceType: request.resourceType(),
+                requestHeaders: request.headers(),
+                requestBody: request.postData() || undefined,
+            });
+        });
+
+        page.on('response', async (response: any) => {
+            let responseHeaders: Record<string, string> = {};
+            try {
+                responseHeaders = await response.allHeaders();
+            } catch {
+                try {
+                    responseHeaders = response.headers();
+                } catch {
+                    responseHeaders = {};
+                }
+            }
+
+            this.recordTrafficEvent(sessionId, {
+                kind: 'response',
+                method: response.request().method(),
+                url: response.url(),
+                timestamp: new Date().toISOString(),
+                originCategory: this.categorizeUrl(response.url(), targetOrigin),
+                resourceType: response.request().resourceType(),
+                requestHeaders: response.request().headers(),
+                statusCode: response.status(),
+                responseHeaders,
+            });
+
+            const liveSession = this.sessions.get(sessionId);
+            if (liveSession) {
+                void this.captureScriptResponse(liveSession, response).catch((error: any) => {
+                    logger.debug('Script artifact capture failed', { sessionId, error: error.message });
+                });
+            }
+        });
+
+        context.on('close', () => {
+            logger.info('Browser context closed', { sessionId });
+            this.sessions.delete(sessionId);
+            dbCloseSession(sessionId);
+        });
+    }
 
     /**
      * Resolve the path to the PenPard Browser branding extension.
@@ -376,30 +790,12 @@ public class PenPardIconChanger {
 
         try {
             const executablePath = await this.resolveChromiumPath();
+            const isHeadless = options.headless ?? false;
 
             // Resolve PenPard Browser branding extension
             const brandingExtPath = this.resolveBrandingExtensionPath();
 
-            const launchArgs: string[] = [
-                `--proxy-server=${proxyServer}`,
-                '--ignore-certificate-errors',
-                '--ignore-certificate-errors-spki-list',
-                '--disable-web-security',
-                '--allow-running-insecure-content',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-blink-features=AutomationControlled',
-                // User-agent that looks normal (not automated)
-                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            ];
-
-            // Load the PenPard Browser branding extension
-            // This sets the favicon, browser-action icon, and window title
-            if (brandingExtPath) {
-                launchArgs.push(
-                    `--disable-extensions-except=${brandingExtPath}`,
-                    `--load-extension=${brandingExtPath}`,
-                );
-            }
+            const launchArgs = this.buildLaunchArgs(proxyServer, brandingExtPath, isHeadless);
 
             // Per-session user data dir — fixes multi-browser bug.
             // Previously all sessions shared browser_profile_live, causing Chromium's
@@ -407,7 +803,8 @@ public class PenPardIconChanger {
             const userDataDir = path.join(os.homedir(), '.penpard', 'browser_sessions', sessionId);
             if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
-            const isHeadless = options.headless ?? false;
+            const targetOrigin = this.getTargetOrigin(options.targetUrl);
+            const jsArtifactsDir = options.scanId ? this.ensureJsArtifactsDir(options.scanId, sessionId) : null;
             const context = await chromium.launchPersistentContext(userDataDir, {
                 headless: isHeadless,
                 executablePath,
@@ -437,41 +834,24 @@ public class PenPardIconChanger {
                 sessionId,
                 userId,
                 userDataDir,
+                scanId: options.scanId,
+                targetUrl: options.targetUrl,
+                targetOrigin,
                 isHeadless,
                 proxyServer,
                 executablePath: executablePath || '',
                 brandingExtPath,
                 transitioning: false,
+                networkEvents: [],
+                nextTrafficEventId: 1,
+                jsArtifacts: new Map(),
+                jsArtifactsDir,
             };
             this.sessions.set(sessionId, liveSession);
 
             // ── Event Listeners ──
 
-            // Track page URL changes
-            page.on('framenavigated', (frame: any) => {
-                if (frame === page.mainFrame()) {
-                    const url = page.url();
-                    updateBrowserSession(sessionId, {
-                        current_url: url,
-                        last_activity_at: new Date().toISOString(),
-                    });
-                    addBrowserAction({
-                        sessionId,
-                        actionType: 'page_load',
-                        actionData: JSON.stringify({ url }),
-                        pageUrl: url,
-                        pageTitle: '',
-                        source: 'system',
-                    });
-                }
-            });
-
-            // Track browser close (human closes the window)
-            context.on('close', () => {
-                logger.info('Browser context closed', { sessionId });
-                this.sessions.delete(sessionId);
-                dbCloseSession(sessionId);
-            });
+            this.attachSessionListeners(sessionId, page, context);
 
             // Navigate to target URL if provided
             if (options.targetUrl) {
@@ -524,7 +904,7 @@ public class PenPardIconChanger {
      * Execute an AI-driven action on a browser session.
      */
     async executeAction(sessionId: string, action: BrowserAction): Promise<any> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) {
             throw new Error(`Session ${sessionId} not found or not active`);
         }
@@ -542,6 +922,9 @@ public class PenPardIconChanger {
             switch (action.type) {
                 case 'goto': {
                     if (!action.url) throw new Error('URL required for goto action');
+                    if (this.isPenPardInternalUrl(action.url, session.targetOrigin)) {
+                        throw new Error(`Blocked navigation to internal PenPard origin: ${action.url}`);
+                    }
                     await page.goto(action.url, {
                         waitUntil: 'domcontentloaded',
                         timeout: action.timeout || 30000,
@@ -666,7 +1049,7 @@ public class PenPardIconChanger {
      * Get current page state for AI inspection.
      */
     async getPageState(sessionId: string): Promise<PageState> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) {
             throw new Error(`Session ${sessionId} not found or not active`);
         }
@@ -704,7 +1087,7 @@ public class PenPardIconChanger {
      * Capture a screenshot of the current page.
      */
     async captureScreenshot(sessionId: string): Promise<{ base64: string; mimeType: string }> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) {
             throw new Error(`Session ${sessionId} not found or not active`);
         }
@@ -802,80 +1185,163 @@ public class PenPardIconChanger {
      * Deep page state: DOM summary, scripts, meta, cookies, storage.
      */
     async getFullPageState(sessionId: string): Promise<any> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) throw new Error(`Session ${sessionId} not found or not active`);
         const { page, context } = session;
 
-        const state = await page.evaluate(`(() => {
-            // DOM summary
+        const state = await page.evaluate(`(async () => {
             const allElements = document.querySelectorAll('*');
             const tagCounts = {};
             allElements.forEach(el => { tagCounts[el.tagName] = (tagCounts[el.tagName] || 0) + 1; });
 
-            // Forms
-            const forms = Array.from(document.querySelectorAll('form')).slice(0, 30).map(form => ({
-                action: form.action || '',
-                method: (form.method || 'get').toUpperCase(),
-                id: form.id || '',
-                name: form.name || '',
-                fields: Array.from(form.querySelectorAll('input, textarea, select, button')).slice(0, 50).map(field => ({
+            const sanitize = (value, limit = 500) => String(value || '').trim().substring(0, limit);
+            const escapeCss = (value) => {
+                if (!value) return '';
+                if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
+                return String(value).replace(/([ #;?%&,.+*~\\':"!^$\\[\\]()=>|/@])/g, '\\\\$1');
+            };
+            const getSelector = (el) => {
+                if (!el || !el.tagName) return '';
+                if (el.id) return '#' + escapeCss(el.id);
+                if (el.name) return el.tagName.toLowerCase() + '[name="' + escapeCss(el.name) + '"]';
+                if (el.getAttribute && el.getAttribute('data-testid')) {
+                    return el.tagName.toLowerCase() + '[data-testid="' + escapeCss(el.getAttribute('data-testid')) + '"]';
+                }
+                const parts = [];
+                let current = el;
+                let depth = 0;
+                while (current && current.nodeType === Node.ELEMENT_NODE && depth < 4) {
+                    const tag = current.tagName.toLowerCase();
+                    let part = tag;
+                    if (current.classList && current.classList.length > 0) {
+                        part += '.' + Array.from(current.classList).slice(0, 2).map(escapeCss).join('.');
+                    }
+                    const siblings = current.parentElement ? Array.from(current.parentElement.children).filter(child => child.tagName === current.tagName) : [];
+                    if (siblings.length > 1) {
+                        part += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
+                    }
+                    parts.unshift(part);
+                    current = current.parentElement;
+                    depth++;
+                }
+                return parts.join(' > ');
+            };
+            const getFieldLabel = (field) => {
+                if (!field) return '';
+                const aria = field.getAttribute('aria-label');
+                if (aria) return sanitize(aria, 120);
+                if (field.id) {
+                    const explicit = document.querySelector('label[for="' + field.id.replace(/"/g, '\\\\"') + '"]');
+                    if (explicit) return sanitize(explicit.textContent, 120);
+                }
+                const wrapped = field.closest('label');
+                if (wrapped) return sanitize(wrapped.textContent, 120);
+                return '';
+            };
+
+            const forms = Array.from(document.querySelectorAll('form')).slice(0, 30).map((form, formIndex) => {
+                const fields = Array.from(form.querySelectorAll('input, textarea, select')).slice(0, 50).map(field => ({
                     name: field.name || '',
                     type: field.type || field.tagName.toLowerCase(),
                     id: field.id || '',
-                    value: field.type === 'hidden' ? field.value : '',
+                    value: field.type === 'hidden' ? sanitize(field.value, 300) : '',
                     placeholder: field.placeholder || '',
-                })),
-            }));
+                    autocomplete: field.autocomplete || '',
+                    required: !!field.required,
+                    label: getFieldLabel(field),
+                    selector: getSelector(field),
+                }));
+                const hiddenInputs = fields.filter(field => field.type === 'hidden');
+                const submitElements = Array.from(form.querySelectorAll('button, input[type="submit"], input[type="button"]')).slice(0, 10).map(button => ({
+                    selector: getSelector(button),
+                    tagName: button.tagName.toLowerCase(),
+                    text: sanitize(button.innerText || button.value || button.textContent, 120),
+                    type: button.type || button.tagName.toLowerCase(),
+                }));
+                const inlineValidation = Array.from(form.querySelectorAll('[aria-live], .error, .invalid-feedback, .form-error, [data-error], [role="alert"]'))
+                    .slice(0, 20)
+                    .map(node => sanitize(node.textContent, 160))
+                    .filter(Boolean);
 
-            // Hidden inputs (outside forms too)
-            const hiddenInputs = Array.from(document.querySelectorAll('input[type="hidden"]')).map(el => ({
+                return {
+                    action: form.action || '',
+                    method: (form.method || 'get').toUpperCase(),
+                    id: form.id || ('form-' + (formIndex + 1)),
+                    name: form.name || '',
+                    selector: getSelector(form),
+                    fields,
+                    hiddenInputs,
+                    submitElements,
+                    inlineValidation,
+                };
+            });
+
+            const hiddenInputs = Array.from(document.querySelectorAll('input[type="hidden"]')).slice(0, 100).map(el => ({
                 name: el.name || '',
                 id: el.id || '',
-                value: el.value || '',
+                value: sanitize(el.value, 300),
                 form: el.form ? (el.form.id || el.form.action || 'unnamed-form') : 'no-form',
+                selector: getSelector(el),
             }));
 
-            // Links
-            const links = Array.from(document.querySelectorAll('a[href]')).slice(0, 100).map(a => ({
+            const links = Array.from(document.querySelectorAll('a[href]')).slice(0, 120).map(a => ({
                 href: a.href || '',
-                text: (a.textContent || '').trim().substring(0, 100),
+                text: sanitize(a.textContent, 120),
+                selector: getSelector(a),
             }));
 
-            // Meta tags
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]'))
+                .slice(0, 120)
+                .map(button => ({
+                    selector: getSelector(button),
+                    tagName: button.tagName.toLowerCase(),
+                    text: sanitize(button.innerText || button.value || button.textContent, 120),
+                    type: button.type || button.tagName.toLowerCase(),
+                    formId: button.form ? (button.form.id || button.form.action || '') : '',
+                }));
+
             const metaTags = Array.from(document.querySelectorAll('meta')).map(m => ({
                 name: m.name || m.httpEquiv || m.getAttribute('property') || '',
-                content: (m.content || '').substring(0, 500),
+                content: sanitize(m.content, 500),
             }));
 
-            // Scripts (src + inline)
             const scripts = Array.from(document.querySelectorAll('script')).map(s => ({
                 src: s.src || '',
                 type: s.type || '',
                 isInline: !s.src,
-                contentPreview: !s.src ? (s.textContent || '').substring(0, 500) : '',
+                contentPreview: !s.src ? sanitize(s.textContent, 500) : '',
                 contentLength: !s.src ? (s.textContent || '').length : 0,
             }));
 
-            // Cookies
-            const cookies = document.cookie;
-
-            // localStorage
             let localStorageData = {};
             try {
                 for (let i = 0; i < localStorage.length && i < 50; i++) {
                     const key = localStorage.key(i);
-                    if (key) localStorageData[key] = (localStorage.getItem(key) || '').substring(0, 500);
+                    if (key) localStorageData[key] = sanitize(localStorage.getItem(key), 500);
                 }
-            } catch(e) {}
+            } catch {}
 
-            // sessionStorage
             let sessionStorageData = {};
             try {
                 for (let i = 0; i < sessionStorage.length && i < 50; i++) {
                     const key = sessionStorage.key(i);
-                    if (key) sessionStorageData[key] = (sessionStorage.getItem(key) || '').substring(0, 500);
+                    if (key) sessionStorageData[key] = sanitize(sessionStorage.getItem(key), 500);
                 }
-            } catch(e) {}
+            } catch {}
+
+            let indexedDbNames = [];
+            try {
+                if (window.indexedDB && typeof window.indexedDB.databases === 'function') {
+                    const dbs = await window.indexedDB.databases();
+                    indexedDbNames = dbs.map(db => sanitize(db && db.name, 120)).filter(Boolean);
+                }
+            } catch {}
+
+            const antiAutomationMarkers = [
+                ...Array.from(document.querySelectorAll('[data-sitekey], iframe[src*="captcha"], script[src*="turnstile"], [class*="captcha"], [id*="captcha"], [name*="captcha"]'))
+                    .slice(0, 20)
+                    .map(node => sanitize(node.getAttribute('class') || node.getAttribute('id') || node.tagName, 160)),
+            ].filter(Boolean);
 
             const bodyText = document.body ? document.body.innerText : '';
             return {
@@ -884,11 +1350,14 @@ public class PenPardIconChanger {
                 forms,
                 hiddenInputs,
                 links,
+                buttons,
                 metaTags,
                 scripts,
-                cookies,
+                cookies: document.cookie,
                 localStorageData,
                 sessionStorageData,
+                indexedDbNames,
+                antiAutomationMarkers,
                 textSummary: bodyText.substring(0, 3000),
             };
         })()`);
@@ -909,10 +1378,11 @@ public class PenPardIconChanger {
      * Loaded scripts analysis — all script tags with URLs and inline content.
      */
     async getLoadedScripts(sessionId: string): Promise<any> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) throw new Error(`Session ${sessionId} not found or not active`);
 
         return await session.page.evaluate(`(() => {
+            const MAX_INLINE_LENGTH = 25000;
             const scripts = Array.from(document.querySelectorAll('script')).map(s => ({
                 src: s.src || null,
                 type: s.type || 'text/javascript',
@@ -920,6 +1390,7 @@ public class PenPardIconChanger {
                 defer: s.defer,
                 isModule: s.type === 'module',
                 isInline: !s.src,
+                content: !s.src ? (s.textContent || '').substring(0, MAX_INLINE_LENGTH) : null,
                 contentPreview: !s.src ? (s.textContent || '').substring(0, 2000) : null,
                 contentLength: !s.src ? (s.textContent || '').length : null,
             }));
@@ -933,13 +1404,42 @@ public class PenPardIconChanger {
         })()`);
     }
 
+    async captureJavaScriptArtifacts(sessionId: string): Promise<CapturedJsArtifact[]> {
+        const session = await this.waitForSessionReady(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+
+        const loadedScripts = await this.getLoadedScripts(sessionId);
+        const pageUrl = session.page.url();
+
+        for (const script of Array.isArray(loadedScripts?.scripts) ? loadedScripts.scripts : []) {
+            if (script?.isInline && typeof script.content === 'string' && script.content.trim()) {
+                await this.persistJsArtifact(session, {
+                    type: 'inline',
+                    pageUrl,
+                    contentType: script.type || 'application/javascript',
+                    content: script.content,
+                    evidence: ['inline-script', `bytes=${script.contentLength || script.content.length}`],
+                });
+            }
+        }
+
+        return Array.from(session.jsArtifacts.values());
+    }
+
+    getCapturedJavaScriptArtifacts(sessionId: string): CapturedJsArtifact[] {
+        const session = this.sessions.get(sessionId);
+        if (!session) return [];
+        return Array.from(session.jsArtifacts.values());
+    }
+
     /**
      * Comprehensive frontend intelligence extraction.
      * Finds API endpoints, GraphQL, WebSockets, tokens, CSRF, routing patterns.
      */
     async getFrontendAnalysis(sessionId: string): Promise<any> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        await this.captureJavaScriptArtifacts(sessionId).catch(() => {});
 
         return await session.page.evaluate(`(() => {
             const results = {
@@ -1065,7 +1565,7 @@ public class PenPardIconChanger {
      * Dump session storage: cookies, localStorage, sessionStorage.
      */
     async getSessionStorageData(sessionId: string): Promise<any> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) throw new Error(`Session ${sessionId} not found or not active`);
 
         const browserStorage = await session.page.evaluate(`(() => {
@@ -1127,12 +1627,18 @@ public class PenPardIconChanger {
         return cookies.length;
     }
 
+    getTrafficSnapshot(sessionId: string): BrowserTrafficEvent[] {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error(`Session ${sessionId} not found or not active`);
+        return [...session.networkEvents];
+    }
+
     /**
      * Correlate browser-visible state with Burp MCP proxy history.
      * Merges what the browser sees with what Burp intercepted.
      */
     async correlateBrowserWithBurp(sessionId: string): Promise<any> {
-        const session = this.sessions.get(sessionId);
+        const session = await this.waitForSessionReady(sessionId);
         if (!session) throw new Error(`Session ${sessionId} not found or not active`);
 
         // Get browser state
@@ -1147,10 +1653,8 @@ public class PenPardIconChanger {
             const { burpMCP } = require('./burp-mcp');
             burpAvailable = await burpMCP.isAvailable();
             if (burpAvailable) {
-                const result = await burpMCP.callTool('get_proxy_history', { count: 50 });
-                burpHistory = result?.content?.[0]?.text
-                    ? JSON.parse(result.content[0].text).history || []
-                    : [];
+                const result = await burpMCP.callTool('get_proxy_history', { count: 50, excludePenPard: true });
+                burpHistory = normalizeProxyHistoryItems(result);
             }
         } catch (e: any) {
             logger.warn('Burp MCP correlation failed', { error: e.message });
@@ -1158,13 +1662,16 @@ public class PenPardIconChanger {
 
         // Get browser action log
         const actions = getBrowserActions(sessionId);
+        const browserTraffic = this.getTrafficSnapshot(sessionId);
 
         // Match browser URLs with Burp history
         const matchedRequests = burpHistory.filter((entry: any) => {
             const entryUrl = entry.url || '';
             try {
                 const entryHost = new URL(entryUrl).hostname;
-                return entryHost === host;
+                return entryHost === host &&
+                    !this.isPenPardInternalUrl(entryUrl, session.targetOrigin) &&
+                    !/\/socket\.io\/|\/sockjs\/|\/__webpack_hmr|transport=polling/i.test(entryUrl);
             } catch { return false; }
         });
 
@@ -1189,6 +1696,7 @@ public class PenPardIconChanger {
             currentUrl,
             host,
             browserActionsCount: actions.length,
+            browserTrafficCount: browserTraffic.length,
             burpRequestsForHost: matchedRequests.length,
             totalBurpHistory: burpHistory.length,
             matchedRequests: matchedRequests.slice(0, 30).map((r: any) => ({
@@ -1197,6 +1705,7 @@ public class PenPardIconChanger {
                 status: r.status,
                 mimeType: r.mimeType,
             })),
+            browserTraffic: browserTraffic.slice(-30),
             burpEndpoints,
             frontendEndpoints,
             frontendOnlyEndpoints: frontendOnly,
@@ -1210,8 +1719,8 @@ public class PenPardIconChanger {
      * Compare two browser sessions — for IDOR, BAC, multi-user testing.
      */
     async compareSessionStates(sessionIdA: string, sessionIdB: string): Promise<any> {
-        const sessionA = this.sessions.get(sessionIdA);
-        const sessionB = this.sessions.get(sessionIdB);
+        const sessionA = await this.waitForSessionReady(sessionIdA);
+        const sessionB = await this.waitForSessionReady(sessionIdB);
         if (!sessionA) throw new Error(`Session A (${sessionIdA}) not found or not active`);
         if (!sessionB) throw new Error(`Session B (${sessionIdB}) not found or not active`);
 
@@ -1324,42 +1833,12 @@ public class PenPardIconChanger {
         logger.info(`Switching browser session to ${label}`, { sessionId });
 
         try {
-            // Capture current URL before closing
-            let lastUrl = 'about:blank';
-            try {
-                lastUrl = session.page.url();
-            } catch { /* page may be dead */ }
-
-            // Close old context gracefully
-            try {
-                // Remove the 'close' listener temporarily to avoid premature cleanup
-                session.context.removeAllListeners('close');
-                await session.context.close();
-            } catch (e: any) {
-                logger.warn('Error closing context during visibility toggle (non-fatal)', { sessionId, error: e.message });
-            }
-
-            // Rebuild launch args
-            const launchArgs: string[] = [
-                `--proxy-server=${session.proxyServer}`,
-                '--ignore-certificate-errors',
-                '--ignore-certificate-errors-spki-list',
-                '--disable-web-security',
-                '--allow-running-insecure-content',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-blink-features=AutomationControlled',
-                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            ];
-
-            if (session.brandingExtPath && !targetHeadless) {
-                launchArgs.push(
-                    `--disable-extensions-except=${session.brandingExtPath}`,
-                    `--load-extension=${session.brandingExtPath}`,
-                );
-            }
-
-            // Relaunch with the same persistent profile
-            const newContext = await chromium.launchPersistentContext(session.userDataDir, {
+            const previousContext = session.context;
+            const previousBrowser = session.browser;
+            const continuitySnapshot = await this.captureContinuitySnapshot(session);
+            const replacementUserDataDir = this.ensureVisibilityTransitionDir(session, targetHeadless);
+            const launchArgs = this.buildLaunchArgs(session.proxyServer, session.brandingExtPath, targetHeadless);
+            const newContext = await chromium.launchPersistentContext(replacementUserDataDir, {
                 headless: targetHeadless,
                 executablePath: session.executablePath,
                 args: launchArgs,
@@ -1367,46 +1846,48 @@ public class PenPardIconChanger {
                 proxy: { server: session.proxyServer },
                 viewport: targetHeadless ? { width: 1280, height: 720 } : null,
             });
+            await this.applyContinuitySnapshot(newContext, continuitySnapshot);
 
             const pages = newContext.pages();
             const newPage = pages.length > 0 ? pages[0] : await newContext.newPage();
+            const restoreUrl = (() => {
+                const preferred = continuitySnapshot.url || session.targetUrl || 'about:blank';
+                if (preferred === 'about:blank') return preferred;
+                return this.isPenPardInternalUrl(preferred, session.targetOrigin)
+                    ? (session.targetUrl || 'about:blank')
+                    : preferred;
+            })();
 
-            // Restore last URL
-            if (lastUrl && lastUrl !== 'about:blank') {
+            if (restoreUrl && restoreUrl !== 'about:blank') {
                 try {
-                    await newPage.goto(lastUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                    await newPage.goto(restoreUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
                 } catch (navErr: any) {
                     logger.warn('Could not restore URL after visibility toggle (non-fatal)', {
-                        sessionId, lastUrl, error: navErr.message,
+                        sessionId, restoreUrl, error: navErr.message,
                     });
                 }
             }
 
-            // Re-attach event listeners
-            newPage.on('framenavigated', (frame: any) => {
-                if (frame === newPage.mainFrame()) {
-                    const url = newPage.url();
-                    updateBrowserSession(sessionId, {
-                        current_url: url,
-                        last_activity_at: new Date().toISOString(),
-                    });
-                }
-            });
+            this.attachSessionListeners(sessionId, newPage, newContext);
 
-            newContext.on('close', () => {
-                logger.info('Browser context closed (post-toggle)', { sessionId });
-                this.sessions.delete(sessionId);
-                dbCloseSession(sessionId);
-            });
-
-            // Update session references in-place
             session.browser = newContext.browser() || (newContext as any);
             session.context = newContext;
             session.page = newPage;
             session.isHeadless = targetHeadless;
+            session.userDataDir = replacementUserDataDir;
             session.transitioning = false;
 
-            // Apply Windows icon override for visible mode
+            updateBrowserSession(sessionId, {
+                current_url: (() => {
+                    try {
+                        return newPage.url();
+                    } catch {
+                        return restoreUrl;
+                    }
+                })(),
+                last_activity_at: new Date().toISOString(),
+            });
+
             if (!targetHeadless) {
                 const browserIcoPath = this.resolveBrowserIconPath();
                 if (browserIcoPath) {
@@ -1414,14 +1895,30 @@ public class PenPardIconChanger {
                 }
             }
 
-            logger.info(`Browser session switched to ${label}`, { sessionId, restoredUrl: lastUrl });
+            try {
+                previousContext.removeAllListeners('close');
+            } catch {
+                /* ignore */
+            }
+            try {
+                await previousContext.close();
+            } catch (closeError: any) {
+                logger.warn('Error closing previous context after visibility swap (non-fatal)', {
+                    sessionId,
+                    error: closeError.message,
+                });
+                try {
+                    await previousBrowser?.close();
+                } catch {
+                    /* ignore */
+                }
+            }
 
+            logger.info(`Browser session switched to ${label}`, { sessionId, restoredUrl: restoreUrl });
         } catch (error: any) {
             session.transitioning = false;
             logger.error(`Failed to switch browser visibility to ${label}`, { sessionId, error: error.message });
-            // Attempt to clean up the stale session
-            this.sessions.delete(sessionId);
-            throw new Error(`Visibility toggle failed: ${error.message}. Session ${sessionId} is no longer valid.`);
+            throw new Error(`Visibility toggle failed: ${error.message}`);
         }
     }
 }

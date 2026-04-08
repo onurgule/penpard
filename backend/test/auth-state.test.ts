@@ -98,6 +98,50 @@ test('preserveExplicitAuth keeps the explicit request untouched', () => {
     assert.equal(explicit.body, 'name=test');
 });
 
+test('AuthStateManager suppresses managed auth on anonymous login and register probes', () => {
+    const manager = createManager();
+
+    manager.capture.fromOperatorCookies('session=primary', 'app.example.com', 'primary-user');
+    manager.capture.fromOperatorAuthHeader('Bearer primary-token-1234567890', 'primary-user');
+
+    const loginProbe = manager.prepareRequest(
+        undefined,
+        '{"email":"user@example.com","password":"badpass"}',
+        'https://app.example.com/rest/user/login',
+        'POST',
+        'primary-user',
+        false,
+        'anonymous_auth_probe',
+    );
+    assert.ok(!('Authorization' in loginProbe.headers));
+    assert.ok(!('Cookie' in loginProbe.headers));
+
+    const registrationProbe = manager.prepareRequest(
+        undefined,
+        '{"email":"new@example.com","password":"PenPard!123"}',
+        'https://app.example.com/create-account',
+        'POST',
+        'primary-user',
+        false,
+        'account_creation',
+    );
+    assert.ok(!('Authorization' in registrationProbe.headers));
+    assert.ok(!('Cookie' in registrationProbe.headers));
+
+    const diagnostics = manager.assessPreparedRequest({
+        originalHeaders: undefined,
+        preparedHeaders: loginProbe.headers,
+        url: 'https://app.example.com/rest/user/login',
+        method: 'POST',
+        identityId: 'primary-user',
+        preserveExplicitAuth: false,
+        intent: 'anonymous_auth_probe',
+    });
+    assert.equal(diagnostics.authSuppressedForIntent, true);
+    assert.equal(diagnostics.isAuthBootstrapRoute, true);
+    assert.equal(diagnostics.likelyRequiresAuth, false);
+});
+
 test('CSRFManager uses deterministic precedence for header and body sources', () => {
     const csrf = new CSRFManager('primary-user');
 
@@ -189,6 +233,22 @@ test('SessionHealthMonitor refresh uses stored metadata, rotates tokens, and cap
     assert.equal(tokenStore.formatAuthHeader(), 'Bearer new-access-token-1234567890');
     assert.equal(tokenStore.getRefreshToken()?.value, 'refresh-token-2222222222');
     assert.ok(cookieJar.resolve('https://app.example.com/').includes('session=new-session'));
+});
+
+test('SessionHealthMonitor does not kill the session on anonymous auth probing 401s', () => {
+    const identities = new IdentityRegistry('scan-test');
+    identities.createPrimary();
+    const monitor = new SessionHealthMonitor(
+        identities,
+        new Map([['primary-user', new TokenStore('primary-user')]]),
+        new Map([['primary-user', new CookieJar('primary-user')]]),
+        'https://app.example.com',
+    );
+    monitor.initializeHealth('primary-user');
+
+    const result = monitor.analyzeResponse('primary-user', 401, {}, '', 'anonymous_auth_probe');
+    assert.equal(result.needsRefresh, false);
+    assert.equal(result.needsRelogin, false);
 });
 
 test('AuthStateManager captures browser cookies and storage tokens for later requests', () => {

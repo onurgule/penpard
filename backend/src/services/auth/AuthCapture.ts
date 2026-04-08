@@ -12,6 +12,7 @@ import { TokenStore } from './TokenStore';
 import { CSRFManager } from './CSRFManager';
 import { IdentityRegistry } from './IdentityRegistry';
 import { logger } from '../../utils/logger';
+import { normalizeCookiesAndAuthEntries, normalizeSessionCookieResult } from '../burp-tool-result';
 
 /** Minimal Burp MCP client interface for decoupling. */
 interface BurpClient {
@@ -103,7 +104,7 @@ export class AuthCapture {
                 maxItems,
             });
 
-            const entries = Array.isArray(historyResult?.entries) ? historyResult.entries : [];
+            const entries = normalizeCookiesAndAuthEntries(historyResult);
 
             for (const entry of entries) {
                 // Capture cookies
@@ -128,7 +129,7 @@ export class AuthCapture {
             if (cookies.length === 0 && tokens.length === 0) {
                 try {
                     const result = await burpClient.callTool('get_session_cookies', { host: targetHost });
-                    const cookie = result?.cookieHeader;
+                    const cookie = normalizeSessionCookieResult(result).cookieHeader;
                     if (cookie && typeof cookie === 'string' && cookie.trim()) {
                         const jar = this.getOrCreateJar(identityId);
                         const parsed = jar.parseCookieHeader(cookie, targetHost, 'burp_proxy_history');

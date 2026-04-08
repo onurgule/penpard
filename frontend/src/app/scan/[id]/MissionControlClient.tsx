@@ -25,12 +25,14 @@ import {
     Crosshair,
     ScanSearch,
     Globe,
+    Route,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import toast from 'react-hot-toast';
 import { MarkdownRenderer } from '@/components/MarkdownRenderer';
 import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
+import { buildEndpointDisplayRows, EndpointInventorySnapshot } from './endpoint-intel';
 
 interface LogEntry {
     timestamp: string;
@@ -117,6 +119,7 @@ export default function MissionControlClient() {
     const [coverageSummary, setCoverageSummary] = useState<{ routesSeen: number; exercised: number; promoted: number; untested: number; coveragePercentage: number } | null>(null);
     const [harvestedCount, setHarvestedCount] = useState(0);
     const [promotedCount, setPromotedCount] = useState(0);
+    const [endpointInventory, setEndpointInventory] = useState<EndpointInventorySnapshot | null>(null);
 
     // Initial fetch
     // Modal State
@@ -177,6 +180,9 @@ export default function MissionControlClient() {
 
             setStatus(data.status);
             setVulns(data.vulnerabilities || []);
+            if (data.endpointInventory !== undefined) {
+                setEndpointInventory(data.endpointInventory || null);
+            }
 
             // Derive progress from status
             const map: Record<string, number> = {
@@ -230,6 +236,7 @@ export default function MissionControlClient() {
             if (data.coverageSummary) setCoverageSummary(data.coverageSummary);
             if (data.harvestedRequestCount !== undefined) setHarvestedCount(data.harvestedRequestCount);
             if (data.promotedRequestCount !== undefined) setPromotedCount(data.promotedRequestCount);
+            if (data.endpointInventory !== undefined) setEndpointInventory(data.endpointInventory || null);
 
             // Append new logs (only if there are actually new ones)
             if (data.logs && data.logs.length > 0 && data.logsCount > logIndexRef.current) {
@@ -499,6 +506,8 @@ User Question: ${userQuestion}`;
     };
 
     // Show loading until scanId is resolved from URL
+    const endpointRows = buildEndpointDisplayRows(endpointInventory, 24);
+
     if (!scanId) {
         return (
             <div className="min-h-screen bg-black text-slate-200 flex items-center justify-center">
@@ -961,40 +970,100 @@ User Question: ${userQuestion}`;
                     </div>
                 </div>
 
-                {/* Right: Findings */}
-                <div className="col-span-12 lg:col-span-3 flex flex-col bg-white/5 rounded-xl border border-white/10 overflow-hidden h-[calc(100vh-8rem)]">
-                    <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0">
-                        <h2 className="font-bold text-sm text-white">Live Findings</h2>
-                        <span className="bg-red-500/20 text-red-400 px-2 py-0.5 rounded text-xs border border-red-500/20">{vulns.length} Issues</span>
-                    </div>
-                    <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin scrollbar-thumb-slate-700">
-                        {vulns.length === 0 ? (
-                            <div className="text-center py-10 opacity-50">
-                                <Shield className="w-10 h-10 mx-auto mb-2 text-slate-600" />
-                                <div className="text-sm text-slate-500">No vulnerabilities found yet.</div>
+                {/* Right: Endpoint Intelligence + Findings */}
+                <div className="col-span-12 lg:col-span-3 flex flex-col gap-4 h-[calc(100vh-8rem)]">
+                    <div className="flex-[1.1] flex flex-col bg-white/5 rounded-xl border border-cyan-500/20 overflow-hidden min-h-0">
+                        <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0">
+                            <div>
+                                <h2 className="font-bold text-sm text-white flex items-center gap-2">
+                                    <Route className="w-4 h-4 text-cyan-400" />
+                                    Endpoint Intelligence
+                                </h2>
+                                <div className="text-[10px] text-slate-500 mt-1">
+                                    {endpointInventory?.summary || 'Waiting for JS, DOM, browser, and Burp endpoint intelligence...'}
+                                </div>
                             </div>
-                        ) : (
-                            <AnimatePresence>
-                                {vulns.map((vuln) => (
-                                    <motion.div
-                                        key={vuln.id}
-                                        initial={{ opacity: 0, x: 20 }}
-                                        animate={{ opacity: 1, x: 0 }}
-                                        onClick={() => {
-                                            setSelectedVuln(vuln);
-                                            setVulnChatHistory([]);
-                                        }}
-                                        className={`p-3 rounded-lg border cursor-pointer hover:bg-white/5 transition-colors ${getSeverityColor(vuln.severity)}`}
-                                    >
-                                        <div className="flex justify-between items-start mb-1">
-                                            <div className="font-bold text-sm truncate pr-2">{vuln.name}</div>
-                                            <div className="text-[10px] uppercase font-bold opacity-70">{vuln.severity}</div>
+                            <span className="bg-cyan-500/15 text-cyan-300 px-2 py-0.5 rounded text-xs border border-cyan-500/20">
+                                {endpointInventory?.records?.length || 0} Endpoints
+                            </span>
+                        </div>
+                        <div className="p-3 border-b border-white/10 bg-black/10 text-[10px] text-slate-400 grid grid-cols-3 gap-2 flex-shrink-0">
+                            <div>Auth Relevant: <span className="text-white">{endpointInventory?.authRelevantCount || 0}</span></div>
+                            <div>Burp Seen: <span className="text-white">{endpointInventory?.observedInBurpCount || 0}</span></div>
+                            <div>JS Artifacts: <span className="text-white">{endpointInventory?.jsArtifacts?.count || 0}</span></div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-3 space-y-3 scrollbar-thin scrollbar-thumb-slate-700 min-h-0">
+                            {endpointRows.length === 0 ? (
+                                <div className="text-center py-10 opacity-50">
+                                    <Route className="w-10 h-10 mx-auto mb-2 text-slate-600" />
+                                    <div className="text-sm text-slate-500">No extracted endpoints yet.</div>
+                                </div>
+                            ) : (
+                                endpointRows.map((row) => (
+                                    <div key={row.id} className="rounded-lg border border-cyan-500/10 bg-black/20 p-3 space-y-2">
+                                        <div className="flex items-start justify-between gap-2">
+                                            <div className="min-w-0">
+                                                <div className="text-sm font-semibold text-white break-all">{row.title}</div>
+                                                <div className="text-[10px] text-slate-500 mt-1 break-all">{row.sourceDetail}</div>
+                                            </div>
+                                            <div className="text-right shrink-0">
+                                                <div className="text-[10px] font-bold uppercase text-cyan-300">{row.methods}</div>
+                                                <div className="text-[10px] text-slate-500">{row.confidenceLabel}</div>
+                                            </div>
                                         </div>
-                                        <div className="text-xs opacity-80 line-clamp-2">{vuln.description}</div>
-                                    </motion.div>
-                                ))}
-                            </AnimatePresence>
-                        )}
+                                        <div className="flex flex-wrap gap-1.5 text-[10px]">
+                                            <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-300">{row.source}</span>
+                                            <span className={`px-2 py-0.5 rounded border ${row.authBadge === 'auth-relevant' ? 'border-amber-500/20 bg-amber-500/10 text-amber-300' : 'border-slate-600 bg-slate-800/60 text-slate-300'}`}>
+                                                {row.classification}
+                                            </span>
+                                            {row.inferredOnly && (
+                                                <span className="px-2 py-0.5 rounded border border-purple-500/20 bg-purple-500/10 text-purple-300">
+                                                    JS inferred only
+                                                </span>
+                                            )}
+                                        </div>
+                                        <div className="text-[11px] text-slate-300">{row.observedLabel}</div>
+                                        <div className="text-[11px] text-slate-400 leading-relaxed">{row.evidence}</div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="flex-1 flex flex-col bg-white/5 rounded-xl border border-white/10 overflow-hidden min-h-0">
+                        <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0">
+                            <h2 className="font-bold text-sm text-white">Live Findings</h2>
+                            <span className="bg-red-500/20 text-red-400 px-2 py-0.5 rounded text-xs border border-red-500/20">{vulns.length} Issues</span>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin scrollbar-thumb-slate-700 min-h-0">
+                            {vulns.length === 0 ? (
+                                <div className="text-center py-10 opacity-50">
+                                    <Shield className="w-10 h-10 mx-auto mb-2 text-slate-600" />
+                                    <div className="text-sm text-slate-500">No vulnerabilities found yet.</div>
+                                </div>
+                            ) : (
+                                <AnimatePresence>
+                                    {vulns.map((vuln) => (
+                                        <motion.div
+                                            key={vuln.id}
+                                            initial={{ opacity: 0, x: 20 }}
+                                            animate={{ opacity: 1, x: 0 }}
+                                            onClick={() => {
+                                                setSelectedVuln(vuln);
+                                                setVulnChatHistory([]);
+                                            }}
+                                            className={`p-3 rounded-lg border cursor-pointer hover:bg-white/5 transition-colors ${getSeverityColor(vuln.severity)}`}
+                                        >
+                                            <div className="flex justify-between items-start mb-1">
+                                                <div className="font-bold text-sm truncate pr-2">{vuln.name}</div>
+                                                <div className="text-[10px] uppercase font-bold opacity-70">{vuln.severity}</div>
+                                            </div>
+                                            <div className="text-xs opacity-80 line-clamp-2">{vuln.description}</div>
+                                        </motion.div>
+                                    ))}
+                                </AnimatePresence>
+                            )}
+                        </div>
                     </div>
                 </div>
 

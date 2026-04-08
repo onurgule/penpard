@@ -8,6 +8,7 @@
 
 import { logger } from '../utils/logger';
 import { createHash } from 'crypto';
+import { normalizeProxyHistoryItems } from './burp-tool-result';
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -34,6 +35,7 @@ export type RequestClass =
     | 'workflow-transition'
     | 'sensitive-resource'
     | 'static-asset'
+    | 'noise'
     | 'unknown';
 
 export interface HarvestedRequest {
@@ -94,13 +96,20 @@ export class RequestHarvester {
                 return [];
             }
 
-            // Normalize, classify, score
-            const processed: HarvestedRequest[] = newRequests.map((raw: any) => {
-                const req = this.normalize(raw);
-                req.classification = this.classify(req);
-                req.interestScore = this.score(req);
-                return req;
-            });
+            // Normalize, classify, score, and discard noise before it reaches promotion logic
+            const processed: HarvestedRequest[] = newRequests
+                .map((raw: any) => {
+                    const req = this.normalize(raw);
+                    req.classification = this.classify(req);
+                    req.interestScore = this.score(req);
+                    return req;
+                })
+                .filter((req) => req.classification !== 'noise');
+
+            if (processed.length === 0) {
+                logger.info('[Harvester] All newly observed requests were filtered as noise');
+                return [];
+            }
 
             // Store
             processed.forEach(r => this.harvested.set(r.id, r));
@@ -120,7 +129,7 @@ export class RequestHarvester {
      */
     getPromotionCandidates(limit: number = 5): PromotedRequest[] {
         const candidates = Array.from(this.harvested.values())
-            .filter(r => !r.promoted && r.interestScore >= 30 && r.classification !== 'static-asset')
+            .filter(r => !r.promoted && r.interestScore >= 30 && r.classification !== 'static-asset' && r.classification !== 'noise')
             .sort((a, b) => b.interestScore - a.interestScore)
             .slice(0, limit);
 
@@ -196,26 +205,13 @@ export class RequestHarvester {
     // ─────────────────────────────────────────────────────────
 
     private parseProxyHistory(result: any): any[] {
-        if (!result) return [];
-        try {
-            // MCP result format: { content: [{ type: 'text', text: '...' }] }
-            if (result.content?.[0]?.text) {
-                const parsed = JSON.parse(result.content[0].text);
-                return parsed.history || parsed.entries || (Array.isArray(parsed) ? parsed : []);
-            }
-            // Direct array
-            if (Array.isArray(result)) return result;
-            if (result.history) return result.history;
-            return [];
-        } catch {
-            return [];
-        }
+        return normalizeProxyHistoryItems(result);
     }
 
     private isTargetHost(url: string, targetHost: string): boolean {
         try {
             const host = new URL(url).hostname;
-            return host === targetHost || host === 'localhost' || host === '127.0.0.1';
+            return host === targetHost;
         } catch {
             return false;
         }
@@ -353,6 +349,9 @@ export class RequestHarvester {
         // GraphQL
         if (pathLower.includes('graphql') || bodyLower.includes('"query"')) return 'graphql';
 
+        // Ignore socket polling / live reload / framework noise before websocket handling.
+        if (this.isIgnorableNoise(req)) return 'noise';
+
         // WebSocket
         if (pathLower.startsWith('/ws') || pathLower.includes('socket.io') || pathLower.includes('sockjs')) return 'websocket-bootstrap';
 
@@ -426,6 +425,7 @@ export class RequestHarvester {
             'authentication': 20,
             'sensitive-resource': 15,
             'static-asset': -100,
+            'noise': -100,
             'session-bootstrap': -20,
             'websocket-bootstrap': -10,
         };
@@ -449,6 +449,26 @@ export class RequestHarvester {
 
     private isAuthEndpoint(path: string): boolean {
         return /\/(login|signin|signup|register|logout|signout|auth|oauth|token|session|verify|password|reset|forgot|activate|confirm|mfa|2fa)/i.test(path);
+    }
+
+    private isIgnorableNoise(req: HarvestedRequest): boolean {
+        const pathLower = req.path.toLowerCase();
+        const accept = (req.requestHeaders['accept'] || '').toLowerCase();
+        const upgrade = (req.requestHeaders['upgrade'] || '').toLowerCase();
+
+        if (/\/socket\.io\/|\/sockjs\/|\/__webpack_hmr|\/vite\/|\/@vite\/client|hot-update|livereload/i.test(pathLower)) {
+            return true;
+        }
+
+        if (pathLower.includes('transport=polling') && pathLower.includes('eio=')) {
+            return true;
+        }
+
+        if (accept.includes('text/event-stream') || upgrade === 'websocket') {
+            return true;
+        }
+
+        return false;
     }
 
     private isFileOperation(path: string, headers: Record<string, string>): boolean {

@@ -18,6 +18,8 @@
 import { 
     AuthCaptureSource, AuthContext, AuthExport, AuthExportIdentity, RequestAuthBindingRules,
     DEFAULT_NO_AUTH_PATHS, AuthEvent, AuthEventType, RequestAuthDiagnostics, redactSecret,
+    AuthStartupConfig, AuthStartupCredential, CredentialSet, IdentityRole, AuthStartupInventory,
+    RequestAuthIntent,
 } from './types';
 import { CookieJar } from './CookieJar';
 import { TokenStore } from './TokenStore';
@@ -38,6 +40,7 @@ interface BurpClient {
 interface ScanAuthConfig {
     sessionCookies?: string;
     initialRequest?: string;
+    authStartup?: AuthStartupConfig;
     idorUsers?: Array<{
         username?: string;
         password?: string;
@@ -71,6 +74,7 @@ export class AuthStateManager {
         hasCookie: boolean;
         hasCustomAuth: boolean;
     }> = new Map();
+    private startupInventory: AuthStartupInventory | null = null;
 
     // ── Events ──
     private events: AuthEvent[] = [];
@@ -121,11 +125,40 @@ export class AuthStateManager {
             return;
         }
 
-        // ── 1. Create primary identity ──
-        this.identityRegistry.createPrimary('Primary User');
+        // ── 1. Create startup identities ──
+        const startupCredentials = config.authStartup?.mode === 'provided_credentials'
+            ? config.authStartup.credentials
+            : [];
 
-        // ── 2. Create IDOR/secondary identities from config ──
-        if (config.idorUsers && config.idorUsers.length > 0) {
+        if (startupCredentials.length > 0) {
+            const [primaryCredential, ...secondaryCredentials] = startupCredentials;
+            this.registerIdentity({
+                identityId: 'primary-user',
+                label: primaryCredential.label || primaryCredential.username || primaryCredential.email || 'Primary User',
+                role: 'primary',
+                username: primaryCredential.username || primaryCredential.email,
+                email: primaryCredential.email,
+                roleInApp: primaryCredential.role,
+                credentialSet: this.buildCredentialSet(primaryCredential),
+            });
+
+            secondaryCredentials.forEach((credential, index) => {
+                this.registerIdentity({
+                    identityId: `provided-user-${index + 1}`,
+                    label: credential.label || credential.username || credential.email || `Provided User ${index + 1}`,
+                    role: 'secondary',
+                    username: credential.username || credential.email,
+                    email: credential.email,
+                    roleInApp: credential.role,
+                    credentialSet: this.buildCredentialSet(credential),
+                });
+            });
+        } else {
+            this.identityRegistry.createPrimary('Primary User');
+        }
+
+        // ── 2. Create legacy IDOR/secondary identities from config ──
+        if (config.idorUsers && config.idorUsers.length > 0 && startupCredentials.length === 0) {
             this.identityRegistry.initializeFromIdorUsers(config.idorUsers);
         }
 
@@ -177,16 +210,16 @@ export class AuthStateManager {
      * Prepare auth context for an outgoing request.
      * This is the primary method called by OrchestratorAgent.executeToolCall().
      */
-    inject(url: string, method: string = 'GET', identityId?: string): AuthContext {
-        return this.injector.prepare(url, method, identityId);
+    inject(url: string, method: string = 'GET', identityId?: string, intent: RequestAuthIntent = 'authenticated'): AuthContext {
+        return this.injector.prepare(url, method, identityId, intent);
     }
 
     /**
      * Merge auth headers into existing request headers.
      * Convenience wrapper around AuthInjector.mergeHeaders().
      */
-    mergeHeaders(existingHeaders: Record<string, string> | undefined, url: string, method: string = 'GET', identityId?: string): Record<string, string> {
-        return this.prepareRequest(existingHeaders, undefined, url, method, identityId).headers;
+    mergeHeaders(existingHeaders: Record<string, string> | undefined, url: string, method: string = 'GET', identityId?: string, intent: RequestAuthIntent = 'authenticated'): Record<string, string> {
+        return this.prepareRequest(existingHeaders, undefined, url, method, identityId, false, intent).headers;
     }
 
     /**
@@ -200,8 +233,9 @@ export class AuthStateManager {
         method: string = 'GET',
         identityId?: string,
         preserveExplicitAuth: boolean = false,
+        intent: RequestAuthIntent = 'authenticated',
     ): { context: AuthContext; headers: Record<string, string>; body: string } {
-        return this.injector.prepareRequest(existingHeaders, body, url, method, identityId, preserveExplicitAuth);
+        return this.injector.prepareRequest(existingHeaders, body, url, method, identityId, preserveExplicitAuth, intent);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -218,13 +252,14 @@ export class AuthStateManager {
         body: string,
         requestUrl: string,
         identityId: string = 'primary-user',
+        intent: RequestAuthIntent = 'authenticated',
     ): { needsRefresh: boolean; needsRelogin: boolean; isCSRFFailure: boolean } {
         // 1. Capture any new auth material from response
         const normalizedHeaders = this.normalizeHeaders(headers);
         this.capture.fromResponse({ statusCode, headers: normalizedHeaders, body }, requestUrl, identityId);
 
         // 2. Analyze session health
-        const healthResult = this.healthMonitor.analyzeResponse(identityId, statusCode, normalizedHeaders, body);
+        const healthResult = this.healthMonitor.analyzeResponse(identityId, statusCode, normalizedHeaders, body, intent);
 
         // 3. Emit events
         if (healthResult.needsRefresh) {
@@ -289,6 +324,59 @@ export class AuthStateManager {
      */
     detectCSRFFromPage(pageState: any, identityId: string = 'primary-user'): void {
         this.capture.fromBrowserPageState(pageState, identityId);
+    }
+
+    registerIdentity(opts: {
+        identityId?: string;
+        label: string;
+        role: IdentityRole;
+        username?: string;
+        email?: string;
+        userId?: string;
+        tenantId?: string;
+        roleInApp?: string;
+        credentialSet?: CredentialSet;
+    }): string {
+        let identityId = opts.identityId;
+
+        if (opts.role === 'primary') {
+            identityId = this.identityRegistry.createPrimary(opts.label, {
+                username: opts.username,
+                email: opts.email,
+                userId: opts.userId,
+                tenantId: opts.tenantId,
+                roleInApp: opts.roleInApp,
+                credentialSet: opts.credentialSet,
+            }).id;
+        } else if (opts.role === 'secondary') {
+            identityId = this.identityRegistry.createSecondary(identityId || `secondary-${Date.now()}`, opts.label, {
+                username: opts.username,
+                email: opts.email,
+                userId: opts.userId,
+                tenantId: opts.tenantId,
+                roleInApp: opts.roleInApp,
+                credentialSet: opts.credentialSet,
+            }).id;
+        } else {
+            identityId = this.identityRegistry.createAttacker(opts.label, {
+                username: opts.username,
+                credentialSet: opts.credentialSet,
+            }).id;
+        }
+
+        this.ensureStores(identityId);
+        this.healthMonitor.initializeHealth(identityId);
+        const strategy = this.healthMonitor.autoDetectRefreshStrategy(identityId);
+        this.healthMonitor.setRefreshPlan(identityId, strategy);
+        return identityId;
+    }
+
+    setStartupInventory(inventory: AuthStartupInventory): void {
+        this.startupInventory = inventory;
+    }
+
+    getStartupInventory(): AuthStartupInventory | null {
+        return this.startupInventory;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -381,10 +469,12 @@ export class AuthStateManager {
         method?: string;
         identityId?: string;
         preserveExplicitAuth?: boolean;
+        intent?: RequestAuthIntent;
     }): RequestAuthDiagnostics {
         const method = opts.method || 'GET';
         const identityId = opts.identityId || this.rules.defaultIdentityId;
-        const context = this.inject(opts.url, method, identityId);
+        const intent = opts.intent || this.inferRequestIntent(opts.url, method);
+        const context = this.inject(opts.url, method, identityId, intent);
         const explicitAuthorizationValue = getHeaderValue(opts.originalHeaders, 'authorization');
         const explicitCookieValue = getHeaderValue(opts.originalHeaders, 'cookie');
         const explicitCustomAuthPresent = this.hasCustomAuthHeaders(opts.originalHeaders);
@@ -394,6 +484,8 @@ export class AuthStateManager {
         const storedCustomAuthAvailable = Object.keys(context.customHeaders).length > 0;
         const storedAuthAvailable = AuthInjector.hasAuth(context);
         const baseline = this.burpRequestBaselines.get(identityId);
+        const isAuthBootstrapRoute = this.isAuthBootstrapUrl(opts.url);
+        const authSuppressedForIntent = ['anonymous_auth_probe', 'account_creation'].includes(intent) && isAuthBootstrapRoute;
 
         let likelyRequiresAuth = false;
         try {
@@ -401,6 +493,7 @@ export class AuthStateManager {
             likelyRequiresAuth =
                 this.isHostInScope(parsedUrl.hostname) &&
                 !this.isNoAuthPath(parsedUrl.pathname) &&
+                !authSuppressedForIntent &&
                 (
                     !!baseline?.hasAuthorization ||
                     !!baseline?.hasCookie ||
@@ -416,7 +509,9 @@ export class AuthStateManager {
         }
 
         let warning: string | undefined;
-        if (likelyRequiresAuth && context.authorizationHeader && !outgoingAuthorizationValue) {
+        if (authSuppressedForIntent && (storedAuthAvailable || explicitAuthorizationValue || explicitCookieValue || explicitCustomAuthPresent)) {
+            warning = `Managed auth intentionally suppressed for ${intent} on bootstrap auth route ${opts.url}.`;
+        } else if (likelyRequiresAuth && context.authorizationHeader && !outgoingAuthorizationValue) {
             warning = `Request is leaving without Authorization for ${identityId} even though managed token material is available.`;
         } else if (likelyRequiresAuth && storedAuthAvailable && !outgoingAuthorizationValue && !outgoingCookieValue && !outgoingCustomAuthPresent) {
             warning = `Request is leaving without any auth material for ${identityId} even though PenPard has stored auth state for this target.`;
@@ -426,7 +521,10 @@ export class AuthStateManager {
             identityId,
             method: method.toUpperCase(),
             url: opts.url,
+            intent,
             likelyRequiresAuth,
+            authSuppressedForIntent,
+            isAuthBootstrapRoute,
             storedAuthAvailable,
             storedAuthorizationAvailable: !!context.authorizationHeader,
             storedCookieAvailable: !!context.cookies,
@@ -539,6 +637,10 @@ export class AuthStateManager {
             block += 'PenPard will automatically capture session cookies and tokens from Burp proxy history.\n';
         }
 
+        if (this.startupInventory?.summary) {
+            block += `Startup auth summary: ${this.startupInventory.summary}\n`;
+        }
+
         return block;
     }
 
@@ -644,6 +746,18 @@ export class AuthStateManager {
         return lines.join('\n');
     }
 
+    private buildCredentialSet(credential: AuthStartupCredential): CredentialSet | undefined {
+        const username = credential.username || credential.email;
+        if (!username) return undefined;
+        return {
+            username,
+            password: credential.password,
+            loginMethod: 'browser',
+            capturedAt: new Date(),
+            source: credential.source || 'scan_config',
+        };
+    }
+
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL HELPERS
     // ═══════════════════════════════════════════════════════════
@@ -729,6 +843,39 @@ export class AuthStateManager {
             if (lower === path || lower.startsWith(path + '/') || lower.startsWith(path + '?')) return true;
         }
         return false;
+    }
+
+    inferRequestIntent(url: string, method: string = 'GET'): RequestAuthIntent {
+        let parsedUrl: URL | null = null;
+        try {
+            parsedUrl = new URL(url);
+        } catch {
+            return 'unknown';
+        }
+
+        const pathname = parsedUrl.pathname.toLowerCase();
+        const upperMethod = method.toUpperCase();
+
+        if (/\/(refresh|token\/refresh|session\/refresh)(?:\/|$|\?)/i.test(pathname)) {
+            return 'session_refresh';
+        }
+
+        if (this.injector.isAuthBootstrapPath(pathname)) {
+            if (/\/(register|signup|sign-up|create-account)(?:\/|$|\?)/i.test(pathname) && ['POST', 'PUT', 'PATCH'].includes(upperMethod)) {
+                return 'account_creation';
+            }
+            return 'anonymous_auth_probe';
+        }
+
+        return 'authenticated';
+    }
+
+    isAuthBootstrapUrl(url: string): boolean {
+        try {
+            return this.injector.isAuthBootstrapPath(new URL(url).pathname);
+        } catch {
+            return false;
+        }
     }
 
     private matchesProtectedPath(pathname: string): boolean {

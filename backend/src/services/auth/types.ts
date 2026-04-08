@@ -15,6 +15,8 @@ export type AuthCaptureSource =
     | 'burp_initial_request'
     | 'burp_set_cookie'
     | 'agent_explicit_request'
+    | 'browser_network_request'
+    | 'browser_network_response'
     | 'browser_context_cookies'
     | 'browser_local_storage'
     | 'browser_session_storage'
@@ -42,6 +44,147 @@ export type CSRFDeliveryMechanism = 'hidden_input' | 'meta_tag' | 'cookie_to_hea
 export type RefreshStrategy = 'jwt_refresh' | 'cookie_refresh' | 'browser_relogin' | 'api_relogin' | 'operator_manual';
 
 export type LoginMethod = 'form' | 'api' | 'browser' | 'token-only' | 'unknown';
+
+export type AuthStartupMode = 'provided_credentials' | 'no_credentials';
+
+export type CredentialPrivilege = 'low' | 'high' | 'unknown';
+
+export type AuthSurfaceType =
+    | 'login'
+    | 'register'
+    | 'forgot_password'
+    | 'reset_password'
+    | 'recover_account'
+    | 'verify_email'
+    | 'activation'
+    | 'onboarding'
+    | 'otp'
+    | 'mfa'
+    | 'totp'
+    | 'sso'
+    | 'invite'
+    | 'magic_link'
+    | 'unknown';
+
+export interface AuthStartupCredential {
+    username?: string;
+    email?: string;
+    password?: string;
+    label?: string;
+    role?: string;
+    privilege?: CredentialPrivilege;
+    source?: CredentialSource;
+}
+
+export interface AuthStartupConfig {
+    mode: AuthStartupMode;
+    credentials: AuthStartupCredential[];
+    allowAccountCreation: boolean;
+    preferSharedPassword: boolean;
+}
+
+export interface AuthInventoryField {
+    name: string;
+    type: string;
+    id?: string;
+    label?: string;
+    placeholder?: string;
+    autocomplete?: string;
+    selector?: string;
+    value?: string;
+    required?: boolean;
+}
+
+export interface AuthInventoryElement {
+    type: AuthSurfaceType;
+    selector: string;
+    tagName: string;
+    text: string;
+    href?: string;
+    action?: string;
+    formId?: string;
+    provider?: string;
+    routeHint?: string;
+}
+
+export interface AuthInventoryForm {
+    type: AuthSurfaceType;
+    formId: string;
+    selector?: string;
+    action: string;
+    method: string;
+    fields: AuthInventoryField[];
+    hiddenInputs: AuthInventoryField[];
+    submitElements: AuthInventoryElement[];
+    antiAutomationMarkers: string[];
+    inlineValidation: string[];
+}
+
+export interface AuthTrafficObservation {
+    source: 'browser' | 'burp';
+    method: string;
+    url: string;
+    statusCode?: number;
+    requestHeaders?: Record<string, string>;
+    responseHeaders?: Record<string, string>;
+    setCookieNames?: string[];
+    authorizationScheme?: string;
+    storageKeys?: string[];
+    redirectChain?: string[];
+    linkedActionId?: string;
+}
+
+export interface AuthStartupActionRecord {
+    id: string;
+    type: 'navigate' | 'click' | 'submit' | 'login' | 'register' | 'discovery';
+    label: string;
+    target?: string;
+    selector?: string;
+    identityId?: string;
+    outcome: 'success' | 'failed' | 'skipped';
+    notes?: string[];
+    observedUrls: string[];
+}
+
+export interface AuthTransportSummary {
+    carriesAuthorizationHeader: boolean;
+    authorizationSchemes: string[];
+    cookieNames: string[];
+    localStorageKeys: string[];
+    sessionStorageKeys: string[];
+    indexedDbNames: string[];
+    csrfHeaders: string[];
+    csrfFormFields: string[];
+    csrfMetaNames: string[];
+    csrfCookieNames: string[];
+    mixedTransport: boolean;
+    evidence: string[];
+}
+
+export interface AuthStartupInventory {
+    mode: AuthStartupMode;
+    status: 'partial' | 'completed' | 'failed';
+    browserSessionId?: string;
+    authRoutes: string[];
+    forms: AuthInventoryForm[];
+    domElements: AuthInventoryElement[];
+    traffic: AuthTrafficObservation[];
+    actions: AuthStartupActionRecord[];
+    discoveredCredentials: Array<AuthStartupCredential & {
+        identityId?: string;
+        created?: boolean;
+        success?: boolean;
+    }>;
+    ssoProviders: string[];
+    blockers: string[];
+    registrationAvailable: boolean;
+    passwordResetAvailable: boolean;
+    activationRequired: boolean;
+    transport: AuthTransportSummary;
+    startedAt: string;
+    completedAt?: string;
+    summary: string;
+}
 
 // ═══════════════════════════════════════════════════════════
 //  CORE IDENTITY MODELS
@@ -209,7 +352,10 @@ export interface RequestAuthDiagnostics {
     identityId: string;
     method: string;
     url: string;
+    intent: RequestAuthIntent;
     likelyRequiresAuth: boolean;
+    authSuppressedForIntent: boolean;
+    isAuthBootstrapRoute: boolean;
     storedAuthAvailable: boolean;
     storedAuthorizationAvailable: boolean;
     storedCookieAvailable: boolean;
@@ -263,6 +409,14 @@ export interface RequestAuthBindingRules {
     /** Strip auth when following redirects to different domains. */
     stripAuthOnRedirect: boolean;
 }
+
+export type RequestAuthIntent =
+    | 'authenticated'
+    | 'anonymous_auth_probe'
+    | 'account_creation'
+    | 'session_refresh'
+    | 'browser_sync'
+    | 'unknown';
 
 // ═══════════════════════════════════════════════════════════
 //  EXPORT FORMAT
@@ -383,6 +537,27 @@ export const LOGIN_PATH_PATTERNS = [
 export const DEFAULT_NO_AUTH_PATHS = [
     '/logout', '/signout', '/sign-out',
     '/favicon.ico', '/robots.txt', '/sitemap.xml',
+];
+
+/** Bootstrap auth routes that should stay anonymous unless explicitly overridden. */
+export const AUTH_BOOTSTRAP_PATH_PATTERNS = [
+    /\/login(?:\/|$|\?)/i,
+    /\/signin(?:\/|$|\?)/i,
+    /\/sign-in(?:\/|$|\?)/i,
+    /\/register(?:\/|$|\?)/i,
+    /\/signup(?:\/|$|\?)/i,
+    /\/sign-up(?:\/|$|\?)/i,
+    /\/create-account(?:\/|$|\?)/i,
+    /\/forgot(?:\/|$|\?)/i,
+    /\/forgot-password(?:\/|$|\?)/i,
+    /\/reset-password(?:\/|$|\?)/i,
+    /\/recover-account(?:\/|$|\?)/i,
+    /\/security-question(?:\/|$|\?)/i,
+    /\/verify-email(?:\/|$|\?)/i,
+    /\/activation(?:\/|$|\?)/i,
+    /\/onboarding(?:\/|$|\?)/i,
+    /\/invite(?:\/|$|\?)/i,
+    /\/magic-link(?:\/|$|\?)/i,
 ];
 
 /** Redaction helper: show first 4 + last 4, mask middle. */

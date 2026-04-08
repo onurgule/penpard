@@ -112,7 +112,7 @@ export class SessionHealthMonitor {
      * Analyze an HTTP response for auth state signals.
      * Called after every `send_http_request`.
      */
-    analyzeResponse(identityId: string, statusCode: number, headers: Record<string, string>, body: string): {
+    analyzeResponse(identityId: string, statusCode: number, headers: Record<string, string>, body: string, intent: string = 'authenticated'): {
         needsRefresh: boolean;
         needsRelogin: boolean;
         isCSRFFailure: boolean;
@@ -120,6 +120,15 @@ export class SessionHealthMonitor {
         const health = this.healthStates.get(identityId);
         const session = this.sessionStates.get(identityId);
         if (!health || !session) return { needsRefresh: false, needsRelogin: false, isCSRFFailure: false };
+
+        const skipHealthTracking = intent === 'anonymous_auth_probe' || intent === 'account_creation';
+        if (skipHealthTracking) {
+            return {
+                needsRefresh: false,
+                needsRelogin: false,
+                isCSRFFailure: AuthInjector.isCSRFFailure(statusCode, body),
+            };
+        }
 
         // Update last used
         session.lastUsedAt = new Date();
