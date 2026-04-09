@@ -239,15 +239,16 @@ export class ScanRuntimeService {
                     existingEndpoints: [...new Set(existingEndpoints)],
                 });
 
-                updateScanStatus(id, 'completed');
-                logger.info('Scan continuation completed', { scanId: id });
+                const finalPhase = this.resolveAgentFinalPhase(id, agent, 'completed');
+                if (finalPhase === 'completed') {
+                    updateScanStatus(id, 'completed');
+                }
+                logger.info('Scan continuation completed', { scanId: id, finalPhase });
             } catch (error: any) {
                 logger.error('Scan continuation error', { scanId: id, error: error.message });
                 updateScanStatus(id, 'failed', error.message);
             } finally {
-                this.registry.captureAgentLogs(id, agent);
-                agent.flushLogsToDB();
-                this.registry.unregister(id);
+                this.finalizeAgentRuntime(id, agent);
                 burpMCP.disconnect();
             }
         })();
@@ -454,13 +455,12 @@ ${suggestion.endpoints.join('\n')}`,
         try {
             await agent.start();
         } finally {
-            this.registry.captureAgentLogs(scanId, agent, this.resolveFinalPhase(scanId, 'completed'));
+            const finalPhase = this.resolveAgentFinalPhase(scanId, agent, 'completed');
+            this.registry.captureAgentLogs(scanId, agent, finalPhase);
             saveScanLogs(scanId, agent.getLogs(0));
             agent.stop();
             this.registry.unregister(scanId);
             burp.disconnect();
-
-            const finalPhase = this.resolveFinalPhase(scanId, 'completed');
             if (finalPhase === 'completed') {
                 updateScanStatus(scanId, 'completed');
             }
@@ -526,11 +526,21 @@ ${suggestion.endpoints.join('\n')}`,
         try {
             await agent.start();
         } finally {
-            this.registry.captureAgentLogs(scanId, agent);
-            agent.flushLogsToDB();
-            this.registry.unregister(scanId);
+            this.finalizeAgentRuntime(scanId, agent);
             burpMCP.disconnect();
         }
+    }
+
+    private finalizeAgentRuntime(scanId: string, agent: OrchestratorAgent): string {
+        const finalPhase = this.resolveAgentFinalPhase(scanId, agent, agent.getState().phase);
+        this.registry.captureAgentLogs(scanId, agent, finalPhase);
+        agent.flushLogsToDB();
+        this.registry.unregister(scanId);
+        return finalPhase;
+    }
+
+    private resolveAgentFinalPhase(scanId: string, agent: OrchestratorAgent, fallbackPhase: string): string {
+        return this.resolveFinalPhase(scanId, agent.getState().phase || fallbackPhase);
     }
 
     private resolveFinalPhase(scanId: string, fallbackPhase: string): string {

@@ -12,27 +12,28 @@
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
-import { addVulnerability, saveScanLogs, db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
+import { saveScanLogs, db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
 import { logger, formatLogTimestamp } from '../utils/logger';
-import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import fs from 'fs';
 import { mindsetService, MindsetTTP } from '../services/mindset-service';
 import { analyzeSource, buildAgentContextBlock } from '../services/source-analysis/SourceAnalysisService';
 import { SourceAnalysisMode } from '../services/source-analysis/SourceAnalysisMode';
-import { RequestHarvester, HarvestedRequest, PromotedRequest } from '../services/RequestHarvester';
-import { HypothesisEngine, VulnHypothesis, MutationTemplate } from '../services/HypothesisEngine';
+import { RequestHarvester } from '../services/RequestHarvester';
+import { HypothesisEngine } from '../services/HypothesisEngine';
 import { CoverageTracker } from '../services/CoverageTracker';
 import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
 import { browserService } from '../services/BrowserService';
-import { AuthStateManager, AuthInjector, IdentityRegistry, AuthStartupConfig, AuthStartupInventory } from '../services/auth';
-import { getHeaderValue, parseRawBurpRequest } from '../services/burp-request';
+import { AuthStateManager, AuthStartupConfig, AuthStartupInventory } from '../services/auth';
+import { parseRawBurpRequest } from '../services/burp-request';
 import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
 import { WebAuthStartupService } from '../services/WebAuthStartupService';
 import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
+import { OrchestratorFindingTracker } from './orchestrator/OrchestratorFindingTracker';
+import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
 import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
-import { evaluateToolExecutionGuard, hasCustomAuthHeader, resolveAuthIdentityId, resolveRequestAuthIntent } from './orchestrator/OrchestratorToolPolicy';
+import { evaluateToolExecutionGuard, resolveAuthIdentityId } from './orchestrator/OrchestratorToolPolicy';
 import { ToolCall } from './orchestrator/types';
 
 type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
@@ -470,17 +471,9 @@ export class OrchestratorAgent {
     /** 0 = no fixed limit (model decides); otherwise max planning rounds. */
     private maxPlanRounds: number = 0;
     private discoveredEndpoints: Set<string> = new Set();
-    private testedParameters: Map<string, Set<string>> = new Map(); // endpoint → set of tested vuln types
     private stepResults: { step: PlanStep; findings: any[]; toolResults: string[] }[] = [];
-
-    // Request tracking
-    private requestHistory: Map<string, { count: number; lastResponse: any; timestamp: Date }> = new Map();
     private rateLimitPauseUntil: Date | null = null;
-    private readonly MAX_SAME_REQUEST = 2;
     private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
-
-    // Store last request/response for findings (includes raw Burp data when available)
-    private lastRequestResponse: { action?: ToolCall; result?: any; rawRequest?: string; rawResponse?: string } | null = null;
 
     // Incremental log persistence — flush to DB periodically to survive crashes
     private lastFlushedLogIndex: number = 0;
@@ -507,7 +500,6 @@ export class OrchestratorAgent {
 
     // Browser session for AI-driven browser testing
     private browserSessionId: string | null = null;
-    private browserLock: boolean = false;
     private startupAuthInventory: AuthStartupInventory | null = null;
     private endpointInventory: EndpointInventorySnapshot | null = null;
 
@@ -516,10 +508,11 @@ export class OrchestratorAgent {
     private hypothesisEngine: HypothesisEngine;
     private coverageTracker: CoverageTracker;
     private lastFrontendAnalysis: any = null;
-    private frontendAnalysisVersion: number = 0;
 
     // ── Auth State Engine ──
     public authManager: AuthStateManager;
+    private readonly requestExecutor: OrchestratorRequestExecutor;
+    private readonly findingTracker: OrchestratorFindingTracker;
     private readonly scanStatus: OrchestratorScanStatus;
     private readonly toolDispatcher: OrchestratorToolDispatcher;
 
@@ -540,6 +533,37 @@ export class OrchestratorAgent {
 
         // Initialize auth state engine
         this.authManager = new AuthStateManager(scanId, targetUrl);
+        this.requestExecutor = new OrchestratorRequestExecutor({
+            scanId,
+            burp,
+            authManager: this.authManager,
+            initialRequest: config.initialRequest,
+            log: (channel, message) => this.log(channel as any, message),
+            delay: (ms) => this.delay(ms),
+            maxSameRequest: 2,
+            rateLimitPauseMs: this.RATE_LIMIT_PAUSE_MS,
+            setRateLimitPauseUntil: (until) => {
+                this.rateLimitPauseUntil = until;
+            },
+            onEndpointDiscovered: (url) => {
+                try {
+                    const parsed = new URL(url);
+                    this.discoveredEndpoints.add(parsed.pathname);
+                } catch {
+                    /* ignore */
+                }
+            },
+            onManagedAuthRefreshed: (identityId) => this.seedBrowserFromAuthManager(identityId),
+        });
+        this.findingTracker = new OrchestratorFindingTracker({
+            scanId,
+            burp,
+            log: (channel, message) => this.log(channel as any, message),
+            getLastExchange: () => this.requestExecutor.getLastExchange(),
+            onFindingSaved: (finding) => {
+                this.findings.push(finding);
+            },
+        });
         this.scanStatus = new OrchestratorScanStatus(scanId);
         this.toolDispatcher = new OrchestratorToolDispatcher({
             log: (channel, message) => this.log(channel as any, message),
@@ -1645,14 +1669,6 @@ Rules for subsequent work:
                             this.log('tool', `→ ${response.action.tool}: ${JSON.stringify(response.action.args).substring(0, 150)}`);
                             const result = await this.executeToolCall(response.action);
 
-                            // Track discovered endpoints
-                            if (response.action.tool === 'send_http_request' && response.action.args?.url) {
-                                try {
-                                    const url = new URL(response.action.args.url);
-                                    this.discoveredEndpoints.add(url.pathname);
-                                } catch { /* ignore */ }
-                            }
-
                             // Analyze for auto-detected vulns
                             if (result && !result.error && !result.skipped) {
                                 this.analyzeResponseForVulns(response.action, result);
@@ -2099,66 +2115,6 @@ Rules for subsequent work:
         return this.toolDispatcher.execute(toolCall);
     }
 
-    private normalizeRequestBody(rawBody: any): string {
-        if (rawBody === undefined || rawBody === null) return '';
-        if (typeof rawBody === 'string') return rawBody;
-        return JSON.stringify(rawBody);
-    }
-
-    private buildRequestHistoryKey(
-        method: string,
-        url: string,
-        body: string,
-        headers: Record<string, string>,
-        identityId: string,
-    ): string {
-        const sortedEntries = Object.entries(headers).sort(([a], [b]) => a.localeCompare(b));
-        return `${identityId}:${method}:${url}:${body}:${JSON.stringify(sortedEntries)}`;
-    }
-
-    private normalizeBurpHttpResult(result: any): {
-        result: any;
-        statusCode: number;
-        responseHeaders: Record<string, any> | Array<string>;
-        responseBody: string;
-    } {
-        const normalized = normalizeSendHttpResponse(result);
-        const baseResult = normalized.raw && typeof normalized.raw === 'object'
-            ? normalized.raw
-            : { rawResult: normalized.raw };
-
-        return {
-            result: {
-                ...baseResult,
-                statusCode: normalized.statusCode,
-                headers: normalized.headers,
-                body: normalized.body,
-            },
-            statusCode: normalized.statusCode,
-            responseHeaders: normalized.headers,
-            responseBody: normalized.body,
-        };
-    }
-
-    private async getLatestProxyEvidence(url: string): Promise<{ rawRequest?: string; rawResponse?: string }> {
-        try {
-            await this.delay(200);
-            const proxyHistory = await this.burp.callTool('get_proxy_history', {
-                count: 1,
-                includeDetails: true,
-                urlRegex: url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\?.*/, ''),
-            });
-            const entry = normalizeProxyHistoryItems(proxyHistory)[0];
-            return {
-                rawRequest: typeof entry?.request === 'string' ? entry.request : undefined,
-                rawResponse: typeof entry?.response === 'string' ? entry.response : undefined,
-            };
-        } catch (e: any) {
-            this.log('debug', `Could not fetch raw proxy data: ${e.message}`);
-            return {};
-        }
-    }
-
     private async syncAuthFromBrowser(identityId: string = 'primary-user'): Promise<void> {
         if (!this.browserSessionId || !browserService.isSessionAlive(this.browserSessionId)) {
             return;
@@ -2194,291 +2150,9 @@ Rules for subsequent work:
     }
 
     private async executeSendHttpRequest(toolCall: ToolCall): Promise<any> {
-        const url = toolCall.args.url;
-        const method = toolCall.args.method || 'GET';
-        const identityId = resolveAuthIdentityId(toolCall.args);
-        const preserveExplicitAuth = toolCall.args?.preserveExplicitAuth === true;
-
-        // Block SQLMap-style UNION SELECT null enumeration
-        const decodedUrl = (() => { try { return decodeURIComponent(url); } catch { return url; } })();
-        const unionNullMatch = decodedUrl.match(/union\s+select\s+null(?:,\s*null)*/gi);
-        if (unionNullMatch) {
-            const nullCount = (unionNullMatch[0].match(/null/gi) || []).length;
-            if (nullCount >= 5) {
-                this.log('tool', `⚠️ Blocked SQLMap-style payload (${nullCount} nulls). Use send_to_scanner.`);
-                const baseUrl = url.split('?')[0];
-                return {
-                    error: `SQLMap-style fuzzing blocked. Use send_to_scanner with ${baseUrl} instead.`,
-                    blocked: true,
-                    suggestion: { tool: 'send_to_scanner', args: { url: baseUrl } }
-                };
-            }
-        }
-
-        const originalBody = this.normalizeRequestBody(toolCall.args.body ?? toolCall.args.data ?? '');
-        const originalHeaders = toolCall.args.headers as Record<string, string> | undefined;
-        const requestIntent = resolveRequestAuthIntent({
-            requestedIntent: toolCall.args.requestIntent,
-            identityId,
-            inferIntent: () => this.authManager.inferRequestIntent(url, method),
-        });
-        const existingAuthContext = this.authManager.inject(url, method, identityId, requestIntent);
-        const explicitAuthorization = getHeaderValue(originalHeaders, 'authorization');
-        const explicitCookie = getHeaderValue(originalHeaders, 'cookie');
-        const explicitCustomAuth = hasCustomAuthHeader(originalHeaders);
-
-        if (
-            !preserveExplicitAuth &&
-            identityId !== IdentityRegistry.ANONYMOUS_ID &&
-            (
-                (!!explicitAuthorization && !existingAuthContext.authorizationHeader) ||
-                (!!explicitCookie && !existingAuthContext.cookies) ||
-                (explicitCustomAuth && Object.keys(existingAuthContext.customHeaders).length === 0)
-            )
-        ) {
-            this.authManager.captureFromStructuredRequest({
-                requestHeaders: originalHeaders || {},
-                url,
-                body: originalBody,
-            }, identityId);
-        }
-
-        let preparedRequest = this.authManager.prepareRequest(
-            originalHeaders,
-            originalBody,
-            url,
-            method,
-            identityId,
-            preserveExplicitAuth,
-            requestIntent,
-        );
-        let requestDiagnostics = this.authManager.assessPreparedRequest({
-            originalHeaders,
-            preparedHeaders: preparedRequest.headers,
-            url,
-            method,
-            identityId,
-            preserveExplicitAuth,
-            intent: requestIntent,
-        });
-        const isBurpOriginatedRequest = !!this.config.initialRequest?.trim();
-        if (isBurpOriginatedRequest && requestDiagnostics.warning) {
-            this.log('system', `⚠️ Auth Warning: ${requestDiagnostics.warning}`);
-        }
-        if (requestDiagnostics.authSuppressedForIntent) {
-            this.log('system', `Auth Guardrail: suppressing stored auth for ${requestIntent} on ${method} ${url}`);
-        }
-
-        const requestKey = this.buildRequestHistoryKey(
-            method,
-            url,
-            preparedRequest.body,
-            preparedRequest.headers,
-            identityId,
-        );
-
-        // Check for duplicate requests - only exact same request
-        const existing = this.requestHistory.get(requestKey);
-        if (existing && existing.count >= this.MAX_SAME_REQUEST) {
-            this.log('tool', `⚠️ Skipping exact duplicate request (${existing.count}x): ${method} ${url.substring(0, 80)}`);
-            return {
-                ...existing.lastResponse,
-                cached: true,
-                message: `Cached response. This exact request was sent ${existing.count} times already. Try different parameters or payloads.`
-            };
-        }
-
-        let requestArgs: Record<string, any> = {};
-        const sendThroughBurp = async (headers: Record<string, string>, body: string) => {
-            const args = {
-                ...toolCall.args,
-                headers,
-                body,
-                identityId,
-            } as Record<string, any>;
-            delete args.data;
-
-            requestArgs = args;
-            return await this.burp.callTool('send_http_request', {
-                ...args,
-                use_proxy: true,
-                penpard_source: `Orchestrator/${this.scanId}`
-            });
-        };
-
-        let normalizedResult = this.normalizeBurpHttpResult(
-            await sendThroughBurp(preparedRequest.headers, preparedRequest.body),
-        );
-        let result = normalizedResult.result;
-        let { rawRequest, rawResponse } = await this.getLatestProxyEvidence(url);
-        let statusCode = normalizedResult.statusCode;
-        let responseHeaders = normalizedResult.responseHeaders;
-        let responseBody = normalizedResult.responseBody;
-        let authHealth = this.authManager.handleResponse(
-            statusCode, responseHeaders, responseBody, url, identityId, requestIntent
-        );
-        let retriedAfterAuthInjection = false;
-
-        const shouldRetryWithManagedAuth =
-            statusCode === 401 &&
-            identityId !== IdentityRegistry.ANONYMOUS_ID &&
-            isBurpOriginatedRequest &&
-            requestDiagnostics.likelyRequiresAuth &&
-            requestDiagnostics.storedAuthAvailable &&
-            !requestDiagnostics.outgoingAuthorizationPresent &&
-            !requestDiagnostics.outgoingCookiePresent &&
-            !requestDiagnostics.outgoingCustomAuthPresent &&
-            !requestDiagnostics.explicitAuthorizationKeyPresent &&
-            !requestDiagnostics.explicitCookieKeyPresent &&
-            !requestDiagnostics.explicitCustomAuthKeyPresent;
-
-        if (shouldRetryWithManagedAuth) {
-            this.log('system', `🔐 Auth Recovery: ${method} ${url} received 401 without outgoing auth. Retrying once with stored auth material...`);
-
-            preparedRequest = this.authManager.prepareRequest(
-                originalHeaders,
-                originalBody,
-                url,
-                method,
-                identityId,
-                false,
-                requestIntent,
-            );
-            requestDiagnostics = this.authManager.assessPreparedRequest({
-                originalHeaders,
-                preparedHeaders: preparedRequest.headers,
-                url,
-                method,
-                identityId,
-                preserveExplicitAuth: false,
-                intent: requestIntent,
-            });
-
-            if (
-                requestDiagnostics.outgoingAuthorizationPresent ||
-                requestDiagnostics.outgoingCookiePresent ||
-                requestDiagnostics.outgoingCustomAuthPresent
-            ) {
-                normalizedResult = this.normalizeBurpHttpResult(
-                    await sendThroughBurp(preparedRequest.headers, preparedRequest.body),
-                );
-                result = normalizedResult.result;
-                statusCode = normalizedResult.statusCode;
-                responseHeaders = normalizedResult.responseHeaders;
-                responseBody = normalizedResult.responseBody;
-                authHealth = this.authManager.handleResponse(
-                    statusCode,
-                    responseHeaders,
-                    responseBody,
-                    url,
-                    identityId,
-                    requestIntent,
-                );
-                retriedAfterAuthInjection = true;
-                result = {
-                    ...result,
-                    retriedAfterAuthInjection: true,
-                };
-            } else {
-                this.log('system', `⚠️ Auth Warning: Stored auth recovery was attempted for ${identityId}, but PenPard still could not prepare any auth headers for retry.`);
-            }
-        }
-
-        // Auto-refresh and retry once for managed auth requests
-        if (authHealth.needsRefresh && !authHealth.needsRelogin && (!preserveExplicitAuth || retriedAfterAuthInjection) && identityId !== IdentityRegistry.ANONYMOUS_ID) {
-            this.log('system', `🔐 Auth State Engine: Session for ${identityId} needs refresh — retrying once...`);
-
-            try {
-                const refreshed = await this.authManager.refreshSession(identityId, this.burp);
-                if (refreshed) {
-                    await this.seedBrowserFromAuthManager(identityId);
-
-                    const retryPreparedRequest = this.authManager.prepareRequest(
-                        originalHeaders,
-                        originalBody,
-                        url,
-                        method,
-                        identityId,
-                        false,
-                        requestIntent,
-                    );
-
-                    normalizedResult = this.normalizeBurpHttpResult(
-                        await sendThroughBurp(retryPreparedRequest.headers, retryPreparedRequest.body),
-                    );
-                    result = normalizedResult.result;
-                    statusCode = normalizedResult.statusCode;
-                    responseHeaders = normalizedResult.responseHeaders;
-                    responseBody = normalizedResult.responseBody;
-                    authHealth = this.authManager.handleResponse(
-                        statusCode,
-                        responseHeaders,
-                        responseBody,
-                        url,
-                        identityId,
-                        requestIntent,
-                    );
-
-                    result = {
-                        ...result,
-                        retriedAfterRefresh: true,
-                    };
-                }
-            } catch (e: any) {
-                this.log('error', `Auth refresh failed: ${e.message}`);
-            }
-        }
-        if (requestDiagnostics.warning) {
-            result = {
-                ...result,
-                authWarning: requestDiagnostics.warning,
-            };
-        }
-        if (authHealth.needsRelogin) {
-            this.log('system', `⚠️ Auth State Engine: Session for ${identityId} is dead — re-login required`);
-        }
-        if (authHealth.isCSRFFailure) {
-            this.log('system', `🛡 Auth State Engine: CSRF validation failed for ${identityId} — token may need refresh`);
-        }
-
-        // Check for 429
-        if (statusCode === 429) {
-            this.rateLimitPauseUntil = new Date(Date.now() + this.RATE_LIMIT_PAUSE_MS);
-            this.log('tool', `🚫 429 Rate Limited! Pausing for 1 minute...`);
-            result = { ...result, rateLimited: true, message: 'Rate limited. Pausing 1 minute.' };
-        }
-
-        // Refresh raw request/response after any retry so evidence matches the final request.
-        ({ rawRequest, rawResponse } = await this.getLatestProxyEvidence(url));
-
-        // Track request using the final response after any refresh retry
-        this.requestHistory.set(requestKey, {
-            count: (existing?.count || 0) + 1,
-            lastResponse: result,
-            timestamp: new Date()
-        });
-
-        // Store for findings — includes raw Burp data when available
-        this.lastRequestResponse = {
-            action: {
-                ...toolCall,
-                args: requestArgs,
-            },
-            result,
-            rawRequest,
-            rawResponse,
-        };
-
-        // Track endpoint
-        try {
-            const parsedUrl = new URL(url);
-            this.discoveredEndpoints.add(parsedUrl.pathname);
-        } catch { /* ignore */ }
-
-        return result;
+        return this.requestExecutor.execute(toolCall);
     }
 
-    // ═══════════════════════════════════════════════════════════
     //  RAW HTTP REQUEST PARSER
     // ═══════════════════════════════════════════════════════════
 
@@ -3106,291 +2780,13 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
 
     private saveFinding(finding: any) {
-        if (!finding || typeof finding !== 'object') {
-            this.log('debug', 'Skipping invalid finding (not an object)');
-            return;
-        }
-
-        // Build a name if missing or generic
-        if (!finding.name || finding.name === 'Security Issue' || finding.name === 'Vulnerability Found') {
-            // Determine vulnerability type from all available fields
-            const typeFromFields = finding.type || finding.vulnerability || finding.title || '';
-            const cweToType: Record<string, string> = {
-                'CWE-79': 'Cross-Site Scripting (XSS)', 'CWE-89': 'SQL Injection', 'CWE-22': 'Path Traversal',
-                'CWE-78': 'Command Injection', 'CWE-918': 'SSRF', 'CWE-352': 'CSRF', 'CWE-287': 'Authentication Bypass',
-                'CWE-639': 'IDOR', 'CWE-601': 'Open Redirect', 'CWE-200': 'Information Disclosure',
-                'CWE-311': 'Missing Encryption', 'CWE-434': 'Unrestricted File Upload', 'CWE-502': 'Deserialization',
-                'CWE-611': 'XXE', 'CWE-94': 'Code Injection', 'CWE-862': 'Missing Authorization',
-            };
-            const typeFromCwe = finding.cwe ? cweToType[finding.cwe] || '' : '';
-
-            // Extract type from description/evidence keywords
-            let typeFromDesc = '';
-            const descText = ((finding.description || '') + ' ' + (finding.evidence || '')).toLowerCase();
-            const descPatterns: [string, RegExp][] = [
-                ['SQL Injection', /sql\s*inject|sqli|sql\s*error|database\s*error/i],
-                ['Cross-Site Scripting (XSS)', /xss|cross.site.script|script.*alert|reflected.*payload/i],
-                ['Path Traversal', /path\s*traversal|directory\s*traversal|lfi|local\s*file/i],
-                ['Command Injection', /command\s*inject|os\s*command|cmdi|shell/i],
-                ['SSRF', /ssrf|server.side\s*request/i],
-                ['CSRF', /csrf|cross.site\s*request\s*forgery/i],
-                ['IDOR', /idor|insecure\s*direct\s*object/i],
-                ['Open Redirect', /open\s*redirect/i],
-                ['Information Disclosure', /information\s*disclos|sensitive\s*data|stack\s*trace|debug|error\s*message/i],
-                ['Authentication Bypass', /auth.*bypass|broken\s*auth/i],
-                ['Missing Security Headers', /security\s*header|x-frame|hsts|csp|x-content/i],
-                ['Insecure Cookie', /cookie.*secure|httponly|samesite/i],
-            ];
-            for (const [label, regex] of descPatterns) {
-                if (regex.test(descText)) { typeFromDesc = label; break; }
-            }
-
-            const vulnType = typeFromFields || typeFromCwe || typeFromDesc || 'Security Issue';
-
-            // Determine endpoint from all available fields
-            let endpoint = finding.endpoint || finding.url || finding.path || finding.location || '';
-            if (!endpoint && finding.request) {
-                // Extract URL path from request string like "GET /api/foo HTTP/1.1"
-                const reqMatch = String(finding.request).match(/(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\S+)/i);
-                if (reqMatch) endpoint = reqMatch[1];
-            }
-            if (!endpoint && this.lastRequestResponse?.action?.args?.url) {
-                endpoint = this.lastRequestResponse.action.args.url;
-            }
-            // Trim to path only (remove host/query for readability)
-            if (endpoint) {
-                try {
-                    const u = new URL(endpoint.startsWith('http') ? endpoint : `https://x${endpoint}`);
-                    endpoint = u.pathname + (u.search ? u.search.substring(0, 40) : '');
-                } catch { /* keep as-is */ }
-            }
-
-            const param = finding.parameter || finding.param || '';
-
-            finding.name = endpoint
-                ? `${vulnType} - ${endpoint}${param ? ` (${param})` : ''}`
-                : `${vulnType}`;
-
-            this.log('debug', `Finding had no/generic name, generated: ${finding.name}`);
-        }
-
-        // Deduplicate
-        const name = String(finding.name);
-        const vulnType = name.split(' - ')[0]?.toLowerCase().replace(/[^a-z]/g, '') || '';
-        const endpoint = name.split(' - ')[1]?.split(' ')[0]?.split('(')[0]?.trim() || '';
-        const existingNames = db.prepare('SELECT name FROM vulnerabilities WHERE scan_id = ?').all(this.scanId) as { name: string }[];
-        const isDuplicate = existingNames.some((row) => {
-            const rName = row.name || '';
-            const rType = rName.split(' - ')[0]?.toLowerCase().replace(/[^a-z]/g, '') || '';
-            const rPath = rName.split(' - ')[1]?.split(' ')[0]?.split('(')[0]?.trim() || '';
-            const typeMatch = vulnType && rType && (vulnType.includes(rType) || rType.includes(vulnType));
-            const pathMatch = !endpoint || !rPath || endpoint === rPath || rPath.includes(endpoint) || endpoint.includes(rPath);
-            return typeMatch && pathMatch;
-        });
-        if (isDuplicate) {
-            this.log('debug', `Skipping duplicate finding: ${name}`);
-            return;
-        }
-
-        this.log('vuln', `🚨 [${(finding.severity || 'MEDIUM').toUpperCase()}] ${name}`);
-
-        // Fill request/response from last tool call if not provided
-        let requestStr = finding.request || '';
-        let responseStr = finding.response || '';
-
-        if ((!requestStr || !responseStr) && this.lastRequestResponse) {
-            const action = this.lastRequestResponse.action;
-            const result = this.lastRequestResponse.result;
-            const rawReq = this.lastRequestResponse.rawRequest;
-            const rawRes = this.lastRequestResponse.rawResponse;
-
-            // Priority 1: Use raw request from Burp proxy history (has ALL headers: Host, Cookie, User-Agent, etc.)
-            if (!requestStr && rawReq) {
-                requestStr = rawReq;
-            }
-            // Priority 2: Reconstruct from agent's tool call args (fallback)
-            if (!requestStr && action?.args) {
-                const method = action.args.method || 'GET';
-                const url = action.args.url || '';
-                // Build a more complete request string
-                let reconstructed = `${method} ${url} HTTP/1.1\n`;
-                // Add Host header from URL
-                try {
-                    const parsedUrl = new URL(url);
-                    reconstructed += `Host: ${parsedUrl.host}\n`;
-                } catch { /* ignore */ }
-                // Add all headers from the tool call
-                if (action.args.headers) {
-                    Object.entries(action.args.headers).forEach(([key, value]) => {
-                        // Don't duplicate Host header
-                        if (key.toLowerCase() !== 'host') {
-                            reconstructed += `${key}: ${value}\n`;
-                        }
-                    });
-                }
-                if (action.args.body) {
-                    reconstructed += `\n${action.args.body}`;
-                }
-                requestStr = reconstructed;
-            }
-
-            // Priority 1: Use raw response from Burp proxy history (has ALL headers)
-            if (!responseStr && rawRes) {
-                responseStr = rawRes;
-            }
-            // Priority 2: Reconstruct from tool result (fallback)
-            if (!responseStr && result) {
-                const statusCode = result.statusCode || result.status || 200;
-                responseStr = `HTTP/1.1 ${statusCode}\n`;
-                if (result.headers) {
-                    if (Array.isArray(result.headers)) {
-                        result.headers.forEach((header: string) => { responseStr += `${header}\n`; });
-                    } else if (typeof result.headers === 'object') {
-                        Object.entries(result.headers).forEach(([key, value]) => { responseStr += `${key}: ${value}\n`; });
-                    }
-                }
-                const body = result.body_preview || result.body || '';
-                if (body) { responseStr += `\n${body}`; }
-            }
-        }
-
-        try {
-            addVulnerability({
-                scanId: this.scanId,
-                name: name,
-                description: String(finding.description || finding.evidence || ''),
-                severity: String((finding.severity || 'medium')).toLowerCase(),
-                cvssScore: this.estimateCvss(finding.severity),
-                remediation: String(finding.remediation || ''),
-                cwe: String(finding.cwe || ''),
-                cve: String(finding.cve || ''),
-                request: String(requestStr || ''),
-                response: String(responseStr || ''),
-                evidence: String(finding.evidence || '')
-            });
-            this.log('system', `✓ Finding saved to DB: ${name}`);
-        } catch (dbErr: any) {
-            this.log('error', `Failed to save finding to DB: ${dbErr.message}. Finding: ${JSON.stringify({ name, severity: finding.severity, cwe: finding.cwe }).substring(0, 200)}`);
-        }
-
-        // Send to Repeater
-        try {
-            if (this.lastRequestResponse?.action) {
-                this.sendToRepeater(requestStr, name, this.lastRequestResponse.action).catch(() => { });
-            }
-        } catch { /* ignore repeater errors */ }
-
-        finding.name = name;
-        this.findings.push(finding);
+        this.findingTracker.saveFinding(finding);
     }
 
     private analyzeResponseForVulns(action: ToolCall, response: any): void {
-        if (!response) return;
-
-        const body = response.body_preview || response.body || '';
-        if (!body || body.length === 0) return;
-
-        const url = action.args?.url || '';
-        const method = action.args?.method || 'GET';
-        const statusCode = response.statusCode || response.status || 200;
-
-        // Check for reflected XSS
-        if (url.includes('?')) {
-            const queryString = url.split('?')[1];
-            const params = new URLSearchParams(queryString);
-
-            for (const [paramName, rawPayload] of params.entries()) {
-                if (!rawPayload || rawPayload.length < 3) continue;
-
-                try {
-                    const decodedPayload = decodeURIComponent(rawPayload);
-                    const xssIndicators = [
-                        '<script', '</script>', 'onerror=', 'onload=', 'onclick=', 'onmouseover=',
-                        '<img', '<svg', '<iframe', '<body', '<input', 'javascript:', 'alert(',
-                        'eval(', 'document.cookie', 'document.write'
-                    ];
-
-                    const hasXssIndicator = xssIndicators.some(ind => decodedPayload.toLowerCase().includes(ind.toLowerCase()));
-                    if (!hasXssIndicator) continue;
-
-                    const isReflected =
-                        body.includes(decodedPayload) ||
-                        body.includes(rawPayload) ||
-                        (decodedPayload.includes('<') && body.includes('<') &&
-                            decodedPayload.includes('>') && body.includes('>') &&
-                            decodedPayload.length > 10 && body.includes(decodedPayload.substring(0, Math.min(20, decodedPayload.length))));
-
-                    if (isReflected) {
-                        this.log('vuln', `🚨 XSS DETECTED: Payload reflected! Parameter: ${paramName}`);
-
-                        // Prefer raw Burp proxy data (has ALL headers: Cookie, User-Agent, etc.)
-                        let reqStr = this.lastRequestResponse?.rawRequest || '';
-                        if (!reqStr) {
-                            reqStr = `${method} ${url} HTTP/1.1\n`;
-                            try { const pu = new URL(url); reqStr += `Host: ${pu.host}\n`; } catch { }
-                            if (action.args?.headers) Object.entries(action.args.headers).forEach(([k, v]) => { if (k.toLowerCase() !== 'host') reqStr += `${k}: ${v}\n`; });
-                            if (action.args?.body) reqStr += `\n${action.args.body}`;
-                        }
-
-                        let resStr = this.lastRequestResponse?.rawResponse || '';
-                        if (!resStr) {
-                            resStr = `HTTP/1.1 ${statusCode}\n`;
-                            if (response.headers && Array.isArray(response.headers)) response.headers.forEach((h: string) => { resStr += `${h}\n`; });
-                            resStr += `\n${body.substring(0, 5000)}`;
-                        }
-
-                        this.saveFinding({
-                            name: `Reflected XSS - ${url.split('?')[0]} (${paramName} parameter)`,
-                            severity: 'high',
-                            description: `XSS payload reflected without encoding in HTML response.`,
-                            evidence: `Payload "${decodedPayload.substring(0, 100)}" reflected in response. Status: ${statusCode}`,
-                            cwe: 'CWE-79',
-                            request: reqStr,
-                            response: resStr,
-                            remediation: 'HTML-encode all user input. Implement Content Security Policy (CSP).'
-                        });
-                        return;
-                    }
-                } catch { continue; }
-            }
-        }
-
-        // Check for SQL injection errors
-        const sqlErrors = ['sql syntax', 'mysql_fetch', 'ora-', 'postgresql', 'sqlite', 'sql error', 'database error'];
-        if (sqlErrors.some(err => body.toLowerCase().includes(err))) {
-            const payload = action.args?.body || action.args?.url?.match(/[?&][^=]+=([^&]+)/)?.[1] || '';
-            if (payload && (payload.includes("'") || payload.includes('"') || payload.includes('--'))) {
-                // Prefer raw Burp proxy data (has ALL headers: Cookie, User-Agent, etc.)
-                let reqStr = this.lastRequestResponse?.rawRequest || '';
-                if (!reqStr) {
-                    reqStr = `${method} ${url} HTTP/1.1\n`;
-                    try { const pu = new URL(url); reqStr += `Host: ${pu.host}\n`; } catch { }
-                    if (action.args?.headers) Object.entries(action.args.headers).forEach(([k, v]) => { if (k.toLowerCase() !== 'host') reqStr += `${k}: ${v}\n`; });
-                    if (action.args?.body) reqStr += `\n${action.args.body}`;
-                }
-
-                let resStr = this.lastRequestResponse?.rawResponse || '';
-                if (!resStr) {
-                    resStr = `HTTP/1.1 ${statusCode}\n`;
-                    if (response.headers && Array.isArray(response.headers)) response.headers.forEach((h: string) => { resStr += `${h}\n`; });
-                    resStr += `\n${body.substring(0, 5000)}`;
-                }
-
-                this.saveFinding({
-                    name: `SQL Injection - ${url.split('?')[0]}`,
-                    severity: 'critical',
-                    description: `SQL error message detected in response, indicating SQL injection vulnerability.`,
-                    evidence: `SQL error: ${body.match(new RegExp(sqlErrors.find(e => body.toLowerCase().includes(e)) || '', 'i'))?.[0] || 'DB error'}`,
-                    cwe: 'CWE-89',
-                    request: reqStr,
-                    response: resStr,
-                    remediation: 'Use parameterized queries/prepared statements. Never concatenate user input into SQL.'
-                });
-            }
-        }
+        this.findingTracker.analyzeResponseForVulns(action, response);
     }
 
-    // ═══════════════════════════════════════════════════════════
     //  BROWSER TOOLS — AI-driven browser testing
     // ═══════════════════════════════════════════════════════════
 
@@ -3844,143 +3240,9 @@ Rules for subsequent work:
         this.flushLogsToDB();
     }
 
-    /** Normalize request for Repeater */
-    private normalizeRequestForRepeater(raw: string): string {
-        const lines = raw.split(/\r?\n/);
-        const result: string[] = [];
-        let bodyStart = -1;
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            if (i === 0) { result.push(line.replace(/\s+/g, ' ').trim()); continue; }
-            if (line.trim() === '') { bodyStart = i; break; }
-            const colonIdx = line.indexOf(':');
-            if (colonIdx > 0) {
-                const name = line.substring(0, colonIdx).trim();
-                const value = line.substring(colonIdx + 1).trim().replace(/[\r\n]/g, ' ');
-                const nameNormalized = name.split('-').map(p => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join('-');
-                result.push(`${nameNormalized}: ${value}`);
-            }
-        }
-        result.push('');
-        if (bodyStart >= 0 && bodyStart < lines.length - 1) {
-            result.push(lines.slice(bodyStart + 1).join('\n'));
-        }
-        return result.join('\r\n');
-    }
-
-    private async sendToRepeater(requestStr: string, vulnName: string, action?: ToolCall): Promise<void> {
-        try {
-            let host = '';
-            let port = 80;
-            let useHttps = false;
-            let finalRequest = requestStr;
-
-            // Priority 1: Use raw request from Burp proxy (has ALL headers: Cookie, User-Agent, etc.)
-            const rawReq = this.lastRequestResponse?.rawRequest;
-            if (rawReq && action?.args?.url) {
-                try {
-                    const url = new URL(action.args.url);
-                    host = url.hostname;
-                    port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-                    useHttps = url.protocol === 'https:';
-
-                    // Raw request from Burp already has the correct format with all headers
-                    // Just ensure it uses relative path (not full URL) for Repeater
-                    finalRequest = rawReq;
-                    // If the raw request has a full URL in the request line, convert to relative path
-                    const firstLine = finalRequest.split(/\r?\n/)[0];
-                    const fullUrlMatch = firstLine.match(/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+https?:\/\/[^\/]+(\/[^\s]*)\s+(HTTP\/\S+)/i);
-                    if (fullUrlMatch) {
-                        finalRequest = `${fullUrlMatch[1]} ${fullUrlMatch[2]} ${fullUrlMatch[3]}` + finalRequest.substring(firstLine.length);
-                    }
-                } catch { /* fallback below */ }
-            }
-            // Priority 2: Reconstruct from action args (fallback)
-            else if (action?.args?.url) {
-                try {
-                    const url = new URL(action.args.url);
-                    host = url.hostname;
-                    port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-                    useHttps = url.protocol === 'https:';
-
-                    const method = action.args.method || 'GET';
-                    const urlPath = url.pathname + url.search;
-                    const headerLines: string[] = [];
-                    headerLines.push(`Host: ${host}${port !== (useHttps ? 443 : 80) ? `:${port}` : ''}`);
-                    if (action.args.headers) {
-                        Object.entries(action.args.headers).forEach(([key, value]) => {
-                            if (key.toLowerCase() !== 'host') {
-                                const v = String(value).replace(/[\r\n]/g, ' ');
-                                const k = key.split('-').map(p => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join('-');
-                                headerLines.push(`${k}: ${v}`);
-                            }
-                        });
-                    }
-                    finalRequest = `${method} ${urlPath} HTTP/1.1\r\n` + headerLines.join('\r\n') + '\r\n\r\n';
-                    if (action.args.body) finalRequest += String(action.args.body).replace(/\r\n/g, '\n');
-                } catch { /* fallback below */ }
-            }
-
-            if (!host) {
-                const requestLines = requestStr.split('\n');
-                const requestLine = requestLines[0];
-                const urlMatch = requestLine.match(/(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(https?:\/\/[^\s]+)/i);
-                if (urlMatch) {
-                    const url = new URL(urlMatch[2]);
-                    host = url.hostname;
-                    port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-                    useHttps = url.protocol === 'https:';
-                    finalRequest = requestStr.replace(urlMatch[2], url.pathname + url.search);
-                } else {
-                    const hostHeader = requestLines.find(line => line.toLowerCase().startsWith('host:'));
-                    if (hostHeader) {
-                        const hostValue = hostHeader.split(':').slice(1).join(':').trim();
-                        const [hostName, portStr] = hostValue.split(':');
-                        host = hostName;
-                        port = portStr ? parseInt(portStr) : 80;
-                        useHttps = port === 443;
-                    }
-                }
-            }
-
-            if (host) {
-                const normalizedRequest = this.normalizeRequestForRepeater(finalRequest);
-                await this.burp.callTool('send_to_repeater', {
-                    host, port, useHttps,
-                    request: normalizedRequest,
-                    name: `${vulnName} - ${this.scanId.substring(0, 8)}`
-                });
-                this.log('debug', `✅ Sent to Repeater: ${vulnName}`);
-            }
-        } catch (error: any) {
-            this.log('debug', `Repeater send failed: ${error.message}`);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
     //  PENTESTER LOOP v2: Harvest → Classify → Hypothesize → Validate
     // ═══════════════════════════════════════════════════════════
 
-    /**
-     * Browser lock — ensures only one browser operation runs at a time.
-     * Prevents race conditions during show/hide transitions.
-     */
-    private async withBrowserLock<T>(fn: () => Promise<T>): Promise<T> {
-        if (this.browserLock) {
-            throw new Error('Browser operation in progress — retry later');
-        }
-        this.browserLock = true;
-        try {
-            return await fn();
-        } finally {
-            this.browserLock = false;
-        }
-    }
-
-    /**
-     * Delta frontend analysis — re-runs analysis after state changes.
-     * Captures new endpoints, tokens, and routes that appeared after navigation/form submission.
-     */
     private async deltaFrontendAnalysis(trigger: string): Promise<void> {
         if (!this.browserSessionId) return;
 
@@ -4012,7 +3274,6 @@ Rules for subsequent work:
             }
 
             this.lastFrontendAnalysis = newAnalysis;
-            this.frontendAnalysisVersion++;
             if (newEndpoints.length > 0) {
                 await this.refreshEndpointInventory(`delta-${trigger}`, false);
             }
@@ -4350,4 +3611,5 @@ Rules for subsequent work:
         };
     }
 }
+
 
