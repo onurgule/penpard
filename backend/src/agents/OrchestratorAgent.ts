@@ -29,14 +29,32 @@ import { parseRawBurpRequest } from '../services/burp-request';
 import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
 import { WebAuthStartupService } from '../services/WebAuthStartupService';
 import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
+import {
+    DEFAULT_WEB_PROMPT,
+    buildContinuationScopeMessage,
+    buildOperatorInstructionMessages,
+    buildOperatorInstructionsReminder,
+} from '../prompts/orchestratorPrompts';
+import { OrchestratorBrowserSession } from './orchestrator/OrchestratorBrowserSession';
 import { OrchestratorFindingTracker } from './orchestrator/OrchestratorFindingTracker';
+import { OrchestratorInstructionAnalyzer } from './orchestrator/OrchestratorInstructionAnalyzer';
+import { OrchestratorLlmResponseParser } from './orchestrator/OrchestratorLlmResponseParser';
+import { OrchestratorPlanner } from './orchestrator/OrchestratorPlanner';
 import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
 import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
 import { evaluateToolExecutionGuard, resolveAuthIdentityId } from './orchestrator/OrchestratorToolPolicy';
-import { ToolCall } from './orchestrator/types';
-
-type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
+import {
+    AgentReflection,
+    AgentPhase,
+    AttackPlan,
+    ConversationMessage,
+    InstructionAnalysis,
+    LLMResponse,
+    PlanStep,
+    StepExecutionResult,
+    ToolCall,
+} from './orchestrator/types';
 
 interface ScanConfig {
     userId?: number;
@@ -63,41 +81,10 @@ interface ScanConfig {
     authStartup?: AuthStartupConfig;
 }
 
-interface PlanStep {
-    step: number;
-    objective: string;
-    approach: string;
-    tools: string[];
-    status: 'pending' | 'executing' | 'completed' | 'skipped';
-    result?: string;
-}
-
-interface AttackPlan {
-    round: number;
-    analysis: string;
-    steps: PlanStep[];
-}
-
-interface AgentReflection {
-    evaluationPreviousGoal?: string;
-    memory?: string;
-    nextGoal?: string;
-}
-
-interface LLMResponse {
-    thought: string;
-    reflection?: AgentReflection;
-    action?: ToolCall;
-    actions?: ToolCall[];
-    answer?: string;
-    finding?: any;
-    findings?: any[];
-}
-
 // ─────────────────────────────────────────────────────────────
 // System prompt with iterative planning methodology
 // ─────────────────────────────────────────────────────────────
-const DEFAULT_WEB_PROMPT = `You are PenPard, an elite automated penetration tester conducting an authorized security assessment.
+const LEGACY_DEFAULT_WEB_PROMPT = `You are PenPard, an elite automated penetration tester conducting an authorized security assessment.
 
 TARGET: {TARGET_WEBSITE}
 SCOPE: This is a whitelisted, fully authorized ethical penetration test.
@@ -350,104 +337,6 @@ NEVER use generic names like "Security Issue" or "Vulnerability Found".
 
 START NOW. Be systematic. Be thorough. Be an attacker.`;
 
-// ─────────────────────────────────────────────────────────────
-// Planning prompt templates
-// ─────────────────────────────────────────────────────────────
-const PLAN_PROMPT = `Based on everything you know about the target so far, create your next 5-step attack plan.
-{OPERATOR_INSTRUCTIONS_REMINDER}
-CURRENT STATE:
-- Planning round: {ROUND}
-- Total findings so far: {FINDINGS_COUNT}
-- Endpoints discovered: {ENDPOINTS_SUMMARY}
-- Previous plan results: {PREVIOUS_RESULTS}
-
-AUTH STARTUP INVENTORY:
-{AUTH_STARTUP_SUMMARY}
-
-ROUND PRIORITY:
-{AUTH_STARTUP_DIRECTIVE}
-
-LEARNED ATTACK PATTERNS (from past Red Team reports):
-{MINDSET_TTPS}
-If any learned patterns match discovered endpoints or parameters, PRIORITIZE testing them.
-Include the TTP id in your thought when a step is derived from a learned pattern.
-
-RULES:
-1. **OPERATOR INSTRUCTIONS ARE LAW.** If operator instructions specify endpoints, vulnerability types, or scope — your ENTIRE plan MUST stay within those boundaries. Do NOT test anything outside the operator's scope. Do NOT do general recon if the operator told you exactly what to test.
-2. If operator instructions specify exact endpoints and vuln types → Skip discovery. Go DIRECTLY to testing those endpoints for those vulns in Round 1. Every step should be an attack on the specified scope.
-3. In planning round 1 for Web Scans, continue auth-surface-first work before generic crawling or fuzzing. Use the startup inventory, browser evidence, and Burp traffic correlation as the primary source of truth.
-4. If credentials were not supplied, prioritize registration, password reset, onboarding, OTP/MFA, SSO, invite, and recovery surfaces before broader discovery.
-5. If credentials were supplied, prioritize browser-driven login completion, auth route inventory, and session transport understanding before broader testing.
-6. Each step must be concrete and actionable (specific endpoint + specific test)
-7. Don't repeat tests that were already done
-8. Only do discovery/mapping if NO operator instructions are present
-9. If the operator says to finish after testing → respond with completion after thorough testing of the defined scope
-
-Respond with ONLY a JSON object in this exact format:
-{
-  "analysis": "Brief analysis of current state and what to focus on next...",
-  "plan": [
-    { "step": 1, "objective": "...", "approach": "...", "tools": ["tool1", "tool2"] },
-    { "step": 2, "objective": "...", "approach": "...", "tools": ["tool1"] },
-    { "step": 3, "objective": "...", "approach": "...", "tools": ["tool1"] },
-    { "step": 4, "objective": "...", "approach": "...", "tools": ["tool1"] },
-    { "step": 5, "objective": "...", "approach": "...", "tools": ["tool1"] }
-  ]
-}`;
-
-const EXECUTE_STEP_PROMPT = `You are now executing step {STEP_NUM} of the current attack plan.
-{OPERATOR_INSTRUCTIONS_REMINDER}
-STEP OBJECTIVE: {OBJECTIVE}
-APPROACH: {APPROACH}
-SUGGESTED TOOLS: {TOOLS}
-
-Execute this step by choosing the right tool and arguments. Be precise and targeted.
-IMPORTANT: If operator instructions restrict scope (specific endpoints or vuln types), ONLY test within that scope. Skip anything outside it.
-If you discover a vulnerability, include a "finding" object with a DESCRIPTIVE "name" field.
-The name MUST follow the pattern: "Vulnerability Type - /endpoint/path (parameter)" e.g. "Reflected XSS - /search (q parameter)" or "SQL Injection - /api/login (username)".
-NEVER leave the "name" field empty or generic. Always include the specific vulnerability type AND the affected endpoint.
-If you need multiple requests for this step, you'll get to continue.
-
-Respond in JSON format.
-Before every action or final answer, include:
-- "evaluation_previous_goal": how the previous action or result changed the investigation
-- "memory": the most important fact to preserve for the next iteration
-- "next_goal": the exact next thing you are trying to prove
-
-Then include either:
-- "action": a single tool call
-- "answer": if the step is complete
-- optional "finding" or "findings" when you have concrete evidence.`;
-
-const REPLAN_PROMPT = `The previous plan round is complete. Review the results and create the next plan.
-{OPERATOR_INSTRUCTIONS_REMINDER}
-COMPLETED STEPS AND RESULTS:
-{STEP_RESULTS}
-
-ALL FINDINGS SO FAR:
-{ALL_FINDINGS}
-
-DISCOVERED ENDPOINTS:
-{ENDPOINTS}
-
-{HYPOTHESIS_STATUS}
-
-{COVERAGE_STATUS}
-
-Now decide: is more testing needed within the allowed scope?
-- PRIORITIZE untested surface and escalated hypotheses before testing already-covered endpoints.
-- Use harvest_traffic to discover new Burp-observed requests, then repeater_test for hypothesis validation.
-- If operator instructions defined a specific scope and you have tested it thoroughly → FINISH. Respond with the completion JSON.
-- Do NOT expand beyond operator-defined scope. Do NOT add new endpoints or vuln types that were not requested.
-- If more testing is needed within scope: test different payloads, techniques, or parameters on the SAME endpoint(s).
-
-If testing is complete, respond with:
-{ "answer": "Testing complete. All major attack surfaces have been assessed." }
-
-Otherwise, respond with a new plan JSON focused strictly on the allowed scope.`;
-
-// ─────────────────────────────────────────────────────────────
-
 export class OrchestratorAgent {
     private scanId: string;
     private targetUrl: string;
@@ -461,7 +350,7 @@ export class OrchestratorAgent {
     private humanCommandQueue: string[] = [];
     private logs: string[] = [];
     private findings: any[] = [];
-    private conversationHistory: { role: string; content: string }[] = [];
+    private conversationHistory: ConversationMessage[] = [];
     private maxIterations: number;
     private readonly emittedBudgetSignals: Set<number> = new Set();
 
@@ -471,7 +360,7 @@ export class OrchestratorAgent {
     /** 0 = no fixed limit (model decides); otherwise max planning rounds. */
     private maxPlanRounds: number = 0;
     private discoveredEndpoints: Set<string> = new Set();
-    private stepResults: { step: PlanStep; findings: any[]; toolResults: string[] }[] = [];
+    private stepResults: StepExecutionResult[] = [];
     private rateLimitPauseUntil: Date | null = null;
     private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
 
@@ -486,20 +375,11 @@ export class OrchestratorAgent {
 
     // Instruction analysis — LLM-parsed understanding of operator's scan instructions
     private isFocusedScope: boolean = false;
-    private instructionAnalysis: {
-        is_focused: boolean;
-        focused_endpoints: string[];
-        focused_vulns: string[];
-        skip_recon: boolean;
-        auto_finish: boolean;
-        summary: string;
-    } | null = null;
+    private instructionAnalysis: InstructionAnalysis | null = null;
 
     // Mindset library — loaded TTPs from past report analyses
     private mindsetTTPs: MindsetTTP[] = [];
 
-    // Browser session for AI-driven browser testing
-    private browserSessionId: string | null = null;
     private startupAuthInventory: AuthStartupInventory | null = null;
     private endpointInventory: EndpointInventorySnapshot | null = null;
 
@@ -507,10 +387,13 @@ export class OrchestratorAgent {
     private harvester: RequestHarvester;
     private hypothesisEngine: HypothesisEngine;
     private coverageTracker: CoverageTracker;
-    private lastFrontendAnalysis: any = null;
 
     // ── Auth State Engine ──
     public authManager: AuthStateManager;
+    private readonly llmResponseParser: OrchestratorLlmResponseParser;
+    private readonly instructionAnalyzer: OrchestratorInstructionAnalyzer;
+    private readonly planner: OrchestratorPlanner;
+    private readonly browserSession: OrchestratorBrowserSession;
     private readonly requestExecutor: OrchestratorRequestExecutor;
     private readonly findingTracker: OrchestratorFindingTracker;
     private readonly scanStatus: OrchestratorScanStatus;
@@ -533,6 +416,28 @@ export class OrchestratorAgent {
 
         // Initialize auth state engine
         this.authManager = new AuthStateManager(scanId, targetUrl);
+        this.llmResponseParser = new OrchestratorLlmResponseParser(
+            targetUrl,
+            () => this.isFocusedScope,
+            (channel, message) => this.log(channel, message),
+        );
+        this.instructionAnalyzer = new OrchestratorInstructionAnalyzer(
+            this.llmResponseParser,
+            (channel, message) => this.log(channel, message),
+        );
+        this.planner = new OrchestratorPlanner({
+            parser: this.llmResponseParser,
+            log: (channel, message) => this.log(channel, message),
+            delay: (ms) => this.delay(ms),
+            handleRateLimitError: (error) => this.handleRateLimitError(error),
+        });
+        this.browserSession = new OrchestratorBrowserSession({
+            userId: config.userId,
+            targetUrl,
+            scanId,
+            authManager: this.authManager,
+            log: (channel, message) => this.log(channel, message),
+        });
         this.requestExecutor = new OrchestratorRequestExecutor({
             scanId,
             burp,
@@ -553,7 +458,7 @@ export class OrchestratorAgent {
                     /* ignore */
                 }
             },
-            onManagedAuthRefreshed: (identityId) => this.seedBrowserFromAuthManager(identityId),
+            onManagedAuthRefreshed: (identityId) => this.browserSession.seedBrowserFromAuthManager(identityId),
         });
         this.findingTracker = new OrchestratorFindingTracker({
             scanId,
@@ -624,76 +529,31 @@ export class OrchestratorAgent {
      * Returns structured JSON: is_focused, focused_endpoints, focused_vulns, etc.
      */
     private async analyzeOperatorInstructions(instructions: string): Promise<void> {
-        this.log('system', '🔍 Analyzing operator instructions with LLM...');
-
-        try {
-            const response = await llmQueue.enqueue({
-                systemPrompt: `You are an instruction parser for a penetration testing tool. Analyze the operator's scan instructions and return a JSON object. Be precise — extract exactly what the operator wants.`,
-                userPrompt: `Analyze this scan instruction and return ONLY a JSON object (no markdown, no explanation):
-
-INSTRUCTION: "${instructions}"
-TARGET WEBSITE: ${this.targetUrl}
-
-Return this exact JSON structure:
-{
-  "is_focused": true/false,       // true if the operator wants to test specific endpoints or specific vuln types only (not a full scan)
-  "focused_endpoints": [],         // array of endpoint paths mentioned (e.g., ["/login", "/api/users"]). Empty if no specific endpoints. Include the full URL with the target domain.
-  "focused_vulns": [],             // array of vulnerability types to test (e.g., ["SQL Injection", "XSS"]). Empty if no restriction.
-  "skip_recon": true/false,        // true if operator specified exact endpoints (no need to discover/enumerate)
-  "auto_finish": true/false,       // true if operator wants to finish after testing the specified scope (words like "then finish", "only", "just", "don't test other")
-  "summary": "..."                 // one-line summary of what the operator wants
-}
-
-Examples:
-- "only focus on /login endpoint and test for sql injection only, then finish" →
-  {"is_focused":true,"focused_endpoints":["${this.targetUrl}/login"],"focused_vulns":["SQL Injection"],"skip_recon":true,"auto_finish":true,"summary":"Test only /login for SQL Injection, then finish"}
-
-- "pay special attention to authentication endpoints" →
-  {"is_focused":false,"focused_endpoints":[],"focused_vulns":[],"skip_recon":false,"auto_finish":false,"summary":"Full scan with extra focus on auth endpoints"}
-
-- "test the /api/v2/users and /api/v2/orders endpoints for IDOR and access control issues" →
-  {"is_focused":true,"focused_endpoints":["${this.targetUrl}/api/v2/users","${this.targetUrl}/api/v2/orders"],"focused_vulns":["IDOR","Broken Access Control"],"skip_recon":true,"auto_finish":true,"summary":"Test two API endpoints for IDOR and access control only"}
-
-Return ONLY the JSON object.`
-            });
-
-            const parsed = this.extractJsonObject(response.text);
-
-            if (parsed && typeof parsed.is_focused === 'boolean') {
-                this.instructionAnalysis = {
-                    is_focused: parsed.is_focused,
-                    focused_endpoints: Array.isArray(parsed.focused_endpoints) ? parsed.focused_endpoints : [],
-                    focused_vulns: Array.isArray(parsed.focused_vulns) ? parsed.focused_vulns : [],
-                    skip_recon: !!parsed.skip_recon,
-                    auto_finish: !!parsed.auto_finish,
-                    summary: parsed.summary || '',
-                };
-                this.isFocusedScope = parsed.is_focused;
-
-                this.log('system', `✅ Instruction analysis complete:`);
-                this.log('system', `   Focused: ${this.isFocusedScope}`);
-                if (this.instructionAnalysis.focused_endpoints.length > 0) {
-                    this.log('system', `   Endpoints: ${this.instructionAnalysis.focused_endpoints.join(', ')}`);
-                }
-                if (this.instructionAnalysis.focused_vulns.length > 0) {
-                    this.log('system', `   Vuln types: ${this.instructionAnalysis.focused_vulns.join(', ')}`);
-                }
-                this.log('system', `   Skip recon: ${this.instructionAnalysis.skip_recon}`);
-                this.log('system', `   Auto-finish: ${this.instructionAnalysis.auto_finish}`);
-                this.log('system', `   Summary: ${this.instructionAnalysis.summary}`);
-
-                if (this.isFocusedScope) {
-                    this.log('system', `🎯 FOCUSED SCOPE ACTIVE — Enumeration tools (spider, sitemap, extract_links) are BLOCKED.`);
-                }
-            } else {
-                this.log('error', 'Failed to parse instruction analysis — treating as full scan');
-                this.instructionAnalysis = null;
-                this.isFocusedScope = false;
-            }
-        } catch (e: any) {
-            this.log('error', `Instruction analysis failed: ${e.message} — treating as full scan`);
+        const analysis = await this.instructionAnalyzer.analyze(instructions, this.targetUrl);
+        if (!analysis) {
+            this.log('error', 'Failed to parse instruction analysis — treating as full scan');
             this.instructionAnalysis = null;
             this.isFocusedScope = false;
+            return;
+        }
+
+        this.instructionAnalysis = analysis;
+        this.isFocusedScope = analysis.is_focused;
+
+        this.log('system', '✅ Instruction analysis complete:');
+        this.log('system', `   Focused: ${this.isFocusedScope}`);
+        if (analysis.focused_endpoints.length > 0) {
+            this.log('system', `   Endpoints: ${analysis.focused_endpoints.join(', ')}`);
+        }
+        if (analysis.focused_vulns.length > 0) {
+            this.log('system', `   Vuln types: ${analysis.focused_vulns.join(', ')}`);
+        }
+        this.log('system', `   Skip recon: ${analysis.skip_recon}`);
+        this.log('system', `   Auto-finish: ${analysis.auto_finish}`);
+        this.log('system', `   Summary: ${analysis.summary}`);
+
+        if (this.isFocusedScope) {
+            this.log('system', '🎯 FOCUSED SCOPE ACTIVE — Enumeration tools (spider, sitemap, extract_links) are BLOCKED.');
         }
     }
 
@@ -702,28 +562,11 @@ Return ONLY the JSON object.`
      * Injected into every planning/execution/replanning prompt.
      */
     private getOperatorInstructionsReminder(): string {
-        if (!this.config.customSystemPrompt) return '';
+        return buildOperatorInstructionsReminder(this.config.customSystemPrompt, this.instructionAnalysis);
+    }
 
-        const analysis = this.instructionAnalysis;
-        if (analysis?.is_focused) {
-            const endpoints = analysis.focused_endpoints.length > 0
-                ? `Endpoints: ${analysis.focused_endpoints.join(', ')}`
-                : '';
-            const vulns = analysis.focused_vulns.length > 0
-                ? `Vuln types: ${analysis.focused_vulns.join(', ')}`
-                : '';
-            return `
-🚨 OPERATOR SCOPE LOCK (violating this = scan failure):
-"${this.config.customSystemPrompt}"
-${endpoints}
-${vulns}
-→ Do NOT test outside this scope. No recon. No enumeration. No other endpoints or vuln types.
-`;
-        }
-
-        return `
-📋 Operator instructions: "${this.config.customSystemPrompt}"
-`;
+    private isStoppedPhase(): boolean {
+        return this.phase === 'stopped';
     }
 
     public async start() {
@@ -741,14 +584,23 @@ ${vulns}
 
             // Phase 1: Initialize
             await this.phaseInit();
+            if (!this.isRunning || this.isStoppedPhase()) {
+                return;
+            }
 
             // Phase 2: Iterative Plan → Execute → Replan
             await this.phaseIterativeTesting();
+            if (!this.isRunning || this.isStoppedPhase()) {
+                return;
+            }
 
             // Phase 3: Reporting
             await this.phaseReporting();
 
         } catch (error: any) {
+            if (this.isStoppedPhase()) {
+                return;
+            }
             this.phase = 'failed';
             this.log('error', `Critical Failure: ${error.message}`);
             this.scanStatus.failed(error.message);
@@ -882,26 +734,14 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
             // Inject scope directives
             if (this.instructionAnalysis?.is_focused) {
-                const endpointsList = this.instructionAnalysis.focused_endpoints.length > 0
-                    ? `Target endpoints: ${this.instructionAnalysis.focused_endpoints.join(', ')}`
-                    : 'No specific endpoints';
-                const vulnsList = this.instructionAnalysis.focused_vulns.length > 0
-                    ? `Vulnerability types: ${this.instructionAnalysis.focused_vulns.join(', ')}`
-                    : 'All vulnerability types';
                 this.isFocusedScope = true;
-
-                this.conversationHistory.push({
-                    role: 'user',
-                    content: `🎯 FOCUSED SCOPE for continuation:
-- ${endpointsList}
-- ${vulnsList}
-- Skip recon: ${this.instructionAnalysis.skip_recon ? 'YES' : 'No'}
-Proceed with testing.`
-                });
+                this.conversationHistory.push(buildContinuationScopeMessage(this.instructionAnalysis));
             }
 
             // Reset round counter for the continuation
             const savedRound = this.planRound;
+            const savedMaxPlanRounds = this.maxPlanRounds;
+            const savedMaxIterations = this.maxIterations;
             this.planRound = 0;
             this.maxPlanRounds = extraRounds;
             this.maxIterations = extraRounds * 10; // generous action budget
@@ -914,11 +754,15 @@ Proceed with testing.`
                 await this.phaseDirectExecution(opts.instruction, extraRounds);
             }
 
-            // Restore round counter
-            this.planRound = savedRound + extraRounds;
+            const completedContinuationRounds = opts.planningEnabled ? this.planRound : 0;
+            this.planRound = savedRound + completedContinuationRounds;
+            this.maxPlanRounds = savedMaxPlanRounds;
+            this.maxIterations = savedMaxIterations;
 
-            this.log('system', `═══ CONTINUATION COMPLETE ═══`);
-            this.log('system', `Total findings after continuation: ${this.findings.length}`);
+            if (!this.isStoppedPhase()) {
+                this.log('system', '═══ CONTINUATION COMPLETE ═══');
+                this.log('system', `Total findings after continuation: ${this.findings.length}`);
+            }
 
         } catch (error: any) {
             this.log('error', `Continuation failed: ${error.message}`);
@@ -932,7 +776,7 @@ Proceed with testing.`
     /**
      * Direct execution mode — no planning, just let LLM execute instructions with tools.
      */
-    private async phaseDirectExecution(instruction: string, maxRounds: number) {
+    private async phaseDirectExecution(_instruction: string, maxRounds: number) {
         this.phase = 'executing';
         this.scanStatus.testing();
         this.log('system', '═══ DIRECT EXECUTION MODE (No Planning) ═══');
@@ -965,22 +809,15 @@ Proceed with testing.`
             }
 
             try {
-                // Build context from conversation history (same pattern as createPlan/executeStep)
-                const recentMessages = this.conversationHistory.slice(-12);
-                const contextBlock = recentMessages.length > 0
-                    ? `CONVERSATION CONTEXT:\n${recentMessages.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n---\n')}\n\n---\n\n`
-                    : '';
-
-                const response = await llmQueue.enqueue({
+                const parsed = await this.planner.executeDirectInstructionTurn({
                     systemPrompt: this.systemPromptContent,
-                    userPrompt: `${contextBlock}Execute the operator's instruction. You are in round ${round + 1} of ${maxRounds}. Use tools to test and report findings.\n\nBefore every action or final answer, include "evaluation_previous_goal", "memory", and "next_goal". Respond with ONLY a valid JSON object containing those reflection fields plus either "action", "finding", or "answer".`,
+                    conversationHistory: this.conversationHistory,
+                    rateLimitPauseUntil: this.rateLimitPauseUntil,
+                    round: round + 1,
+                    maxRounds,
                 });
-
-                this.conversationHistory.push({ role: 'assistant', content: response.text });
-
-                const parsed = this.parseAgentResponse(response.text);
                 if (!parsed) {
-                    this.log('agent', `Response: ${response.text.slice(0, 200)}`);
+                    this.log('agent', 'No valid response from the planner during direct execution.');
                     continue;
                 }
 
@@ -1033,6 +870,7 @@ Proceed with testing.`
         this.isRunning = false;
         this.phase = 'stopped';
         this.log('system', 'Stop command received. Terminating agent...');
+        this.scanStatus.stopped('Scan stopped by user');
         // Cleanup browser session
         this.cleanupBrowserSession();
     }
@@ -1141,7 +979,7 @@ Proceed with testing.`
                 authStartup,
             },
             this.burp,
-            this.browserSessionId,
+            this.browserSession.getSessionId(),
         );
         this.log('system', `✓ Auth State Engine: ${this.authManager.identityRegistry.size} identities, ${this.authManager.getTotalCookies()} cookies, ${this.authManager.getTotalTokens()} tokens`);
 
@@ -1234,60 +1072,7 @@ Proceed with testing.`
         // Inject operator instructions into conversation based on analysis
         if (this.config.customSystemPrompt) {
             const instr = this.config.customSystemPrompt;
-            const analysis = this.instructionAnalysis;
-
-            if (analysis?.is_focused) {
-                // Focused scope — inject strict directives
-                const endpointsList = analysis.focused_endpoints.length > 0
-                    ? `Target endpoints: ${analysis.focused_endpoints.join(', ')}`
-                    : 'No specific endpoints — test the entire target but only for specified vuln types';
-                const vulnsList = analysis.focused_vulns.length > 0
-                    ? `Vulnerability types: ${analysis.focused_vulns.join(', ')}`
-                    : 'All vulnerability types on the specified endpoints';
-
-                this.conversationHistory.push({
-                    role: 'user',
-                    content: `🚨 MANDATORY OPERATOR INSTRUCTIONS — ABSOLUTE LAW FOR THIS SCAN 🚨
-
-Operator's original instruction: "${instr}"
-
-PARSED SCOPE (you MUST follow this exactly):
-- ${endpointsList}
-- ${vulnsList}
-- Skip reconnaissance: ${analysis.skip_recon ? 'YES — go directly to testing' : 'No — do basic recon first'}
-- Auto-finish when scope is tested: ${analysis.auto_finish ? 'YES' : 'No'}
-
-ENFORCED RULES:
-1. Do NOT use spider_url, get_sitemap, or extract_links — these are BLOCKED by the system.
-2. Do NOT test endpoints outside the list above.
-3. Do NOT test vulnerability types outside the list above.
-4. Round 1 plan must DIRECTLY attack the specified targets with the specified vuln types.
-5. When the specified scope is thoroughly tested, respond with completion.
-
-Acknowledge and begin.`
-                });
-                this.conversationHistory.push({
-                    role: 'assistant',
-                    content: `Understood. Operator scope is locked:
-
-${endpointsList}
-${vulnsList}
-Recon: SKIPPED — going directly to attack.
-Auto-finish: ${analysis.auto_finish ? 'Yes, will complete after testing specified scope' : 'No'}
-
-I will create a focused attack plan targeting ONLY the specified scope. Starting now.`
-                });
-            } else {
-                // Full scan — standard injection
-                this.conversationHistory.push({
-                    role: 'user',
-                    content: `The operator provided these general instructions for this scan:\n\n"${instr}"\n\nKeep these in mind throughout the scan. Acknowledge.`
-                });
-                this.conversationHistory.push({
-                    role: 'assistant',
-                    content: `Understood. I will keep the operator's instructions in mind: "${instr}". Proceeding with the full scan methodology.`
-                });
-            }
+            this.conversationHistory.push(...buildOperatorInstructionMessages(instr, this.instructionAnalysis));
 
             this.log('system', `✓ Operator instructions processed: "${instr.substring(0, 100)}${instr.length > 100 ? '...' : ''}"`);
         }
@@ -1394,7 +1179,7 @@ Start by sending the original request as-is to get a baseline response, then beg
             (kind, message) => this.log(kind === 'debug' ? 'debug' : kind, message),
         );
         const { browserSessionId, inventory } = await service.run(authStartup);
-        this.browserSessionId = browserSessionId;
+        this.browserSession.setSessionId(browserSessionId);
         this.startupAuthInventory = inventory;
 
         try {
@@ -1430,7 +1215,8 @@ Start by sending the original request as-is to get a baseline response, then beg
     }
 
     private async refreshEndpointInventory(trigger: string, allowAiClassification: boolean = false): Promise<void> {
-        if (!this.browserSessionId) return;
+        const browserSessionId = this.browserSession.getSessionId();
+        if (!browserSessionId) return;
 
         try {
             const service = new EndpointIntelligenceService(
@@ -1440,7 +1226,7 @@ Start by sending the original request as-is to get a baseline response, then beg
                 (level, message) => this.log(level === 'error' ? 'error' : level === 'system' ? 'system' : 'debug', message),
             );
             const inventory = await service.buildInventory({
-                browserSessionId: this.browserSessionId,
+                browserSessionId,
                 authInventory: this.startupAuthInventory,
                 allowAiClassification,
             });
@@ -1604,7 +1390,7 @@ Rules for subsequent work:
 
             // ── EXECUTE ──
             this.phase = 'executing';
-            const roundResults: { step: PlanStep; findings: any[]; toolResults: string[] }[] = [];
+            const roundResults: StepExecutionResult[] = [];
 
             for (let i = 0; i < plan.steps.length; i++) {
                 if (!this.isRunning || totalActions >= this.maxIterations) break;
@@ -1750,6 +1536,10 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
 
     private async phaseReporting() {
+        if (!this.isRunning || this.isStoppedPhase()) {
+            return;
+        }
+
         this.phase = 'reporting';
         this.scanStatus.reporting();
         this.log('system', '═══ PHASE: REPORTING ═══');
@@ -1785,103 +1575,39 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
 
     private async createPlan(): Promise<AttackPlan | null> {
-        try {
-            if (this.rateLimitPauseUntil && new Date() < this.rateLimitPauseUntil) {
-                await this.delay(30000);
-                return null;
-            }
-
-            // Build context for planning
-            const endpointsSummary = this.discoveredEndpoints.size > 0
+        const decision = await this.planner.createPlan({
+            systemPrompt: this.systemPromptContent,
+            conversationHistory: this.conversationHistory,
+            rateLimitPauseUntil: this.rateLimitPauseUntil,
+            planRound: this.planRound,
+            findingsCount: this.findings.length,
+            endpointsSummary: this.discoveredEndpoints.size > 0
                 ? Array.from(this.discoveredEndpoints).slice(0, 30).join(', ')
-                : 'None yet - initial discovery needed';
-
-            const previousResults = this.stepResults.length > 0
-                ? this.stepResults.slice(-10).map(r =>
-                    `Step "${r.step.objective}": ${r.step.result || 'completed'} (${r.toolResults.length} tool calls)`
+                : 'None yet - initial discovery needed',
+            previousResults: this.stepResults.length > 0
+                ? this.stepResults.slice(-10).map((result) =>
+                    `Step "${result.step.objective}": ${result.step.result || 'completed'} (${result.toolResults.length} tool calls)`,
                 ).join('\n')
-                : 'This is the first round - no previous results.';
+                : 'This is the first round - no previous results.',
+            authStartupSummary: this.startupAuthInventory
+                ? this.buildStartupAuthSummary(this.startupAuthInventory)
+                : 'No startup auth inventory was captured.',
+            authStartupDirective: this.buildAuthStartupDirective(),
+            operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
+            mindsetTtps: this.mindsetTTPs.length > 0
+                ? mindsetService.formatTTPsForPlanning(this.mindsetTTPs)
+                : 'None loaded — no past reports analyzed yet.',
+        });
 
-            const planPrompt = PLAN_PROMPT
-                .replace('{ROUND}', String(this.planRound))
-                .replace('{FINDINGS_COUNT}', String(this.findings.length))
-                .replace('{ENDPOINTS_SUMMARY}', endpointsSummary)
-                .replace('{PREVIOUS_RESULTS}', previousResults)
-                .replace('{AUTH_STARTUP_SUMMARY}', this.startupAuthInventory ? this.buildStartupAuthSummary(this.startupAuthInventory) : 'No startup auth inventory was captured.')
-                .replace('{AUTH_STARTUP_DIRECTIVE}', this.buildAuthStartupDirective())
-                .replace('{OPERATOR_INSTRUCTIONS_REMINDER}', this.getOperatorInstructionsReminder())
-                .replace('{MINDSET_TTPS}', this.mindsetTTPs.length > 0
-                    ? mindsetService.formatTTPsForPlanning(this.mindsetTTPs)
-                    : 'None loaded — no past reports analyzed yet.');
-
-            this.conversationHistory.push({ role: 'user', content: planPrompt });
-
-            // Always use the original system prompt — never let it get sliced away
-            // Build context from recent conversation history, then place the plan prompt last and prominent
-            const recentMessages = this.conversationHistory.slice(-14);
-            const contextMessages = recentMessages.slice(0, -1); // everything except the current plan prompt
-            const contextBlock = contextMessages.length > 0
-                ? `CONVERSATION CONTEXT:\n${contextMessages.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n---\n')}\n\n---\n\n`
-                : '';
-
-            const response = await llmQueue.enqueue({
-                systemPrompt: this.systemPromptContent,
-                userPrompt: `${contextBlock}${planPrompt}\n\nIMPORTANT: Respond with ONLY a valid JSON object. No markdown code fences, no explanation, no text before or after the JSON.`
-            });
-
-            this.conversationHistory.push({ role: 'assistant', content: response.text });
-
-            // Check for completion
-            let parsed = this.extractJsonObject(response.text);
-            if (!parsed) {
-                // Log truncated response for debugging
-                this.log('warn', `Plan JSON parse failed. LLM response (first 300 chars): ${response.text.substring(0, 300)}`);
-
-                // Retry once: ask LLM to fix its own response into valid JSON
-                try {
-                    this.log('system', '🔄 Retrying plan creation — asking LLM to return valid JSON...');
-                    const retryResponse = await llmQueue.enqueue({
-                        systemPrompt: 'You are a JSON repair assistant. The user will give you text that should be JSON. Extract or fix the JSON and return ONLY a valid JSON object. No markdown, no explanation, no code fences.',
-                        userPrompt: `Fix or extract the JSON from this text. Return ONLY valid JSON:\n\n${response.text.substring(0, 2000)}`
-                    });
-                    parsed = this.extractJsonObject(retryResponse.text);
-                } catch { /* ignore retry error */ }
-
-                if (!parsed) {
-                    this.log('error', 'Failed to parse plan JSON from LLM (even after retry)');
-                    return this.createFallbackPlan();
-                }
-                this.log('system', '✅ JSON repair successful');
-            }
-
-            if (parsed.answer && parsed.answer.toLowerCase().includes('complete')) {
-                return null; // Testing complete
-            }
-
-            if (!parsed.plan || !Array.isArray(parsed.plan) || parsed.plan.length === 0) {
-                this.log('error', 'Invalid plan format from LLM');
-                return this.createFallbackPlan();
-            }
-
-            const steps: PlanStep[] = parsed.plan.slice(0, 5).map((s: any, i: number) => ({
-                step: i + 1,
-                objective: s.objective || `Step ${i + 1}`,
-                approach: s.approach || '',
-                tools: Array.isArray(s.tools) ? s.tools : ['send_http_request'],
-                status: 'pending' as const,
-            }));
-
-            return {
-                round: this.planRound,
-                analysis: parsed.analysis || '',
-                steps,
-            };
-
-        } catch (e: any) {
-            this.log('error', `Plan creation failed: ${e.message}`);
-            this.handleRateLimitError(e);
+        if (!decision) {
             return this.createFallbackPlan();
         }
+
+        if (decision.kind === 'complete') {
+            return null;
+        }
+
+        return decision.plan;
     }
 
     private createFallbackPlan(): AttackPlan {
@@ -1977,94 +1703,31 @@ Rules for subsequent work:
     }
 
     private async askLLMForStepExecution(step: PlanStep, previousResults: string[], totalActions: number): Promise<LLMResponse | null> {
-        try {
-            if (this.rateLimitPauseUntil && new Date() < this.rateLimitPauseUntil) {
-                await this.delay(30000);
-                return null;
-            }
-
-            const contextFromPrevious = previousResults.length > 0
-                ? `\n\nPREVIOUS RESULTS FOR THIS STEP:\n${previousResults.slice(-3).join('\n')}\n\nContinue testing or move to next action for this step.`
-                : '';
-
-            const budgetPressureReminder = this.getBudgetPressureReminder(totalActions);
-            const stepPrompt = EXECUTE_STEP_PROMPT
-                .replace('{STEP_NUM}', String(step.step))
-                .replace('{OBJECTIVE}', step.objective)
-                .replace('{APPROACH}', step.approach)
-                .replace('{TOOLS}', step.tools.join(', '))
-                .replace('{OPERATOR_INSTRUCTIONS_REMINDER}', this.getOperatorInstructionsReminder())
-                + contextFromPrevious
-                + budgetPressureReminder;
-
-            this.conversationHistory.push({ role: 'user', content: stepPrompt });
-
-            // Always use the original system prompt — never let it get sliced away
-            const recentMessages = this.conversationHistory.slice(-11);
-            const contextMessages = recentMessages.slice(0, -1);
-            const contextBlock = contextMessages.length > 0
-                ? `CONVERSATION CONTEXT:\n${contextMessages.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n---\n')}\n\n---\n\n`
-                : '';
-
-            const response = await llmQueue.enqueue({
-                systemPrompt: this.systemPromptContent,
-                userPrompt: `${contextBlock}${stepPrompt}\n\nRespond with ONLY a valid JSON object.`
-            });
-
-            this.conversationHistory.push({ role: 'assistant', content: response.text });
-            return this.parseAgentResponse(response.text);
-
-        } catch (e: any) {
-            this.log('error', `Step execution LLM call failed: ${e.message}`);
-            this.handleRateLimitError(e);
-            return null;
-        }
+        return this.planner.askForStepExecution({
+            systemPrompt: this.systemPromptContent,
+            conversationHistory: this.conversationHistory,
+            rateLimitPauseUntil: this.rateLimitPauseUntil,
+            step,
+            previousResults,
+            totalActions,
+            budgetPressureReminder: this.getBudgetPressureReminder(totalActions),
+            operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
+        });
     }
 
-    private async shouldContinueTesting(roundResults: { step: PlanStep; findings: any[]; toolResults: string[] }[]): Promise<boolean> {
-        try {
-            const stepSummary = roundResults.map(r =>
-                `Step "${r.step.objective}": ${r.step.result} | Tool calls: ${r.toolResults.length} | Findings: ${r.findings.length}`
-            ).join('\n');
-
-            const allFindings = this.findings.map(f => `[${f.severity || 'MEDIUM'}] ${f.name}`).join('\n');
-            const endpoints = Array.from(this.discoveredEndpoints).join(', ');
-
-            const replanPrompt = REPLAN_PROMPT
-                .replace('{STEP_RESULTS}', stepSummary)
-                .replace('{ALL_FINDINGS}', allFindings || 'None yet')
-                .replace('{ENDPOINTS}', endpoints || 'None discovered')
-                .replace('{OPERATOR_INSTRUCTIONS_REMINDER}', this.getOperatorInstructionsReminder())
-                .replace('{HYPOTHESIS_STATUS}', this.hypothesisEngine.getSummaryForPrompt())
-                .replace('{COVERAGE_STATUS}', this.coverageTracker.getSummaryForPrompt());
-
-            this.conversationHistory.push({ role: 'user', content: replanPrompt });
-
-            // Always use the original system prompt — never let it get sliced away
-            const recentMessages = this.conversationHistory.slice(-11);
-            const contextMessages = recentMessages.slice(0, -1);
-            const contextBlock = contextMessages.length > 0
-                ? `CONVERSATION CONTEXT:\n${contextMessages.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n---\n')}\n\n---\n\n`
-                : '';
-
-            const response = await llmQueue.enqueue({
-                systemPrompt: this.systemPromptContent,
-                userPrompt: `${contextBlock}${replanPrompt}\n\nRespond with ONLY a valid JSON object.`
-            });
-
-            this.conversationHistory.push({ role: 'assistant', content: response.text });
-
-            const parsed = this.extractJsonObject(response.text);
-            if (parsed?.answer && parsed.answer.toLowerCase().includes('complete')) {
-                return false;
-            }
-
-            return true; // Continue testing
-        } catch (e: any) {
-            this.log('error', `Replan check failed: ${e.message}`);
-            // On error, continue if we haven't done much
-            return this.planRound < 3;
-        }
+    private async shouldContinueTesting(roundResults: StepExecutionResult[]): Promise<boolean> {
+        return this.planner.shouldContinueTesting({
+            systemPrompt: this.systemPromptContent,
+            conversationHistory: this.conversationHistory,
+            rateLimitPauseUntil: this.rateLimitPauseUntil,
+            roundResults,
+            findings: this.findings,
+            discoveredEndpoints: Array.from(this.discoveredEndpoints),
+            hypothesisStatus: this.hypothesisEngine.getSummaryForPrompt(),
+            coverageStatus: this.coverageTracker.getSummaryForPrompt(),
+            operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
+            planRound: this.planRound,
+        });
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2116,37 +1779,11 @@ Rules for subsequent work:
     }
 
     private async syncAuthFromBrowser(identityId: string = 'primary-user'): Promise<void> {
-        if (!this.browserSessionId || !browserService.isSessionAlive(this.browserSessionId)) {
-            return;
-        }
-
-        try {
-            const pageState = await browserService.getFullPageState(this.browserSessionId);
-
-            this.authManager.syncFromBrowser(pageState.contextCookies || [], identityId);
-            this.authManager.syncFromBrowserStorage({
-                localStorageData: pageState.localStorageData || {},
-                sessionStorageData: pageState.sessionStorageData || {},
-            }, identityId);
-            this.authManager.detectCSRFFromPage(pageState, identityId);
-        } catch (e: any) {
-            this.log('debug', `Browser auth sync failed (non-fatal): ${e.message}`);
-        }
+        await this.browserSession.syncAuthFromBrowser(identityId);
     }
 
     private async seedBrowserFromAuthManager(identityId: string = 'primary-user'): Promise<void> {
-        if (!this.browserSessionId || !browserService.isSessionAlive(this.browserSessionId)) {
-            return;
-        }
-
-        try {
-            const cookies = this.authManager.exportForBrowser(identityId);
-            if (cookies.length > 0) {
-                await browserService.syncCookiesToSession(this.browserSessionId, cookies);
-            }
-        } catch (e: any) {
-            this.log('debug', `Browser auth seed failed (non-fatal): ${e.message}`);
-        }
+        await this.browserSession.seedBrowserFromAuthManager(identityId);
     }
 
     private async executeSendHttpRequest(toolCall: ToolCall): Promise<any> {
@@ -2176,107 +1813,11 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
 
     private parseAgentResponse(text: string): LLMResponse | null {
-        this.log('debug', `LLM Response: ${text.substring(0, 300)}...`);
-
-        try {
-            const jsonObj = this.extractJsonObject(text);
-            if (jsonObj) {
-                const normalized = this.normalizeResponse(jsonObj);
-                if (normalized) return normalized;
-            }
-
-            // Fallback: extract URL from text
-            const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/);
-            if (urlMatch) {
-                const methodMatch = text.match(/\b(GET|POST|PUT|DELETE|PATCH)\b/i);
-                return {
-                    thought: text.substring(0, 150),
-                    action: {
-                        tool: 'send_http_request',
-                        args: { url: urlMatch[0], method: methodMatch ? methodMatch[1].toUpperCase() : 'GET' }
-                    }
-                };
-            }
-
-            // Fallback tool detection from plain text — skip enumeration tools in focused scope
-            if (!this.isFocusedScope) {
-                if (text.toLowerCase().includes('proxy history') || text.toLowerCase().includes('get_proxy_history')) {
-                    return { thought: text.substring(0, 150), action: { tool: 'get_proxy_history', args: { count: 20, excludePenPard: true } } };
-                }
-
-                if (text.toLowerCase().includes('sitemap') || text.toLowerCase().includes('get_sitemap')) {
-                    return { thought: text.substring(0, 150), action: { tool: 'get_sitemap', args: {} } };
-                }
-
-                if (text.toLowerCase().includes('spider') || text.toLowerCase().includes('crawl')) {
-                    return { thought: text.substring(0, 150), action: { tool: 'spider_url', args: { url: this.targetUrl } } };
-                }
-            }
-
-            return { thought: text.substring(0, 500) };
-        } catch (e) {
-            this.log('error', `Parse error: ${(e as any).message}`);
-            return { thought: text.substring(0, 500) };
-        }
+        return this.llmResponseParser.parseAgentResponse(text);
     }
 
     private extractJsonObject(text: string): any | null {
-        const cleaned = this.stripMarkdownCodeFences(text).trim();
-        if (!cleaned) return null;
-
-        const direct = this.parseJsonCandidate(cleaned);
-        if (direct !== null) {
-            return direct;
-        }
-
-        for (let start = 0; start < cleaned.length; start++) {
-            const opener = cleaned[start];
-            if (opener !== '{' && opener !== '[') continue;
-
-            const stack: string[] = [];
-            let inString = false;
-            let escaped = false;
-
-            for (let end = start; end < cleaned.length; end++) {
-                const char = cleaned[end];
-
-                if (escaped) {
-                    escaped = false;
-                    continue;
-                }
-                if (char === '\\') {
-                    escaped = true;
-                    continue;
-                }
-                if (char === '"' && !escaped) {
-                    inString = !inString;
-                    continue;
-                }
-                if (inString) continue;
-
-                if (char === '{' || char === '[') {
-                    stack.push(char);
-                    continue;
-                }
-
-                if (char === '}' || char === ']') {
-                    const expected = char === '}' ? '{' : '[';
-                    if (stack[stack.length - 1] !== expected) {
-                        break;
-                    }
-                    stack.pop();
-                    if (stack.length === 0) {
-                        const candidate = this.parseJsonCandidate(cleaned.substring(start, end + 1));
-                        if (candidate !== null) {
-                            return candidate;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        return null;
+        return this.llmResponseParser.extractJsonObject(text);
     }
 
     private stripMarkdownCodeFences(text: string): string {
@@ -2791,169 +2332,25 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * Initialize headless browser and run automatic frontend analysis.
-     * Called early in phaseInit() so browser intelligence informs the first planning round.
-     * Non-fatal: if browser launch fails the scan continues in HTTP-only mode.
-     */
-    private async initBrowserAndAnalyze(): Promise<void> {
-        this.log('system', '🌐 Launching headless PenPard Browser...');
-        try {
-            this.browserSessionId = await browserService.launchSession(this.config.userId || 1, {
-                targetUrl: this.targetUrl,
-                scanId: this.scanId,
-                headless: true,
-            });
-            await this.seedBrowserFromAuthManager();
-            await this.syncAuthFromBrowser();
-            this.log('system', '✓ PenPard Browser: Running (headless)');
-        } catch (err: any) {
-            this.log('error', `Browser launch failed (non-fatal): ${err.message}`);
-            this.log('system', 'Continuing without browser tools — HTTP-only mode.');
-            this.browserSessionId = null;
-            return;
-        }
-
-        // ── Automatic Frontend Analysis ──
-        this.log('system', '🔍 Running automatic frontend analysis...');
-        try {
-            let browserIntelBlock = '\n\n═══════════════════════════════════════════════════════════════\n';
-            browserIntelBlock += '  BROWSER INTELLIGENCE (auto-collected at scan start)\n';
-            browserIntelBlock += '═══════════════════════════════════════════════════════════════\n\n';
-
-            let hasIntel = false;
-
-            // Frontend analysis — extract JS-embedded endpoints, tokens, routes
-            try {
-                const frontendAnalysis = await browserService.getFrontendAnalysis(this.browserSessionId);
-                if (frontendAnalysis.apiEndpoints?.length > 0) {
-                    browserIntelBlock += `API Endpoints (from JavaScript): ${frontendAnalysis.apiEndpoints.join(', ')}\n`;
-                    frontendAnalysis.apiEndpoints.forEach((ep: string) => this.discoveredEndpoints.add(ep));
-                    hasIntel = true;
-                }
-                if (frontendAnalysis.graphqlIndicators?.length > 0) {
-                    browserIntelBlock += `GraphQL Indicators: ${frontendAnalysis.graphqlIndicators.join(', ')}\n`;
-                    hasIntel = true;
-                }
-                if (frontendAnalysis.websocketUrls?.length > 0) {
-                    browserIntelBlock += `WebSocket URLs: ${frontendAnalysis.websocketUrls.join(', ')}\n`;
-                    hasIntel = true;
-                }
-                if (frontendAnalysis.csrfTokens?.length > 0) {
-                    browserIntelBlock += `CSRF Tokens: ${JSON.stringify(frontendAnalysis.csrfTokens)}\n`;
-                    hasIntel = true;
-                }
-                if (frontendAnalysis.tokenPatterns?.length > 0) {
-                    browserIntelBlock += `Token Patterns: ${frontendAnalysis.tokenPatterns.join(', ')}\n`;
-                    hasIntel = true;
-                }
-                this.log('system', `✓ Frontend analysis: ${frontendAnalysis.apiEndpoints?.length || 0} API endpoints found`);
-            } catch (e: any) {
-                this.log('error', `Frontend analysis failed (non-fatal): ${e.message}`);
-            }
-
-            // Page state — extract forms, links, hidden inputs
-            try {
-                const pageState = await browserService.getPageState(this.browserSessionId);
-                if (pageState?.forms?.length > 0) {
-                    browserIntelBlock += `\nForms (${pageState.forms.length} found):\n`;
-                    pageState.forms.forEach((f: any) => {
-                        const fields = f.fields?.map((fd: any) => `${fd.name || fd.id}(${fd.type})`).join(', ') || 'no fields';
-                        browserIntelBlock += `  - ${f.method || 'GET'} ${f.action || '/'} [${fields}]\n`;
-                    });
-                    hasIntel = true;
-                }
-                this.log('system', `✓ Page state: ${pageState?.forms?.length || 0} forms, ${pageState?.links?.length || 0} links`);
-            } catch (e: any) {
-                this.log('error', `Page state extraction failed (non-fatal): ${e.message}`);
-            }
-
-            // Burp correlation — find untested endpoints
-            try {
-                const correlation = await browserService.correlateBrowserWithBurp(this.browserSessionId);
-                if (correlation?.frontendOnlyEndpoints?.length > 0) {
-                    browserIntelBlock += `\n⚠️ UNTESTED ENDPOINTS (found in JavaScript but NOT in Burp proxy traffic):\n`;
-                    correlation.frontendOnlyEndpoints.forEach((ep: string) => {
-                        browserIntelBlock += `  → ${ep}\n`;
-                    });
-                    browserIntelBlock += `  These are HIGH PRIORITY targets — test them!\n`;
-                    hasIntel = true;
-                    this.log('system', `✓ Burp correlation: ${correlation.frontendOnlyEndpoints.length} untested endpoints found`);
-                } else {
-                    this.log('system', '✓ Burp correlation: No untested endpoints found');
-                }
-            } catch (e: any) {
-                this.log('error', `Burp correlation failed (non-fatal): ${e.message}`);
-            }
-
-            // Inject browser intelligence into system prompt
-            if (hasIntel) {
-                this.systemPromptContent += browserIntelBlock;
-                // Update the already-pushed system message
-                if (this.conversationHistory.length > 0 && this.conversationHistory[0].role === 'system') {
-                    this.conversationHistory[0].content = this.systemPromptContent;
-                }
-                this.log('system', '✓ Browser intelligence injected into agent context');
-            } else {
-                this.log('system', 'No browser intelligence discovered at startup');
-            }
-        } catch (e: any) {
-            this.log('error', `Automatic frontend analysis failed (non-fatal): ${e.message}`);
-        }
-    }
-
-    /**
      * Ensure a browser session exists and is alive.
      * If the session is dead or missing, attempt a relaunch.
      */
     private async ensureBrowserSession(): Promise<string> {
-        if (this.browserSessionId && browserService.isSessionAlive(this.browserSessionId)) {
-            return this.browserSessionId;
-        }
-
-        if (this.browserSessionId) {
-            const visibility = browserService.getSessionVisibility(this.browserSessionId);
-            if (visibility && !visibility.isLive) {
-                this.log('system', `Browser session became unavailable (${visibility.lifecycleState}). Continuing in HTTP-only mode until browser features are needed again.`);
-            }
-        }
-
-        // Session is dead or was never created — attempt relaunch
-        this.log('system', '🌐 Browser session not found. Re-launching headless browser...');
-        try {
-            this.browserSessionId = await browserService.launchSession(this.config.userId || 1, {
-                targetUrl: this.targetUrl,
-                scanId: this.scanId,
-                headless: true,
-            });
-            await this.seedBrowserFromAuthManager();
-            await this.syncAuthFromBrowser();
-            this.log('system', '✓ Browser re-launched successfully');
-            return this.browserSessionId;
-        } catch (err: any) {
-            this.log('error', `Browser re-launch failed: ${err.message}`);
-            throw new Error(`Browser session unavailable: ${err.message}`);
-        }
+        return this.browserSession.ensureSession();
     }
 
     /**
      * Cleanup browser session. Safe to call multiple times.
      */
     private cleanupBrowserSession(): void {
-        if (this.browserSessionId) {
-            const sid = this.browserSessionId;
-            this.browserSessionId = null;
-            browserService.closeSession(sid).catch((err: any) => {
-                this.log('error', `Browser session cleanup failed (non-fatal): ${err.message}`);
-            });
-            this.log('system', '🌐 Browser session closed');
-        }
+        this.browserSession.cleanup();
     }
 
     /**
      * Get the current browser session ID. Exposed for show/hide API.
      */
     public getBrowserSessionId(): string | null {
-        return this.browserSessionId;
+        return this.browserSession.getSessionId();
     }
 
     // ── Browser Tool Implementations ──
@@ -2989,12 +2386,7 @@ Rules for subsequent work:
         this.log('tool', '🌐 browser_get_page_state');
         const state = await browserService.getFullPageState(sessionId);
 
-        this.authManager.syncFromBrowser(state.contextCookies || [], 'primary-user');
-        this.authManager.syncFromBrowserStorage({
-            localStorageData: state.localStorageData || {},
-            sessionStorageData: state.sessionStorageData || {},
-        }, 'primary-user');
-        this.authManager.detectCSRFFromPage(state, 'primary-user');
+        this.browserSession.syncAuthFromPageState(state, 'primary-user');
 
         return {
             ...state,
@@ -3244,14 +2636,15 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
 
     private async deltaFrontendAnalysis(trigger: string): Promise<void> {
-        if (!this.browserSessionId) return;
+        const browserSessionId = this.browserSession.getSessionId();
+        if (!browserSessionId) return;
 
         this.log('system', `🔍 Delta frontend analysis (trigger: ${trigger})`);
         try {
-            const isAlive = await browserService.isSessionAlive(this.browserSessionId);
+            const isAlive = await browserService.isSessionAlive(browserSessionId);
             if (!isAlive) return;
 
-            const newAnalysis = await browserService.getFrontendAnalysis(this.browserSessionId);
+            const newAnalysis = await browserService.getFrontendAnalysis(browserSessionId);
             const newEndpoints = (newAnalysis.apiEndpoints || []).filter(
                 (ep: string) => !this.discoveredEndpoints.has(ep)
             );
@@ -3273,7 +2666,6 @@ Rules for subsequent work:
                 newAnalysis.frontendRoutes.forEach((r: string) => this.coverageTracker.addRoute(r, 'GET', 'frontend-js'));
             }
 
-            this.lastFrontendAnalysis = newAnalysis;
             if (newEndpoints.length > 0) {
                 await this.refreshEndpointInventory(`delta-${trigger}`, false);
             }
