@@ -84,6 +84,11 @@ router.get('/pending', authenticateToken, (req: AuthRequest, res: Response) => {
 });
 
 /** Export for scans/from-burp: get and remove a pending request. */
+export function peekPendingRequest(pendingId: string): PendingRequest | null {
+    return pendingFromBurp.get(pendingId) || null;
+}
+
+/** Export for scans/from-burp: get and remove a pending request. */
 export function takePendingRequest(pendingId: string): PendingRequest | null {
     const entry = pendingFromBurp.get(pendingId);
     if (entry) {

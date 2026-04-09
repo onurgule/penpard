@@ -64,6 +64,21 @@ export interface PromotedRequest {
     reason: string;
 }
 
+export interface RequestHarvesterCheckpointSummary {
+    total: number;
+    promoted: number;
+    byClassification: Record<string, number>;
+    promotedRequests: Array<{
+        id: string;
+        method: string;
+        path: string;
+        classification: RequestClass;
+        interestScore: number;
+        testedHypotheses: string[];
+    }>;
+    topScoring: Array<{ id: string; score: number; method: string; path: string; classification: string }>;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Service Class
 // ─────────────────────────────────────────────────────────────
@@ -179,6 +194,27 @@ export class RequestHarvester {
                 .sort((a, b) => b.interestScore - a.interestScore)
                 .slice(0, 10)
                 .map(r => ({ id: r.id, score: r.interestScore, method: r.method, path: r.path, classification: r.classification })),
+        };
+    }
+
+    getCheckpointSummary(limit: number = 10): RequestHarvesterCheckpointSummary {
+        const summary = this.getSummary();
+        const promotedRequests = Array.from(this.harvested.values())
+            .filter((request) => request.promoted)
+            .sort((a, b) => b.interestScore - a.interestScore)
+            .slice(0, limit)
+            .map((request) => ({
+                id: request.id,
+                method: request.method,
+                path: request.path,
+                classification: request.classification,
+                interestScore: request.interestScore,
+                testedHypotheses: [...request.testedHypotheses],
+            }));
+
+        return {
+            ...summary,
+            promotedRequests,
         };
     }
 

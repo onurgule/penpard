@@ -1,4 +1,5 @@
 import { addVulnerability, db } from '../../db/init';
+import { prepareBurpDispatchRequest } from '../../services/burp-request';
 import { ToolCall, RequestExecutionExchange } from './types';
 
 interface BurpToolClient {
@@ -296,86 +297,21 @@ export class OrchestratorFindingTracker {
 
     private async sendToRepeater(requestStr: string, vulnName: string, action?: ToolCall): Promise<void> {
         try {
-            let host = '';
-            let port = 80;
-            let useHttps = false;
-            let finalRequest = requestStr;
-
             const lastExchange = this.options.getLastExchange();
-            const rawRequest = lastExchange?.rawRequest;
-            if (rawRequest && action?.args?.url) {
-                try {
-                    const url = new URL(action.args.url);
-                    host = url.hostname;
-                    port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-                    useHttps = url.protocol === 'https:';
+            const prepared = prepareBurpDispatchRequest({
+                rawRequest: lastExchange?.rawRequest || requestStr,
+                url: typeof action?.args?.url === 'string' ? action.args.url : undefined,
+                method: typeof action?.args?.method === 'string' ? action.args.method : undefined,
+                headers: action?.args?.headers,
+                body: typeof action?.args?.body === 'string' ? action.args.body : undefined,
+            });
 
-                    finalRequest = rawRequest;
-                    const firstLine = finalRequest.split(/\r?\n/)[0];
-                    const fullUrlMatch = firstLine.match(/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+https?:\/\/[^\/]+(\/[^\s]*)\s+(HTTP\/\S+)/i);
-                    if (fullUrlMatch) {
-                        finalRequest = `${fullUrlMatch[1]} ${fullUrlMatch[2]} ${fullUrlMatch[3]}` + finalRequest.substring(firstLine.length);
-                    }
-                } catch {
-                    /* fall through */
-                }
-            } else if (action?.args?.url) {
-                try {
-                    const url = new URL(action.args.url);
-                    host = url.hostname;
-                    port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-                    useHttps = url.protocol === 'https:';
-
-                    const method = action.args.method || 'GET';
-                    const urlPath = url.pathname + url.search;
-                    const headerLines: string[] = [];
-                    headerLines.push(`Host: ${host}${port !== (useHttps ? 443 : 80) ? `:${port}` : ''}`);
-                    if (action.args.headers) {
-                        Object.entries(action.args.headers).forEach(([key, value]) => {
-                            if (key.toLowerCase() !== 'host') {
-                                const sanitizedValue = String(value).replace(/[\r\n]/g, ' ');
-                                const normalizedName = key.split('-').map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()).join('-');
-                                headerLines.push(`${normalizedName}: ${sanitizedValue}`);
-                            }
-                        });
-                    }
-                    finalRequest = `${method} ${urlPath} HTTP/1.1\r\n${headerLines.join('\r\n')}\r\n\r\n`;
-                    if (action.args.body) {
-                        finalRequest += String(action.args.body).replace(/\r\n/g, '\n');
-                    }
-                } catch {
-                    /* fall through */
-                }
-            }
-
-            if (!host) {
-                const requestLines = requestStr.split('\n');
-                const requestLine = requestLines[0];
-                const urlMatch = requestLine.match(/(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(https?:\/\/[^\s]+)/i);
-                if (urlMatch) {
-                    const url = new URL(urlMatch[2]);
-                    host = url.hostname;
-                    port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-                    useHttps = url.protocol === 'https:';
-                    finalRequest = requestStr.replace(urlMatch[2], url.pathname + url.search);
-                } else {
-                    const hostHeader = requestLines.find((line) => line.toLowerCase().startsWith('host:'));
-                    if (hostHeader) {
-                        const hostValue = hostHeader.split(':').slice(1).join(':').trim();
-                        const [hostName, portStr] = hostValue.split(':');
-                        host = hostName;
-                        port = portStr ? parseInt(portStr) : 80;
-                        useHttps = port === 443;
-                    }
-                }
-            }
-
-            if (host) {
+            if (prepared) {
                 await this.options.burp.callTool('send_to_repeater', {
-                    host,
-                    port,
-                    useHttps,
-                    request: normalizeRequestForRepeater(finalRequest),
+                    host: prepared.host,
+                    port: prepared.port,
+                    useHttps: prepared.useHttps,
+                    request: prepared.request,
                     name: `${vulnName} - ${this.options.scanId.substring(0, 8)}`,
                 });
                 this.options.log('debug', `Sent to Repeater: ${vulnName}`);
@@ -459,31 +395,3 @@ function buildResponseFromResult(result: any, fallbackStatusCode?: number, fallb
     return response;
 }
 
-function normalizeRequestForRepeater(raw: string): string {
-    const lines = raw.split(/\r?\n/);
-    const result: string[] = [];
-    let bodyStart = -1;
-    for (let index = 0; index < lines.length; index++) {
-        const line = lines[index];
-        if (index === 0) {
-            result.push(line.replace(/\s+/g, ' ').trim());
-            continue;
-        }
-        if (line.trim() === '') {
-            bodyStart = index;
-            break;
-        }
-        const colonIndex = line.indexOf(':');
-        if (colonIndex > 0) {
-            const name = line.substring(0, colonIndex).trim();
-            const value = line.substring(colonIndex + 1).trim().replace(/[\r\n]/g, ' ');
-            const normalizedName = name.split('-').map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()).join('-');
-            result.push(`${normalizedName}: ${value}`);
-        }
-    }
-    result.push('');
-    if (bodyStart >= 0 && bodyStart < lines.length - 1) {
-        result.push(lines.slice(bodyStart + 1).join('\n'));
-    }
-    return result.join('\r\n');
-}

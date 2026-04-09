@@ -2193,11 +2193,122 @@ public class PenPardIconChanger {
         return await this.toggleVisibility(sessionId, true);
     }
 
+    private resolveRestoreUrl(session: LiveSession, preferredUrl?: string | null): string {
+        const preferred = preferredUrl || session.lastKnownUrl || session.targetUrl || 'about:blank';
+        if (preferred === 'about:blank') {
+            return preferred;
+        }
+        return this.isPenPardInternalUrl(preferred, session.targetOrigin)
+            ? (session.targetUrl || 'about:blank')
+            : preferred;
+    }
+
+    private async launchReplacementContext(
+        session: LiveSession,
+        targetHeadless: boolean,
+        options: {
+            userDataDir?: string;
+            preferredUrl?: string | null;
+            continuitySnapshot?: BrowserContinuitySnapshot | null;
+            navigationFailureLog: string;
+        },
+    ): Promise<{ context: BrowserContext; page: Page; restoreUrl: string; userDataDir: string }> {
+        const userDataDir = options.userDataDir || session.userDataDir;
+        if (!fs.existsSync(userDataDir)) {
+            fs.mkdirSync(userDataDir, { recursive: true });
+        }
+
+        const context = await chromium.launchPersistentContext(userDataDir, {
+            headless: targetHeadless,
+            executablePath: session.executablePath || undefined,
+            args: this.buildLaunchArgs(session.proxyServer, session.brandingExtPath, targetHeadless),
+            ignoreHTTPSErrors: true,
+            proxy: { server: session.proxyServer },
+            viewport: targetHeadless ? { width: 1280, height: 720 } : null,
+        });
+
+        if (options.continuitySnapshot) {
+            await this.applyContinuitySnapshot(context, options.continuitySnapshot);
+        }
+
+        const pages = context.pages();
+        const page = pages.length > 0 ? pages[0] : await context.newPage();
+        const restoreUrl = this.resolveRestoreUrl(session, options.preferredUrl);
+
+        if (restoreUrl && restoreUrl !== 'about:blank') {
+            try {
+                await page.goto(restoreUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            } catch (navErr: any) {
+                logger.warn(options.navigationFailureLog, {
+                    sessionId: session.sessionId,
+                    restoreUrl,
+                    error: navErr.message,
+                });
+            }
+        }
+
+        return { context, page, restoreUrl, userDataDir };
+    }
+
+    private activateReplacementSession(
+        session: LiveSession,
+        targetHeadless: boolean,
+        replacement: { context: BrowserContext; page: Page; restoreUrl: string; userDataDir: string },
+    ): void {
+        session.browser = replacement.context.browser() || (replacement.context as any);
+        session.context = replacement.context;
+        session.page = replacement.page;
+        session.isHeadless = targetHeadless;
+        session.userDataDir = replacement.userDataDir;
+        session.generation += 1;
+        session.transitioning = false;
+        session.lastError = null;
+        this.updateLastKnownPageState(session, replacement.page);
+        this.attachSessionListeners(session.sessionId, replacement.page, replacement.context, session.generation);
+        this.updateLifecycleState(
+            session.sessionId,
+            session,
+            deriveActiveBrowserLifecycleState(targetHeadless, session.hasBeenVisible || !targetHeadless),
+            {
+                status: 'active',
+                currentUrl: this.safePageUrl(session) || replacement.restoreUrl,
+                closedAt: null,
+            },
+        );
+
+        if (!targetHeadless) {
+            const browserIcoPath = this.resolveBrowserIconPath();
+            if (browserIcoPath) {
+                this.applyWindowsIconOverride(browserIcoPath);
+            }
+        }
+    }
+
+    private restoreTransitionFailure(
+        session: LiveSession,
+        previousLifecycleState: BrowserLifecycleState,
+        previousLifecycleDetail: string | null,
+        error: any,
+    ): never {
+        const message = error?.message || String(error);
+        session.transitioning = false;
+        session.lifecycleState = previousLifecycleState;
+        session.lifecycleDetail = previousLifecycleDetail;
+        session.lastError = message;
+        updateBrowserSession(session.sessionId, {
+            lifecycle_state: previousLifecycleState,
+            lifecycle_detail: previousLifecycleDetail,
+            last_error: message,
+            last_activity_at: this.now(),
+        });
+        throw new Error(`Visibility toggle failed: ${message}`);
+    }
+
     private async relaunchUnavailableSession(session: LiveSession, targetHeadless: boolean): Promise<BrowserVisibilityResult> {
         const label = targetHeadless ? 'headless' : 'visible';
         const priorState = session.lifecycleState;
         const priorDetail = session.lifecycleDetail;
-        let newContext: BrowserContext | null = null;
+        let replacementContext: BrowserContext | null = null;
 
         session.transitioning = true;
         updateBrowserSession(session.sessionId, {
@@ -2206,68 +2317,13 @@ public class PenPardIconChanger {
         });
 
         try {
-            const launchArgs = this.buildLaunchArgs(session.proxyServer, session.brandingExtPath, targetHeadless);
-            if (!fs.existsSync(session.userDataDir)) {
-                fs.mkdirSync(session.userDataDir, { recursive: true });
-            }
-
-            newContext = await chromium.launchPersistentContext(session.userDataDir, {
-                headless: targetHeadless,
-                executablePath: session.executablePath || undefined,
-                args: launchArgs,
-                ignoreHTTPSErrors: true,
-                proxy: { server: session.proxyServer },
-                viewport: targetHeadless ? { width: 1280, height: 720 } : null,
+            const replacement = await this.launchReplacementContext(session, targetHeadless, {
+                userDataDir: session.userDataDir,
+                preferredUrl: session.lastKnownUrl || session.targetUrl || 'about:blank',
+                navigationFailureLog: 'Could not restore URL while relaunching unavailable browser session (non-fatal)',
             });
-
-            const pages = newContext.pages();
-            const newPage = pages.length > 0 ? pages[0] : await newContext.newPage();
-            const restoreUrl = (() => {
-                const preferred = session.lastKnownUrl || session.targetUrl || 'about:blank';
-                if (preferred === 'about:blank') return preferred;
-                return this.isPenPardInternalUrl(preferred, session.targetOrigin)
-                    ? (session.targetUrl || 'about:blank')
-                    : preferred;
-            })();
-
-            if (restoreUrl && restoreUrl !== 'about:blank') {
-                try {
-                    await newPage.goto(restoreUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                } catch (navErr: any) {
-                    logger.warn('Could not restore URL while relaunching unavailable browser session (non-fatal)', {
-                        sessionId: session.sessionId,
-                        restoreUrl,
-                        error: navErr.message,
-                    });
-                }
-            }
-
-            session.browser = newContext.browser() || (newContext as any);
-            session.context = newContext;
-            session.page = newPage;
-            session.isHeadless = targetHeadless;
-            session.transitioning = false;
-            session.generation += 1;
-            session.lastError = null;
-            this.updateLastKnownPageState(session, newPage);
-            this.attachSessionListeners(session.sessionId, newPage, newContext, session.generation);
-            this.updateLifecycleState(
-                session.sessionId,
-                session,
-                deriveActiveBrowserLifecycleState(targetHeadless, session.hasBeenVisible || !targetHeadless),
-                {
-                    status: 'active',
-                    currentUrl: this.safePageUrl(session),
-                    closedAt: null,
-                },
-            );
-
-            if (!targetHeadless) {
-                const browserIcoPath = this.resolveBrowserIconPath();
-                if (browserIcoPath) {
-                    this.applyWindowsIconOverride(browserIcoPath);
-                }
-            }
+            replacementContext = replacement.context;
+            this.activateReplacementSession(session, targetHeadless, replacement);
 
             return {
                 ...this.buildVisibilityState(session),
@@ -2275,25 +2331,15 @@ public class PenPardIconChanger {
                 reopened: true,
             };
         } catch (error: any) {
-            if (newContext) {
+            if (replacementContext) {
                 try {
-                    await newContext.close();
+                    await replacementContext.close();
                 } catch {
                     /* ignore */
                 }
             }
-            session.transitioning = false;
-            session.lifecycleState = priorState;
-            session.lifecycleDetail = priorDetail;
-            session.lastError = error.message;
-            updateBrowserSession(session.sessionId, {
-                lifecycle_state: priorState,
-                lifecycle_detail: priorDetail,
-                last_error: error.message,
-                last_activity_at: this.now(),
-            });
             logger.error(`Failed to relaunch ${label} browser session`, { sessionId: session.sessionId, error: error.message });
-            throw new Error(`Visibility toggle failed: ${error.message}`);
+            this.restoreTransitionFailure(session, priorState, priorDetail, error);
         }
     }
 
@@ -2329,7 +2375,7 @@ public class PenPardIconChanger {
         logger.info(`Switching browser session to ${label}`, { sessionId });
         const previousLifecycleState = session.lifecycleState;
         const previousLifecycleDetail = session.lifecycleDetail;
-        let newContext: BrowserContext | null = null;
+        let replacementContext: BrowserContext | null = null;
 
         try {
             const readySession = this.assertReadySession(sessionId, `switch browser visibility to ${label}`);
@@ -2337,70 +2383,20 @@ public class PenPardIconChanger {
             const previousBrowser = readySession.browser;
             const continuitySnapshot = await this.captureContinuitySnapshot(readySession);
             const replacementUserDataDir = this.ensureVisibilityTransitionDir(session, targetHeadless);
-            const launchArgs = this.buildLaunchArgs(session.proxyServer, session.brandingExtPath, targetHeadless);
             this.updateLifecycleState(sessionId, session, 'closing', {
                 detail: `Switching browser to ${label}`,
                 status: 'active',
                 currentUrl: this.safePageUrl(session),
                 preserveTransitioning: true,
             });
-            newContext = await chromium.launchPersistentContext(replacementUserDataDir, {
-                headless: targetHeadless,
-                executablePath: session.executablePath,
-                args: launchArgs,
-                ignoreHTTPSErrors: true,
-                proxy: { server: session.proxyServer },
-                viewport: targetHeadless ? { width: 1280, height: 720 } : null,
+            const replacement = await this.launchReplacementContext(session, targetHeadless, {
+                userDataDir: replacementUserDataDir,
+                preferredUrl: continuitySnapshot.url || session.targetUrl || 'about:blank',
+                continuitySnapshot,
+                navigationFailureLog: 'Could not restore URL after visibility toggle (non-fatal)',
             });
-            await this.applyContinuitySnapshot(newContext, continuitySnapshot);
-
-            const pages = newContext.pages();
-            const newPage = pages.length > 0 ? pages[0] : await newContext.newPage();
-            const restoreUrl = (() => {
-                const preferred = continuitySnapshot.url || session.targetUrl || 'about:blank';
-                if (preferred === 'about:blank') return preferred;
-                return this.isPenPardInternalUrl(preferred, session.targetOrigin)
-                    ? (session.targetUrl || 'about:blank')
-                    : preferred;
-            })();
-
-            if (restoreUrl && restoreUrl !== 'about:blank') {
-                try {
-                    await newPage.goto(restoreUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                } catch (navErr: any) {
-                    logger.warn('Could not restore URL after visibility toggle (non-fatal)', {
-                        sessionId, restoreUrl, error: navErr.message,
-                    });
-                }
-            }
-
-            session.browser = newContext.browser() || (newContext as any);
-            session.context = newContext;
-            session.page = newPage;
-            session.isHeadless = targetHeadless;
-            session.userDataDir = replacementUserDataDir;
-            session.generation += 1;
-            session.transitioning = false;
-            session.lastError = null;
-            this.updateLastKnownPageState(session, newPage);
-            this.attachSessionListeners(sessionId, newPage, newContext, session.generation);
-            this.updateLifecycleState(
-                sessionId,
-                session,
-                deriveActiveBrowserLifecycleState(targetHeadless, session.hasBeenVisible || !targetHeadless),
-                {
-                    status: 'active',
-                    currentUrl: this.safePageUrl(session) || restoreUrl,
-                    closedAt: null,
-                },
-            );
-
-            if (!targetHeadless) {
-                const browserIcoPath = this.resolveBrowserIconPath();
-                if (browserIcoPath) {
-                    this.applyWindowsIconOverride(browserIcoPath);
-                }
-            }
+            replacementContext = replacement.context;
+            this.activateReplacementSession(session, targetHeadless, replacement);
 
             try {
                 previousContext.removeAllListeners('close');
@@ -2421,32 +2417,22 @@ public class PenPardIconChanger {
                 }
             }
 
-            logger.info(`Browser session switched to ${label}`, { sessionId, restoredUrl: restoreUrl });
+            logger.info(`Browser session switched to ${label}`, { sessionId, restoredUrl: replacement.restoreUrl });
             return {
                 ...this.buildVisibilityState(session),
                 message: targetHeadless ? 'Browser hidden and continued headless' : 'Browser window opened',
                 reopened: false,
             };
         } catch (error: any) {
-            if (newContext) {
+            if (replacementContext) {
                 try {
-                    await newContext.close();
+                    await replacementContext.close();
                 } catch {
                     /* ignore */
                 }
             }
-            session.transitioning = false;
-            session.lifecycleState = previousLifecycleState;
-            session.lifecycleDetail = previousLifecycleDetail;
-            session.lastError = error.message;
-            updateBrowserSession(sessionId, {
-                lifecycle_state: previousLifecycleState,
-                lifecycle_detail: previousLifecycleDetail,
-                last_error: error.message,
-                last_activity_at: this.now(),
-            });
             logger.error(`Failed to switch browser visibility to ${label}`, { sessionId, error: error.message });
-            throw new Error(`Visibility toggle failed: ${error.message}`);
+            this.restoreTransitionFailure(session, previousLifecycleState, previousLifecycleDetail, error);
         }
     }
 }

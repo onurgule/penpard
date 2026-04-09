@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const { OrchestratorToolDispatcher } = require('../src/agents/orchestrator/OrchestratorToolDispatcher') as typeof import('../src/agents/orchestrator/OrchestratorToolDispatcher');
+const { OrchestratorToolRegistry } = require('../src/agents/orchestrator/OrchestratorToolRegistry') as typeof import('../src/agents/orchestrator/OrchestratorToolRegistry');
 const {
     evaluateToolExecutionGuard,
     hasCustomAuthHeader,
@@ -66,4 +67,39 @@ test('auth helpers preserve explicit control over identity and intent resolution
 
     assert.equal(explicit, 'session_refresh');
     assert.equal(inferredAnonymous, 'unknown');
+});
+
+test('tool registry centralizes canonical names, aliases, and arg coercion for the active path', () => {
+    const registry = new OrchestratorToolRegistry({
+        handlers: {
+            browser_navigate: async () => ({}),
+            get_proxy_history: async () => ({}),
+            send_http_request: async () => ({}),
+            none: async () => ({}),
+        },
+    });
+
+    const browserAction = registry.normalizeToolCall(
+        {
+            name: 'browserNavigate',
+            arguments: 'https://app.example.com/account',
+        },
+        (value: any) => value,
+    );
+    const proxyAction = registry.normalizeToolCall(
+        'getProxyHistory',
+        (value: any) => value,
+        { count: 8 },
+    );
+
+    assert.deepEqual(browserAction, {
+        tool: 'browser_navigate',
+        args: { url: 'https://app.example.com/account' },
+    });
+    assert.deepEqual(proxyAction, {
+        tool: 'get_proxy_history',
+        args: { count: 8, excludePenPard: true },
+    });
+    assert.equal(registry.canonicalize('sendHttpRequest'), 'send_http_request');
+    assert.ok(registry.listToolNames().includes('none'));
 });

@@ -115,6 +115,7 @@ export async function initDatabase(): Promise<void> {
       scan_config_json TEXT,
       auth_inventory_json TEXT,
       endpoint_inventory_json TEXT,
+      runtime_checkpoint_json TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
@@ -447,10 +448,14 @@ export async function initDatabase(): Promise<void> {
     db.exec('ALTER TABLE scans ADD COLUMN auth_inventory_json TEXT');
     logger.info('Added scans.auth_inventory_json column');
   }
-  if (!scanCols.some((c) => c.name === 'endpoint_inventory_json')) {
-    db.exec('ALTER TABLE scans ADD COLUMN endpoint_inventory_json TEXT');
-    logger.info('Added scans.endpoint_inventory_json column');
-  }
+if (!scanCols.some((c) => c.name === 'endpoint_inventory_json')) {
+  db.exec('ALTER TABLE scans ADD COLUMN endpoint_inventory_json TEXT');
+  logger.info('Added scans.endpoint_inventory_json column');
+}
+if (!scanCols.some((c) => c.name === 'runtime_checkpoint_json')) {
+  db.exec('ALTER TABLE scans ADD COLUMN runtime_checkpoint_json TEXT');
+  logger.info('Added scans.runtime_checkpoint_json column');
+}
 
   // Migration: browser_sessions.label (user-friendly session names for multi-session testing)
   const browserCols = db.prepare('PRAGMA table_info(browser_sessions)').all() as { name: string }[];
@@ -502,9 +507,9 @@ export const getScan = (id: string) => {
 };
 
 export const updateScanStatus = (id: string, status: string, errorMessage?: string) => {
-  if (status === 'completed' || status === 'failed') {
+  if (status === 'completed' || status === 'failed' || status === 'stopped' || status === 'interrupted') {
     return db.prepare(`
-      UPDATE scans SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ?
+      UPDATE scans SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), error_message = ?
       WHERE id = ?
     `).run(status, errorMessage || null, id);
   }
@@ -535,6 +540,16 @@ export const getScanEndpointInventory = (scanId: string): any | null => {
   const row = db.prepare('SELECT endpoint_inventory_json FROM scans WHERE id = ?').get(scanId) as any;
   if (!row?.endpoint_inventory_json) return null;
   try { return JSON.parse(row.endpoint_inventory_json); } catch { return null; }
+};
+
+export const saveScanRuntimeCheckpoint = (scanId: string, checkpointJson: string) => {
+  return db.prepare('UPDATE scans SET runtime_checkpoint_json = ? WHERE id = ?').run(checkpointJson, scanId);
+};
+
+export const getScanRuntimeCheckpoint = (scanId: string): any | null => {
+  const row = db.prepare('SELECT runtime_checkpoint_json FROM scans WHERE id = ?').get(scanId) as any;
+  if (!row?.runtime_checkpoint_json) return null;
+  try { return JSON.parse(row.runtime_checkpoint_json); } catch { return null; }
 };
 
 export const getSourceAnalysisResult = (scanId: string): any | null => {

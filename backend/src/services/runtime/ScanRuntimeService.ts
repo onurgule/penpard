@@ -13,6 +13,7 @@ import { browserService } from '../BrowserService';
 import { BurpMCPClient } from '../burp-mcp';
 import { defaultAuthStartupConfig, redactAuthStartupConfig } from '../web-auth-startup-config';
 import { logger } from '../../utils/logger';
+import { scanRuntimeCheckpointService } from './ScanRuntimeCheckpointService';
 import { ScanRuntimeRegistry, scanRuntimeRegistry } from './ScanRuntimeRegistry';
 
 interface ScanRecord {
@@ -33,6 +34,7 @@ interface WebScanRuntimeConfig {
     useFfuf?: boolean;
     idorUsers?: any[];
     parallelAgents?: number;
+    requestedParallelAgents?: number;
     customSystemPrompt?: string;
     sessionCookies?: string;
     initialRequest?: string;
@@ -43,6 +45,12 @@ interface WebScanRuntimeConfig {
 
 export class ScanRuntimeService {
     constructor(private readonly registry: ScanRuntimeRegistry = scanRuntimeRegistry) {}
+
+    public launchWebScan(scanId: string, targetUrl: string, config: WebScanRuntimeConfig = {}): void {
+        void this.startWebScan(scanId, targetUrl, config).catch(() => {
+            /* startWebScan already records terminal failure state */
+        });
+    }
 
     public getActiveAgent(scanId: string): OrchestratorAgent | undefined {
         return this.registry.getAgent(scanId);
@@ -55,6 +63,10 @@ export class ScanRuntimeService {
     public getEndpointInventory(scanId: string): any {
         const agent = this.registry.getAgent(scanId);
         return agent?.getState?.().endpointInventory || getScanEndpointInventory(scanId);
+    }
+
+    public getRuntimeCheckpoint(scanId: string): any {
+        return scanRuntimeCheckpointService.getCheckpoint(scanId);
     }
 
     public async startWebScan(scanId: string, targetUrl: string, config: WebScanRuntimeConfig = {}): Promise<void> {
@@ -91,23 +103,18 @@ export class ScanRuntimeService {
 
             logger.info('Using Burp MCP for scanning', { scanId });
 
-            const requestedParallelAgents = config.parallelAgents || 1;
-            const authFirstStartupRequired = true;
-            const parallelAgents = authFirstStartupRequired ? 1 : requestedParallelAgents;
-            logger.info(`parallelAgents config value: ${requestedParallelAgents} (effective: ${parallelAgents})`, { scanId, config });
-
+            const requestedParallelAgents = Math.max(
+                1,
+                Number(config.requestedParallelAgents ?? config.parallelAgents) || 1,
+            );
             if (requestedParallelAgents > 1) {
-                logger.warn('Web Scan startup now requires a single orchestrator so browser-driven auth inventory, Burp traffic correlation, and session state stay consistent across the scan lifecycle.', {
+                logger.warn('Parallel multi-agent web scan execution is intentionally dormant. Ignoring requested parallelAgents so auth-first startup, browser continuity, and finding evidence stay on the hardened single-agent path.', {
                     scanId,
                     requestedParallelAgents,
                 });
             }
 
-            if (parallelAgents > 1) {
-                await this.runPoolScan(scanId, targetUrl, burpMCP, config, parallelAgents);
-            } else {
-                await this.runSingleAgentScan(scanId, targetUrl, burpMCP, config);
-            }
+            await this.runSingleAgentScan(scanId, targetUrl, burpMCP, config);
 
             logger.info('Web scan completed', { scanId });
         } catch (error: any) {
@@ -157,7 +164,7 @@ export class ScanRuntimeService {
         const runtime = this.registry.getRuntime(scanId);
 
         if (!runtime) {
-            if (scanStatus !== 'completed' && scanStatus !== 'failed') {
+            if (!['completed', 'failed', 'stopped', 'interrupted'].includes(scanStatus)) {
                 updateScanStatus(scanId, 'stopped', 'Scan stopped by user');
             }
             return { message: 'Scan was not actively running, status updated' };
@@ -172,8 +179,8 @@ export class ScanRuntimeService {
         }
 
         runtime.agent.stop();
+        await runtime.agent.waitForCompletion();
         this.finalizeAgentRuntime(scanId, runtime.agent);
-        updateScanStatus(scanId, 'stopped', 'Scan stopped by user');
         logger.info('Scan stopped by user', { scanId, userId });
         return { message: 'Scan stopped successfully' };
     }
@@ -220,7 +227,9 @@ export class ScanRuntimeService {
             idorUsers: [],
             customSystemPrompt: options.instruction,
             initialRequest,
-        }, burpMCP);
+        }, burpMCP, {
+            checkpoint: (checkpoint) => scanRuntimeCheckpointService.saveCheckpoint(id, checkpoint),
+        });
 
         this.registry.registerAgent(id, agent);
 
@@ -263,6 +272,7 @@ export class ScanRuntimeService {
             return {
                 isActive: true,
                 isPool: true,
+                executionMode: 'dormant-multi-agent',
                 phase: 'testing',
                 isRunning: state.isRunning,
                 isPaused: false,
@@ -285,6 +295,7 @@ export class ScanRuntimeService {
             return {
                 isActive: true,
                 isPool: false,
+                executionMode: 'single-agent',
                 phase: state.phase,
                 isRunning: state.isRunning,
                 isPaused: state.isPaused,
@@ -318,10 +329,12 @@ export class ScanRuntimeService {
         const cachedLogs = cached ? cached.logs.slice(since) : [];
         const cachedLogsCount = cached ? cached.logs.length : 0;
         const isCompleted = scan.status === 'completed' || scan.status === 'stopped' || scan.status === 'failed';
+        const checkpoint = scanRuntimeCheckpointService.getCheckpoint(scanId);
 
         return {
             isActive: false,
             isPool: false,
+            executionMode: checkpoint?.executionMode || 'single-agent',
             phase: cached?.phase || scan.status,
             isRunning: false,
             isPaused: false,
@@ -331,6 +344,17 @@ export class ScanRuntimeService {
             activeAgents: this.registry.getTotalActiveRuntimeCount(),
             scanCompleted: isCompleted,
             endpointInventory: getScanEndpointInventory(scanId),
+            harvestedRequestCount: checkpoint?.harvested?.total || 0,
+            promotedRequestCount: checkpoint?.harvested?.promoted || 0,
+            hypothesisCount: checkpoint?.hypotheses?.counts || { new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 },
+            coverageSummary: checkpoint?.coverage ? {
+                routesSeen: checkpoint.coverage.routesSeen,
+                exercised: checkpoint.coverage.routesExercisedInBrowser,
+                promoted: checkpoint.coverage.requestsPromoted,
+                untested: Array.isArray(checkpoint.coverage.untestedRoutes) ? checkpoint.coverage.untestedRoutes.length : 0,
+                coveragePercentage: checkpoint.coverage.coveragePercentage,
+            } : null,
+            runtimeCheckpoint: checkpoint,
         };
     }
 
@@ -445,6 +469,7 @@ ${suggestion.endpoints.join('\n')}`,
                 maxIterations: 15,
             },
             burp,
+            { checkpoint: (checkpoint) => scanRuntimeCheckpointService.saveCheckpoint(scanId, checkpoint) },
         );
 
         this.registry.registerAgent(scanId, agent);
@@ -511,7 +536,9 @@ ${suggestion.endpoints.join('\n')}`,
             sourceAnalysisMode: config.sourceAnalysisMode,
             authStartup: config.authStartup || defaultAuthStartupConfig(),
             customSystemPrompt: config.customSystemPrompt,
-        }, burpMCP);
+        }, burpMCP, {
+            checkpoint: (checkpoint) => scanRuntimeCheckpointService.saveCheckpoint(scanId, checkpoint),
+        });
 
         this.registry.registerAgent(scanId, agent);
 

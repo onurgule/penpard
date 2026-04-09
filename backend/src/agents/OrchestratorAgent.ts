@@ -24,10 +24,10 @@ import { CoverageTracker } from '../services/CoverageTracker';
 import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
 import { browserService } from '../services/BrowserService';
 import { AuthStateManager, AuthStartupConfig, AuthStartupInventory } from '../services/auth';
-import { parseRawBurpRequest, type ParsedBurpRequest } from '../services/burp-request';
 import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
 import { WebAuthStartupService } from '../services/WebAuthStartupService';
 import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
+import { ScanRuntimeCheckpoint } from '../services/runtime/ScanRuntimeCheckpointService';
 import {
     DEFAULT_WEB_PROMPT,
     buildContinuationScopeMessage,
@@ -42,7 +42,10 @@ import { OrchestratorLogLedger } from './orchestrator/OrchestratorLogLedger';
 import { OrchestratorLlmResponseParser } from './orchestrator/OrchestratorLlmResponseParser';
 import { OrchestratorPlanner } from './orchestrator/OrchestratorPlanner';
 import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
+import { buildInitialRequestContext, type OrchestratorInitialRequestContext } from './orchestrator/OrchestratorInitialRequestContext';
+import { OrchestratorSingleAgentHarness } from './orchestrator/OrchestratorSingleAgentHarness';
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
+import { OrchestratorToolRegistry } from './orchestrator/OrchestratorToolRegistry';
 import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
 import { evaluateToolExecutionGuard, resolveAuthIdentityId } from './orchestrator/OrchestratorToolPolicy';
 import {
@@ -80,6 +83,19 @@ interface ScanConfig {
     sourceAnalysisMode?: string;
     /** Explicit startup auth discovery/login strategy for Web Scans. */
     authStartup?: AuthStartupConfig;
+}
+
+interface ContinueScanOptions {
+    instruction: string;
+    iterations: number;
+    planningEnabled: boolean;
+    existingFindings?: any[];
+    existingEndpoints?: string[];
+    existingLogs?: string[];
+}
+
+interface OrchestratorAgentHooks {
+    checkpoint?: (checkpoint: ScanRuntimeCheckpoint) => void | Promise<void>;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -396,8 +412,17 @@ export class OrchestratorAgent {
     private readonly findingTracker: OrchestratorFindingTracker;
     private readonly scanStatus: OrchestratorScanStatus;
     private readonly toolDispatcher: OrchestratorToolDispatcher;
+    private readonly toolRegistry: OrchestratorToolRegistry;
+    private readonly harness: OrchestratorSingleAgentHarness<ContinueScanOptions>;
+    private readonly initialRequestContext: OrchestratorInitialRequestContext | null;
 
-    constructor(scanId: string, targetUrl: string, config: ScanConfig, burp: BurpMCPClient) {
+    constructor(
+        scanId: string,
+        targetUrl: string,
+        config: ScanConfig,
+        burp: BurpMCPClient,
+        private readonly hooks: OrchestratorAgentHooks = {},
+    ) {
         this.scanId = scanId;
         this.targetUrl = targetUrl;
         this.config = config;
@@ -407,6 +432,9 @@ export class OrchestratorAgent {
         const requested = config.maxPlanRounds ?? 0;
         this.maxPlanRounds = requested > 0 ? requested : 0;
         this.logLedger = new OrchestratorLogLedger({ scanId });
+        this.initialRequestContext = config.initialRequest?.trim()
+            ? buildInitialRequestContext(config.initialRequest.trim())
+            : null;
 
         // Initialize pentester loop services
         this.harvester = new RequestHarvester();
@@ -471,21 +499,7 @@ export class OrchestratorAgent {
             },
         });
         this.scanStatus = new OrchestratorScanStatus(scanId);
-        this.toolDispatcher = new OrchestratorToolDispatcher({
-            log: (channel, message) => this.log(channel as any, message),
-            guard: (toolCall) => {
-                const guardResult = evaluateToolExecutionGuard({
-                    toolName: toolCall.tool,
-                    isFocusedScope: this.isFocusedScope,
-                    rateLimitPauseUntil: this.rateLimitPauseUntil,
-                });
-
-                if (!guardResult.allowed && guardResult.logMessage) {
-                    this.log('tool', guardResult.logMessage);
-                }
-
-                return guardResult.allowed ? null : guardResult.response;
-            },
+        this.toolRegistry = new OrchestratorToolRegistry({
             handlers: {
                 send_http_request: (toolCall) => this.executeSendHttpRequest(toolCall),
                 get_proxy_history: async (toolCall) => ({
@@ -522,6 +536,30 @@ export class OrchestratorAgent {
                 repeater_test: (toolCall) => this.executeRepeaterTest(toolCall),
                 none: async () => ({ status: 'No tool call (step complete)' }),
             },
+        });
+        this.toolDispatcher = new OrchestratorToolDispatcher({
+            log: (channel, message) => this.log(channel as any, message),
+            guard: (toolCall) => {
+                const guardResult = evaluateToolExecutionGuard({
+                    toolName: toolCall.tool,
+                    isFocusedScope: this.isFocusedScope,
+                    rateLimitPauseUntil: this.rateLimitPauseUntil,
+                });
+
+                if (!guardResult.allowed && guardResult.logMessage) {
+                    this.log('tool', guardResult.logMessage);
+                }
+
+                return guardResult.allowed ? null : guardResult.response;
+            },
+            handlers: this.toolRegistry.getHandlers(),
+        });
+        this.harness = new OrchestratorSingleAgentHarness<ContinueScanOptions>({
+            beforeRun: (kind) => this.prepareRun(kind),
+            runInitial: () => this.executeInitialRun(),
+            runContinuation: (options) => this.executeContinuationRun(options),
+            handleFailure: (kind, error) => this.handleRunFailure(kind, error),
+            finalizeRun: () => this.finalizeRun(),
         });
     }
 
@@ -570,155 +608,132 @@ export class OrchestratorAgent {
         return this.phase === 'stopped';
     }
 
-    public async start() {
-        if (this.isRunning) return;
+    private async finalizeRun(): Promise<void> {
+        this.isRunning = false;
+        await this.persistRuntimeCheckpoint('run-finalizing');
+        try {
+            await this.cleanupBrowserSession();
+        } finally {
+            this.saveLogs();
+        }
+
+        await this.persistRuntimeCheckpoint('run-finalized');
+    }
+
+    public async waitForCompletion(): Promise<void> {
+        await this.harness.waitForCompletion();
+    }
+
+    private prepareRun(kind: 'initial' | 'continuation'): void {
         this.isRunning = true;
         this.contextSignals.resetBudgetSignals();
-        this.log('system', `Orchestrator Agent started for target: ${this.targetUrl}`);
-
-        try {
-            this.scanStatus.initializing();
-
-            if (!this.targetUrl) {
-                throw new Error('Target URL is required');
-            }
-
-            // Phase 1: Initialize
-            await this.phaseInit();
-            if (!this.isRunning || this.isStoppedPhase()) {
-                return;
-            }
-
-            // Phase 2: Iterative Plan → Execute → Replan
-            await this.phaseIterativeTesting();
-            if (!this.isRunning || this.isStoppedPhase()) {
-                return;
-            }
-
-            // Phase 3: Reporting
-            await this.phaseReporting();
-
-        } catch (error: any) {
-            if (this.isStoppedPhase()) {
-                return;
-            }
-            this.phase = 'failed';
-            this.log('error', `Critical Failure: ${error.message}`);
-            this.scanStatus.failed(error.message);
-        } finally {
-            this.isRunning = false;
-            this.saveLogs();
-            this.browserSession.cleanup();
+        if (kind === 'initial') {
+            this.log('system', `Orchestrator Agent started for target: ${this.targetUrl}`);
+            return;
         }
+        this.phase = 'planning';
+    }
+
+    public async start() {
+        await this.harness.start();
     }
 
     /**
      * Continue a completed scan with a new instruction.
      * Re-initializes the agent with existing findings context and runs for X more planning rounds.
      */
-    public async continueScan(opts: {
-        instruction: string;
-        iterations: number;
-        planningEnabled: boolean;
-        existingFindings?: any[];
-        existingEndpoints?: string[];
-        existingLogs?: string[];
-    }) {
-        if (this.isRunning) {
-            this.log('error', 'Agent is already running. Cannot continue.');
+    public async continueScan(opts: ContinueScanOptions) {
+        await this.harness.continueScan(opts);
+    }
+
+    private handleRunFailure(kind: 'initial' | 'continuation', error: any): void {
+        if (this.isStoppedPhase()) {
             return;
         }
 
-        this.isRunning = true;
-        this.phase = 'planning';
-        this.contextSignals.resetBudgetSignals();
-        const extraRounds = Math.min(Math.max(opts.iterations, 1), 20); // clamp 1-20
+        this.phase = 'failed';
+        const message = error?.message || String(error);
+        this.log('error', kind === 'continuation' ? `Continuation failed: ${message}` : `Critical Failure: ${message}`);
+        this.scanStatus.failed(message);
+    }
+
+    private async executeInitialRun(): Promise<void> {
+        this.scanStatus.initializing();
+
+        if (!this.targetUrl) {
+            throw new Error('Target URL is required');
+        }
+
+        await this.phaseInit();
+        if (!this.isRunning || this.isStoppedPhase()) {
+            return;
+        }
+
+        await this.phaseIterativeTesting();
+        if (!this.isRunning || this.isStoppedPhase()) {
+            return;
+        }
+
+        await this.phaseReporting();
+    }
+
+    private async executeContinuationRun(opts: ContinueScanOptions): Promise<void> {
+        const extraRounds = Math.min(Math.max(opts.iterations, 1), 20);
 
         this.log('system', `═══ CONTINUING SCAN ═══`);
         this.log('system', `Instruction: ${opts.instruction}`);
         this.log('system', `Additional rounds: ${extraRounds}, Planning: ${opts.planningEnabled ? 'ON' : 'OFF'}`);
+        this.scanStatus.testing();
 
-        try {
-            this.scanStatus.testing();
+        if (opts.existingFindings) {
+            this.findings = opts.existingFindings;
+            this.log('system', `Restored ${this.findings.length} existing findings`);
+        }
+        if (opts.existingEndpoints) {
+            opts.existingEndpoints.forEach((endpoint) => this.discoveredEndpoints.add(endpoint));
+            this.log('system', `Restored ${this.discoveredEndpoints.size} discovered endpoints`);
+        }
 
-            // Restore existing state from DB
-            if (opts.existingFindings) {
-                this.findings = opts.existingFindings;
-                this.log('system', `Restored ${this.findings.length} existing findings`);
-            }
-            if (opts.existingEndpoints) {
-                opts.existingEndpoints.forEach(ep => this.discoveredEndpoints.add(ep));
-                this.log('system', `Restored ${this.discoveredEndpoints.size} discovered endpoints`);
-            }
+        const burpOk = await this.burp.isAvailable();
+        if (!burpOk) {
+            this.log('error', 'Burp MCP not available! Attempting to continue anyway...');
+        } else {
+            this.log('system', '✓ Burp MCP: Connected');
+        }
 
-            // Check connections
-            const burpOk = await this.burp.isAvailable();
-            if (!burpOk) {
-                this.log('error', 'Burp MCP not available! Attempting to continue anyway...');
-            } else {
-                this.log('system', '✓ Burp MCP: Connected');
-            }
+        const llmOk = await this.checkLLM();
+        if (!llmOk) {
+            throw new Error('No active LLM configured.');
+        }
+        this.log('system', '✓ LLM: Connected');
 
-            const llmOk = await this.checkLLM();
-            if (!llmOk) {
-                throw new Error('No active LLM configured.');
-            }
-            this.log('system', '✓ LLM: Connected');
+        if (this.conversationHistory.length === 0) {
+            const promptTemplate = await this.loadPromptTemplate();
+            const accountsJson = JSON.stringify(this.buildAccountPromptContext(), null, 2);
+            let systemPrompt = promptTemplate
+                .replace('{TARGET_WEBSITE}', this.targetUrl)
+                .replace('{TARGET_WEBSITE_ACCOUNTS}', accountsJson);
 
-            // Build system prompt if not already set (includes initialRequest headers)
-            if (this.conversationHistory.length === 0) {
-                const promptTemplate = await this.loadPromptTemplate();
-                const accountsJson = JSON.stringify(this.buildAccountPromptContext(), null, 2);
-                let sysPrompt = promptTemplate
-                    .replace('{TARGET_WEBSITE}', this.targetUrl)
-                    .replace('{TARGET_WEBSITE_ACCOUNTS}', accountsJson);
-
-                // Inject initialRequest structured data into system prompt (same as phaseInit)
-                if (this.config.initialRequest?.trim()) {
-                    const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
-                    if (parsed) {
-                        const headersBlock = Object.entries(parsed.headers)
-                            .filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
-                            .map(([k, v]) => `    "${k}": "${v}"`)
-                            .join(',\n');
-                        sysPrompt += `\n\n═══════════════════════════════════════════════════════════════\n  SEND TO PENPARD — REQUEST FROM BURP (CRITICAL)\n═══════════════════════════════════════════════════════════════\n\nYou received a complete HTTP request from the user via Burp. STRICT RULES:\n\n1. Every send_http_request MUST include ALL headers listed below. Do NOT omit any. Do NOT add new headers. Copy them exactly.\n2. Set preserveExplicitAuth=true so PenPard preserves the explicit Cookie/Authorization headers exactly as supplied.\n3. Only PARAMETRIC testing: change parameter values in the URL query string or body. Do NOT touch headers unless the user explicitly asks.\n4. The request has cookies and auth tokens — these are essential for authenticated testing.\n\nBASE REQUEST:\n  Method: ${parsed.method}\n  URL: ${parsed.url}\n  Headers (INCLUDE ALL OF THESE IN EVERY REQUEST):\n${headersBlock}\n  Body: ${parsed.body || '(none)'}\n\nWhen calling send_http_request, use:\n  { "method": "${parsed.method}", "url": "<url with modified params>", "headers": { ALL HEADERS ABOVE }, "body": "${parsed.body || ''}", "preserveExplicitAuth": true }\n`;
-                    }
-                }
-
-                this.systemPromptContent = sysPrompt;
-                this.conversationHistory.push({ role: 'system', content: sysPrompt });
+            if (this.initialRequestContext) {
+                systemPrompt += this.initialRequestContext.systemPromptAppendix;
             }
 
-            // Also inject initialRequest as structured user message for continuation context
-            if (this.config.initialRequest?.trim()) {
-                const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
-                if (parsed) {
-                    const headersJson = JSON.stringify(
-                        Object.fromEntries(
-                            Object.entries(parsed.headers).filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
-                        ),
-                        null, 2
-                    );
-                    this.conversationHistory.push({
-                        role: 'user',
-                        content: `REMINDER — The original request from Burp (Send to PenPard) is still active. You MUST include ALL these headers in every send_http_request and set preserveExplicitAuth=true.\n\nMethod: ${parsed.method}\nURL: ${parsed.url}\nHeaders (JSON — pass this entire object):\n${headersJson}\nBody: ${parsed.body || '(none)'}\n\nDo NOT send requests without these headers. The user's session cookies and auth tokens are required.`
-                    });
-                    this.conversationHistory.push({
-                        role: 'assistant',
-                        content: `Understood. I will continue including all ${Object.keys(parsed.headers).length} headers (Cookie, auth tokens, User-Agent, etc.) in every request and I will set preserveExplicitAuth=true so PenPard does not replace them.`
-                    });
-                    this.log('system', `✓ Burp request headers re-injected for continuation (${Object.keys(parsed.headers).length} headers)`);
-                }
-            }
+            this.systemPromptContent = systemPrompt;
+            this.conversationHistory.push({ role: 'system', content: systemPrompt });
+        }
 
-            // Inject continuation instruction as operator command
-            const findingsSummary = this.findings.length > 0
-                ? this.findings.map(f => `- [${f.severity?.toUpperCase()}] ${f.name}`).join('\n')
-                : 'No findings yet.';
+        if (this.initialRequestContext) {
+            this.conversationHistory.push(...this.initialRequestContext.continuationMessages);
+            this.log('system', `✓ ${this.initialRequestContext.logSummary}`);
+        }
 
-            this.conversationHistory.push({
-                role: 'user',
-                content: `⚠️ [OPERATOR COMMAND — SCAN CONTINUATION] The operator has resumed this completed scan with new instructions:
+        const findingsSummary = this.findings.length > 0
+            ? this.findings.map((finding) => `- [${finding.severity?.toUpperCase()}] ${finding.name}`).join('\n')
+            : 'No findings yet.';
+
+        this.conversationHistory.push({
+            role: 'user',
+            content: `⚠️ [OPERATOR COMMAND — SCAN CONTINUATION] The operator has resumed this completed scan with new instructions:
 
 INSTRUCTION: ${opts.instruction}
 
@@ -728,51 +743,38 @@ ${findingsSummary}
 DISCOVERED ENDPOINTS:
 ${[...this.discoveredEndpoints].join('\n') || 'None recorded'}
 
-You have ${extraRounds} planning round(s) to execute this instruction. ${opts.planningEnabled ? 'Use the PLAN → EXECUTE → REPLAN cycle.' : 'Skip planning — execute the instruction directly with tool calls.'} Be thorough within the given rounds.`
-            });
+You have ${extraRounds} planning round(s) to execute this instruction. ${opts.planningEnabled ? 'Use the PLAN → EXECUTE → REPLAN cycle.' : 'Skip planning — execute the instruction directly with tool calls.'} Be thorough within the given rounds.`,
+        });
 
-            // Analyze instruction scope
-            await this.analyzeOperatorInstructions(opts.instruction);
+        await this.analyzeOperatorInstructions(opts.instruction);
 
-            // Inject scope directives
-            if (this.instructionAnalysis?.is_focused) {
-                this.isFocusedScope = true;
-                this.conversationHistory.push(buildContinuationScopeMessage(this.instructionAnalysis));
-            }
+        if (this.instructionAnalysis?.is_focused) {
+            this.isFocusedScope = true;
+            this.conversationHistory.push(buildContinuationScopeMessage(this.instructionAnalysis));
+        }
 
-            // Reset round counter for the continuation
-            const savedRound = this.planRound;
-            const savedMaxPlanRounds = this.maxPlanRounds;
-            const savedMaxIterations = this.maxIterations;
-            this.planRound = 0;
-            this.maxPlanRounds = extraRounds;
-            this.maxIterations = extraRounds * 10; // generous action budget
+        const savedRound = this.planRound;
+        const savedMaxPlanRounds = this.maxPlanRounds;
+        const savedMaxIterations = this.maxIterations;
+        this.planRound = 0;
+        this.maxPlanRounds = extraRounds;
+        this.maxIterations = extraRounds * 10;
+        await this.persistRuntimeCheckpoint('continuation-prepared');
 
-            if (opts.planningEnabled) {
-                // Full Plan → Execute → Replan cycle
-                await this.phaseIterativeTesting();
-            } else {
-                // Direct execution — send instruction and let LLM execute freely
-                await this.phaseDirectExecution(opts.instruction, extraRounds);
-            }
+        if (opts.planningEnabled) {
+            await this.phaseIterativeTesting();
+        } else {
+            await this.phaseDirectExecution(opts.instruction, extraRounds);
+        }
 
-            const completedContinuationRounds = opts.planningEnabled ? this.planRound : 0;
-            this.planRound = savedRound + completedContinuationRounds;
-            this.maxPlanRounds = savedMaxPlanRounds;
-            this.maxIterations = savedMaxIterations;
+        const completedContinuationRounds = opts.planningEnabled ? this.planRound : 0;
+        this.planRound = savedRound + completedContinuationRounds;
+        this.maxPlanRounds = savedMaxPlanRounds;
+        this.maxIterations = savedMaxIterations;
 
-            if (!this.isStoppedPhase()) {
-                this.log('system', '═══ CONTINUATION COMPLETE ═══');
-                this.log('system', `Total findings after continuation: ${this.findings.length}`);
-            }
-
-        } catch (error: any) {
-            this.log('error', `Continuation failed: ${error.message}`);
-            this.scanStatus.failed(error.message);
-        } finally {
-            this.isRunning = false;
-            this.saveLogs();
-            this.browserSession.cleanup();
+        if (!this.isStoppedPhase()) {
+            this.log('system', '═══ CONTINUATION COMPLETE ═══');
+            this.log('system', `Total findings after continuation: ${this.findings.length}`);
         }
     }
 
@@ -864,6 +866,8 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
                 this.handleRateLimitError(e);
                 this.log('error', `Execution error: ${e.message}`);
             }
+
+            await this.persistRuntimeCheckpoint(`direct-execution-round-${round + 1}`);
         }
 
         this.log('system', `Direct execution finished. ${totalActions} actions taken.`);
@@ -876,7 +880,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         this.log('system', 'Stop command received. Terminating agent...');
         this.scanStatus.stopped('Scan stopped by user');
         // Cleanup browser session
-        this.cleanupBrowserSession();
+        void this.cleanupBrowserSession();
     }
 
     public pause() {
@@ -912,6 +916,57 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
     public getLogs(since: number = 0): string[] {
         return this.logLedger.getLogs(since);
+    }
+
+    public getRuntimeCheckpointSnapshot(reason: string): ScanRuntimeCheckpoint {
+        const harvestSummary = this.harvester.getCheckpointSummary();
+        const hypothesisSummary = this.hypothesisEngine.getCheckpointSummary();
+        const coverageSummary = this.coverageTracker.getSummary();
+
+        return {
+            version: 1,
+            executionMode: 'single-agent',
+            reason,
+            updatedAt: new Date().toISOString(),
+            phase: this.phase,
+            isRunning: this.isRunning,
+            isPaused: this.isPaused,
+            planRound: this.planRound,
+            maxPlanRounds: this.maxPlanRounds,
+            maxIterations: this.maxIterations,
+            findingsCount: this.findings.length,
+            discoveredEndpointsCount: this.discoveredEndpoints.size,
+            discoveredEndpointsPreview: Array.from(this.discoveredEndpoints).slice(0, 25),
+            currentPlan: this.currentPlan ? {
+                round: this.currentPlan.round,
+                steps: this.currentPlan.steps.map((step) => ({
+                    step: step.step,
+                    objective: step.objective,
+                    status: step.status,
+                    tools: [...step.tools],
+                })),
+            } : null,
+            harvested: harvestSummary,
+            hypotheses: {
+                total: hypothesisSummary.total,
+                counts: hypothesisSummary.counts,
+                activeHypotheses: hypothesisSummary.activeHypotheses,
+            },
+            coverage: coverageSummary,
+            endpointInventory: this.endpointInventory ? {
+                summary: this.endpointInventory.summary,
+                authSurfaceCount: this.endpointInventory.authRelevantCount,
+                endpointCount: this.endpointInventory.records.length,
+            } : null,
+        };
+    }
+
+    private async persistRuntimeCheckpoint(reason: string): Promise<void> {
+        try {
+            await this.hooks.checkpoint?.(this.getRuntimeCheckpointSnapshot(reason));
+        } catch (error: any) {
+            this.log('error', `Failed to persist runtime checkpoint (${reason}): ${error.message}`);
+        }
     }
 
     public async checkBurpConnection(): Promise<boolean> {
@@ -1035,15 +1090,8 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
             systemPrompt += sourceContextBlock;
         }
 
-        if (this.config.initialRequest?.trim()) {
-            const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
-            if (parsed) {
-                const headersBlock = Object.entries(parsed.headers)
-                    .filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
-                    .map(([k, v]) => `    "${k}": "${v}"`)
-                    .join(',\n');
-                systemPrompt += `\n\n═══════════════════════════════════════════════════════════════\n  SEND TO PENPARD — REQUEST FROM BURP (CRITICAL)\n═══════════════════════════════════════════════════════════════\n\nYou received a complete HTTP request from the user via Burp. STRICT RULES:\n\n1. Every send_http_request MUST include ALL headers listed below. Do NOT omit any. Do NOT add new headers. Copy them exactly.\n2. Set preserveExplicitAuth=true so PenPard preserves the explicit Cookie/Authorization headers exactly as supplied.\n3. Only PARAMETRIC testing: change parameter values in the URL query string or body. Do NOT touch headers unless the user explicitly asks.\n4. The request has cookies and auth tokens — these are essential for authenticated testing.\n\nBASE REQUEST:\n  Method: ${parsed.method}\n  URL: ${parsed.url}\n  Headers (INCLUDE ALL OF THESE IN EVERY REQUEST):\n${headersBlock}\n  Body: ${parsed.body || '(none)'}\n\nWhen calling send_http_request, use:\n  { "method": "${parsed.method}", "url": "<url with modified params>", "headers": { ALL HEADERS ABOVE }, "body": "${parsed.body || ''}", "preserveExplicitAuth": true }\n`;
-            }
+        if (this.initialRequestContext) {
+            systemPrompt += this.initialRequestContext.systemPromptAppendix;
         }
 
         this.systemPromptContent = systemPrompt;
@@ -1082,64 +1130,12 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         }
 
         // Request sent from Burp "Send to PenPard" — parse and inject structured data
-        if (this.config.initialRequest?.trim()) {
-            const parsed = this.parseRawHttpRequest(this.config.initialRequest.trim());
-            if (parsed) {
-                const headersJson = JSON.stringify(
-                    Object.fromEntries(
-                        Object.entries(parsed.headers).filter(([k]) => !k.toLowerCase().startsWith('x-penpard'))
-                    ),
-                    null, 2
-                );
-                this.conversationHistory.push({
-                    role: 'user',
-                    content: `CRITICAL — Request from Burp (Send to PenPard).
-
-PLANNING PHASE: Before testing, analyze this request:
-- Look at the cookies and auth tokens — note which ones are session tokens
-- Identify all parameters in the URL query string and body
-- Plan which parameters to test for which vulnerability types (SQLi, XSS, IDOR, etc.)
-
-RULES:
-1. Include ALL headers below in EVERY send_http_request call. Copy them exactly — do not omit Cookie, User-Agent, Authorization, or any other header. The user's session depends on these.
-2. Only modify PARAMETER VALUES (query string, body fields). Headers stay unchanged.
-3. If the user later says "test the Host header" or similar, only then may you modify that specific header.
-
-BASE REQUEST:
-Method: ${parsed.method}
-URL: ${parsed.url}
-Headers (JSON — pass this entire object in every send_http_request):
-${headersJson}
-Body: ${parsed.body || '(none)'}
-
-Example call:
-{
-  "tool": "send_http_request",
-  "args": {
-    "method": "${parsed.method}",
-    "url": "${parsed.url}",
-    "headers": ${headersJson},
-    "body": "${parsed.body || ''}",
-    "preserveExplicitAuth": true
-  }
-}
-
-Start by sending the original request as-is to get a baseline response, then begin parametric testing.`
-                });
-                this.conversationHistory.push({
-                    role: 'assistant',
-                    content: `Understood. I will:\n1. Include ALL ${Object.keys(parsed.headers).length} headers in every request (Cookie, User-Agent, auth tokens, etc.)\n2. Set preserveExplicitAuth=true when replaying the Burp-derived request so PenPard preserves the supplied auth exactly\n3. Only modify parameter values for testing — headers stay exactly as provided\n4. Start with a baseline request, then test each parameter for vulnerabilities\n\nLet me begin by analyzing the request and planning my tests.`
-                });
-                this.log('system', `✓ Burp request parsed — ${parsed.method} ${parsed.url.substring(0, 80)} — ${Object.keys(parsed.headers).length} headers preserved`);
-            } else {
-                // Fallback: could not parse, inject raw
-                this.conversationHistory.push({
-                    role: 'user',
-                    content: `Request from Burp (Send to PenPard). Test this request. Raw:\n\n${this.config.initialRequest.trim()}`
-                });
-                this.log('system', '⚠ Could not parse Burp request — injected raw');
-            }
+        if (this.initialRequestContext) {
+            this.conversationHistory.push(...this.initialRequestContext.initialMessages);
+            this.log('system', `✓ ${this.initialRequestContext.logSummary}`);
         }
+
+        await this.persistRuntimeCheckpoint('initialization-complete');
     }
 
     private buildAccountPromptContext(): any[] {
@@ -1510,6 +1506,7 @@ Rules for subsequent work:
             this.phase = 'replanning';
             this.log('system', `\nRound ${this.planRound} complete. Findings this round: ${roundResults.reduce((sum, r) => sum + r.findings.length, 0)}`);
             this.log('system', `Total findings: ${this.findings.length} | Total actions: ${totalActions}/${this.maxIterations}`);
+            await this.persistRuntimeCheckpoint(`planning-round-${this.planRound}`);
 
             // Check if LLM wants to continue
             if (totalActions >= this.maxIterations) {
@@ -1565,7 +1562,7 @@ Rules for subsequent work:
         this.log('system', `Rounds: ${this.planRound} | Endpoints: ${this.discoveredEndpoints.size} | Findings: ${vulns.length}`);
 
         // Cleanup browser session when scan completes
-        this.cleanupBrowserSession();
+        await this.cleanupBrowserSession();
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1697,9 +1694,6 @@ Rules for subsequent work:
      * Parse a raw HTTP request string (from Burp "Send to PenPard") into structured components.
      * Returns { method, url, headers, body } or null if parsing fails.
      */
-    private parseRawHttpRequest(raw: string): ParsedBurpRequest | null {
-        return parseRawBurpRequest(raw);
-    }
 
     // ═══════════════════════════════════════════════════════════
     //  RESPONSE PARSING
@@ -1794,7 +1788,7 @@ Rules for subsequent work:
         if (obj.function?.name && obj.function?.arguments !== undefined) {
             const functionName = String(obj.function.name);
             const args = this.unwrapJsonValue(obj.function.arguments, depth + 1);
-            if (this.isKnownToolName(functionName)) {
+            if (this.toolRegistry.isKnown(functionName)) {
                 return { ...obj, action: { tool: functionName, args } };
             }
             if (functionName === 'AgentOutput') {
@@ -1815,7 +1809,7 @@ Rules for subsequent work:
             }
         }
 
-        if (obj.name && obj.arguments !== undefined && this.isKnownToolName(String(obj.name))) {
+        if (obj.name && obj.arguments !== undefined && this.toolRegistry.isKnown(String(obj.name))) {
             return {
                 ...obj,
                 action: {
@@ -1856,7 +1850,7 @@ Rules for subsequent work:
 
         if (Array.isArray(resolved)) {
             for (const entry of resolved) {
-                addAction(this.normalizeToolCall(entry));
+                addAction(this.toolRegistry.normalizeToolCall(entry, (value) => this.unwrapJsonValue(value)));
             }
             return result.action || result.actions?.length ? result : null;
         }
@@ -1888,17 +1882,17 @@ Rules for subsequent work:
         result.answer = this.firstString(source.answer, source.final_answer, source.summary, source.result);
 
         if (source.action !== undefined) {
-            addAction(this.normalizeToolCall(source.action, source));
+            addAction(this.toolRegistry.normalizeToolCall(source.action, (value) => this.unwrapJsonValue(value), source));
         }
 
         if (Array.isArray(source.actions)) {
             for (const action of source.actions) {
-                addAction(this.normalizeToolCall(action, source));
+                addAction(this.toolRegistry.normalizeToolCall(action, (value) => this.unwrapJsonValue(value), source));
             }
         }
 
         if (!result.action && !result.actions?.length) {
-            addAction(this.normalizeToolCall(source));
+            addAction(this.toolRegistry.normalizeToolCall(source, (value) => this.unwrapJsonValue(value)));
         }
 
         if (result.actions?.length === 1) {
@@ -1951,255 +1945,6 @@ Rules for subsequent work:
             : undefined;
     }
 
-    private normalizeToolCall(rawAction: any, context?: Record<string, any>): ToolCall | null {
-        const action = this.unwrapJsonValue(rawAction);
-
-        if (typeof action === 'string') {
-            const tool = this.canonicalizeToolName(action);
-            if (!this.isKnownToolName(tool)) return null;
-            return {
-                tool,
-                args: this.coerceToolArgs(tool, context?.args ?? context?.parameters ?? context?.params ?? context?.input ?? context?.arguments ?? context ?? {}),
-            };
-        }
-
-        if (action === null || action === undefined) {
-            return null;
-        }
-
-        if (typeof action !== 'object') {
-            return null;
-        }
-
-        const actionObj = action as Record<string, any>;
-
-        const explicitToolName = this.firstString(actionObj.tool, actionObj.name);
-        if (explicitToolName) {
-            const tool = this.canonicalizeToolName(explicitToolName);
-            if (!this.isKnownToolName(tool)) return null;
-            return {
-                tool,
-                args: this.coerceToolArgs(
-                    tool,
-                    actionObj.args ?? actionObj.arguments ?? actionObj.parameters ?? actionObj.params ?? actionObj.input ?? actionObj.tool_input ?? actionObj,
-                    context,
-                ),
-            };
-        }
-
-        const entries = Object.entries(actionObj);
-        if (entries.length === 1) {
-            const [toolName, toolArgs] = entries[0];
-            const tool = this.canonicalizeToolName(toolName);
-            if (this.isKnownToolName(tool)) {
-                return {
-                    tool,
-                    args: this.coerceToolArgs(tool, toolArgs, context),
-                };
-            }
-        }
-
-        if (actionObj.url || actionObj.target || actionObj.endpoint || actionObj.href) {
-            return {
-                tool: 'send_http_request',
-                args: this.coerceToolArgs('send_http_request', actionObj, context),
-            };
-        }
-
-        return null;
-    }
-
-    private coerceToolArgs(tool: string, rawArgs: any, context?: Record<string, any>): Record<string, any> {
-        const args = this.unwrapJsonValue(
-            rawArgs !== undefined
-                ? rawArgs
-                : context?.args ?? context?.arguments ?? context?.parameters ?? context?.params ?? context?.input ?? context?.tool_input,
-        );
-
-        if (args === null || args === undefined || args === '') {
-            return tool === 'get_proxy_history' ? { count: 20, excludePenPard: true } : {};
-        }
-
-        if (typeof args === 'string') {
-            const trimmed = args.trim();
-            switch (tool) {
-                case 'send_http_request':
-                case 'send_to_scanner':
-                case 'spider_url':
-                case 'extract_links':
-                case 'browser_navigate':
-                    return { url: trimmed, method: tool === 'send_http_request' ? 'GET' : undefined };
-                case 'browser_evaluate_js':
-                    return { script: trimmed };
-                case 'get_session_cookies':
-                case 'get_cookies_and_auth_for_host':
-                    return { host: trimmed };
-                case 'get_proxy_history': {
-                    const parsedCount = Number(trimmed);
-                    return {
-                        count: Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : 20,
-                        excludePenPard: true,
-                    };
-                }
-                case 'repeater_test':
-                    return { requestId: trimmed };
-                default:
-                    return {};
-            }
-        }
-
-        if (typeof args === 'number') {
-            if (tool === 'get_proxy_history') {
-                return { count: args, excludePenPard: true };
-            }
-            return {};
-        }
-
-        if (Array.isArray(args)) {
-            if (tool === 'browser_fill_and_submit') {
-                return { fields: args };
-            }
-            return {};
-        }
-
-        if (typeof args !== 'object') {
-            return {};
-        }
-
-        const normalized = { ...(args as Record<string, any>) };
-
-        if (tool === 'send_http_request') {
-            normalized.url = normalized.url || normalized.target || normalized.endpoint || normalized.href;
-            normalized.method = String(normalized.method || 'GET').toUpperCase();
-            normalized.headers = normalized.headers && typeof normalized.headers === 'object' ? normalized.headers : {};
-            if (normalized.body === undefined && normalized.data !== undefined) {
-                normalized.body = normalized.data;
-            }
-            if (normalized.body === undefined) {
-                normalized.body = '';
-            }
-            return normalized;
-        }
-
-        if (tool === 'get_proxy_history') {
-            return {
-                ...normalized,
-                count: normalized.count || 20,
-                excludePenPard: normalized.excludePenPard ?? true,
-            };
-        }
-
-        if (tool === 'browser_fill_and_submit' && normalized.submitSelector && normalized.submit_selector === undefined) {
-            normalized.submit_selector = normalized.submitSelector;
-        }
-
-        if (tool === 'send_to_scanner' || tool === 'spider_url' || tool === 'extract_links' || tool === 'browser_navigate') {
-            normalized.url = normalized.url || normalized.target || normalized.endpoint || normalized.href;
-        }
-
-        if (tool === 'browser_evaluate_js' && normalized.script === undefined && typeof normalized.code === 'string') {
-            normalized.script = normalized.code;
-        }
-
-        if ((tool === 'get_session_cookies' || tool === 'get_cookies_and_auth_for_host') && normalized.host === undefined && typeof normalized.url === 'string') {
-            try {
-                normalized.host = new URL(normalized.url).hostname;
-            } catch {
-                normalized.host = normalized.url;
-            }
-        }
-
-        return normalized;
-    }
-
-    private canonicalizeToolName(toolName: string): string {
-        const normalized = toolName
-            .trim()
-            .replace(/^tools?\./i, '')
-            .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-            .replace(/[\s-]+/g, '_')
-            .toLowerCase();
-
-        const aliases: Record<string, string> = {
-            sendhttprequest: 'send_http_request',
-            send_http_request: 'send_http_request',
-            send_to_scanner: 'send_to_scanner',
-            sendtoscanner: 'send_to_scanner',
-            getproxyhistory: 'get_proxy_history',
-            get_proxy_history: 'get_proxy_history',
-            getsessioncookies: 'get_session_cookies',
-            get_session_cookie: 'get_session_cookies',
-            get_session_cookies: 'get_session_cookies',
-            getcookiesandauthforhost: 'get_cookies_and_auth_for_host',
-            get_cookies_and_auth_for_host: 'get_cookies_and_auth_for_host',
-            getsitemap: 'get_sitemap',
-            get_sitemap: 'get_sitemap',
-            spiderurl: 'spider_url',
-            spider_url: 'spider_url',
-            checkauthorization: 'check_authorization',
-            check_authorization: 'check_authorization',
-            generatepayloads: 'generate_payloads',
-            generate_payloads: 'generate_payloads',
-            extractlinks: 'extract_links',
-            extract_links: 'extract_links',
-            browsernavigate: 'browser_navigate',
-            browser_navigate: 'browser_navigate',
-            browsergetpagestate: 'browser_get_page_state',
-            browser_get_page_state: 'browser_get_page_state',
-            browser_page_state: 'browser_get_page_state',
-            browser_get_state: 'browser_get_page_state',
-            browsergetfrontendanalysis: 'browser_get_frontend_analysis',
-            browser_get_frontend_analysis: 'browser_get_frontend_analysis',
-            browser_frontend_analysis: 'browser_get_frontend_analysis',
-            browserfillandsubmit: 'browser_fill_and_submit',
-            browser_fill_and_submit: 'browser_fill_and_submit',
-            browser_fill_submit: 'browser_fill_and_submit',
-            browserevaluatejs: 'browser_evaluate_js',
-            browser_evaluate_js: 'browser_evaluate_js',
-            browserscreenshot: 'browser_screenshot',
-            browser_screenshot: 'browser_screenshot',
-            browsercorrelateburp: 'browser_correlate_burp',
-            browser_correlate_burp: 'browser_correlate_burp',
-            harvesttraffic: 'harvest_traffic',
-            harvest_traffic: 'harvest_traffic',
-            gethypotheses: 'get_hypotheses',
-            get_hypotheses: 'get_hypotheses',
-            getcoverage: 'get_coverage',
-            get_coverage: 'get_coverage',
-            repeatertest: 'repeater_test',
-            repeater_test: 'repeater_test',
-        };
-
-        return aliases[normalized] || aliases[normalized.replace(/_/g, '')] || normalized;
-    }
-
-    private isKnownToolName(toolName: string): boolean {
-        return new Set([
-            'send_http_request',
-            'send_to_scanner',
-            'get_proxy_history',
-            'get_session_cookies',
-            'get_cookies_and_auth_for_host',
-            'get_sitemap',
-            'spider_url',
-            'check_authorization',
-            'generate_payloads',
-            'extract_links',
-            'analyze_response',
-            'browser_navigate',
-            'browser_get_page_state',
-            'browser_get_frontend_analysis',
-            'browser_fill_and_submit',
-            'browser_evaluate_js',
-            'browser_screenshot',
-            'browser_correlate_burp',
-            'harvest_traffic',
-            'get_hypotheses',
-            'get_coverage',
-            'repeater_test',
-        ]).has(this.canonicalizeToolName(toolName));
-    }
-
     private firstString(...values: unknown[]): string | undefined {
         for (const value of values) {
             if (typeof value === 'string' && value.trim()) {
@@ -2235,8 +1980,8 @@ Rules for subsequent work:
     /**
      * Cleanup browser session. Safe to call multiple times.
      */
-    private cleanupBrowserSession(): void {
-        this.browserSession.cleanup();
+    private async cleanupBrowserSession(): Promise<void> {
+        await this.browserSession.cleanup();
     }
 
     /**
@@ -2601,6 +2346,8 @@ Rules for subsequent work:
             this.hypothesisEngine.generateFromRequest(p.request);
         }
 
+        await this.persistRuntimeCheckpoint('harvest-traffic-tool');
+
         return {
             newRequests: newRequests.length,
             promoted: promoted.map(p => ({
@@ -2758,6 +2505,7 @@ Rules for subsequent work:
             }
         }
 
+        await this.persistRuntimeCheckpoint('repeater-test');
         return { requestId, path: request.path, method: request.method, results };
     }
 

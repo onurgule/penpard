@@ -72,3 +72,24 @@ test('start always cleans up the browser session when the run fails', async () =
     assert.equal(agent.getState().phase, 'failed');
     assert.equal(cleanupCalls, 1);
 });
+
+test('start awaits browser cleanup before persisting final logs', async () => {
+    const agent = createAgent();
+    const callOrder: string[] = [];
+
+    (agent as any).phaseInit = async () => {
+        throw new Error('boom');
+    };
+    (agent as any).browserSession = {
+        cleanup: async () => {
+            callOrder.push('cleanup');
+        },
+    };
+    (agent as any).saveLogs = () => {
+        callOrder.push('save');
+    };
+
+    await agent.start();
+
+    assert.deepEqual(callOrder, ['cleanup', 'save']);
+});

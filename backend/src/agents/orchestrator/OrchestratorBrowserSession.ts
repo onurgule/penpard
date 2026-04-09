@@ -13,6 +13,7 @@ interface OrchestratorBrowserSessionOptions {
 
 export class OrchestratorBrowserSession {
     private browserSessionId: string | null = null;
+    private cleanupPromise: Promise<void> | null = null;
 
     constructor(private readonly options: OrchestratorBrowserSessionOptions) {}
 
@@ -76,7 +77,7 @@ export class OrchestratorBrowserSession {
             }
         }
 
-        this.options.log?.('system', '🌐 Browser session not found. Re-launching headless browser...');
+        this.options.log?.('system', 'Browser session not found. Re-launching headless browser...');
         try {
             this.browserSessionId = await browserService.launchSession(this.options.userId || 1, {
                 targetUrl: this.options.targetUrl,
@@ -85,7 +86,7 @@ export class OrchestratorBrowserSession {
             });
             await this.seedBrowserFromAuthManager();
             await this.syncAuthFromBrowser();
-            this.options.log?.('system', '✓ Browser re-launched successfully');
+            this.options.log?.('system', 'Browser re-launched successfully');
             return this.browserSessionId;
         } catch (error: any) {
             this.options.log?.('error', `Browser re-launch failed: ${error.message}`);
@@ -93,16 +94,29 @@ export class OrchestratorBrowserSession {
         }
     }
 
-    public cleanup(): void {
+    public async cleanup(): Promise<void> {
+        if (this.cleanupPromise) {
+            await this.cleanupPromise;
+            return;
+        }
+
         if (!this.browserSessionId) {
             return;
         }
 
         const sessionId = this.browserSessionId;
         this.browserSessionId = null;
-        browserService.closeSession(sessionId).catch((error: any) => {
-            this.options.log?.('error', `Browser session cleanup failed (non-fatal): ${error.message}`);
-        });
-        this.options.log?.('system', '🌐 Browser session closed');
+        this.cleanupPromise = (async () => {
+            try {
+                await browserService.closeSession(sessionId);
+                this.options.log?.('system', 'Browser session closed');
+            } catch (error: any) {
+                this.options.log?.('error', `Browser session cleanup failed (non-fatal): ${error.message}`);
+            } finally {
+                this.cleanupPromise = null;
+            }
+        })();
+
+        await this.cleanupPromise;
     }
 }

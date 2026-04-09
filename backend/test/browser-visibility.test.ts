@@ -368,6 +368,28 @@ test('showBrowser reopens a manually closed session cleanly', async () => {
     }
 });
 
+test('showBrowser restores the target URL when the last known page was an internal PenPard screen', async () => {
+    const { sessionId, session, page } = createRuntimeSession({ isHeadless: false });
+    session.targetUrl = 'http://target.local/account';
+    session.targetOrigin = 'http://target.local';
+    session.lastKnownUrl = 'http://localhost:4000/api/browser/status';
+    page.closeManually();
+
+    const relaunchedPage = new FakePage('about:blank', 'Blank');
+    const relaunchedBrowser = new FakeBrowser();
+    const relaunchedContext = new FakeContext(relaunchedBrowser, [relaunchedPage]);
+    const originalLaunch = (chromium as any).launchPersistentContext;
+
+    (chromium as any).launchPersistentContext = async () => relaunchedContext;
+
+    try {
+        await browserService.showBrowser(sessionId);
+        assert.equal(relaunchedPage.url(), 'http://target.local/account');
+    } finally {
+        (chromium as any).launchPersistentContext = originalLaunch;
+    }
+});
+
 test('browser actions on dead sessions fail in a controlled way', async () => {
     const { sessionId, page } = createRuntimeSession({ isHeadless: false });
     page.closeManually();

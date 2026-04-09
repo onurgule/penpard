@@ -67,6 +67,22 @@ export interface MutationTemplate {
     vulnType: VulnHypothesisType;
 }
 
+export interface HypothesisCheckpointSummary {
+    total: number;
+    counts: Record<HypothesisStatus, number>;
+    activeHypotheses: Array<{
+        id: string;
+        type: VulnHypothesisType;
+        targetEndpoint: string;
+        targetMethod: string;
+        parameter: string;
+        confidence: number;
+        status: HypothesisStatus;
+        nextAction: string;
+        evidenceCount: number;
+    }>;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Engine
 // ─────────────────────────────────────────────────────────────
@@ -381,6 +397,37 @@ export class HypothesisEngine {
         }
 
         return lines.join('\n');
+    }
+
+    getCheckpointSummary(limit: number = 10): HypothesisCheckpointSummary {
+        const counts = this.getStatusCounts();
+        const all = Array.from(this.hypotheses.values());
+        const activeHypotheses = all
+            .filter((hypothesis) => hypothesis.status !== 'discarded')
+            .sort((left, right) => {
+                if (right.confidence !== left.confidence) {
+                    return right.confidence - left.confidence;
+                }
+                return right.updatedAt.getTime() - left.updatedAt.getTime();
+            })
+            .slice(0, limit)
+            .map((hypothesis) => ({
+                id: hypothesis.id,
+                type: hypothesis.type,
+                targetEndpoint: hypothesis.targetEndpoint,
+                targetMethod: hypothesis.targetMethod,
+                parameter: hypothesis.parameter,
+                confidence: hypothesis.confidence,
+                status: hypothesis.status,
+                nextAction: hypothesis.nextAction,
+                evidenceCount: hypothesis.evidence.length,
+            }));
+
+        return {
+            total: all.length,
+            counts,
+            activeHypotheses,
+        };
     }
 
     /**

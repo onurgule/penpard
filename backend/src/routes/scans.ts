@@ -19,11 +19,11 @@ import {
 } from '../db/init';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
 import { logger, logApiUsage } from '../utils/logger';
-import { BurpMCPClient } from '../services/burp-mcp';
-import { MobSFService } from '../services/mobsf';
+import { burpDispatchService } from '../services/BurpDispatchService';
 import { llmProvider } from '../services/LLMProviderService';
+import { mobileScanService } from '../services/MobileScanService';
 import { activityMonitor } from '../services/ActivityMonitorService';
-import { takePendingRequest } from './penpard';
+import { peekPendingRequest, takePendingRequest } from './penpard';
 import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
 import { extractRoutes } from '../services/source-analysis/utils/route-extractor';
 import { defaultAuthStartupConfig, redactAuthStartupConfig, resolveAuthStartupConfig, toLegacyIdorUsers } from '../services/web-auth-startup-config';
@@ -390,13 +390,15 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
         const legacyIdorUsers = authStartup.credentials.length > 0
             ? toLegacyIdorUsers(authStartup)
             : (Array.isArray(idorUsers) ? idorUsers : []);
+        const requestedParallelAgents = Math.max(1, Math.min(10, Number(parallelAgents) || 1));
         const scanConfig = {
             userId: user.id,
             rateLimit: Number(rateLimit) || 5,
             useNuclei: !!useNuclei,
             useFfuf: !!useFfuf,
             idorUsers: legacyIdorUsers,
-            parallelAgents: Number(parallelAgents) || 1,
+            parallelAgents: 1,
+            requestedParallelAgents,
             maxIterations,
             maxPlanRounds,
             customSystemPrompt: scanInstructions || undefined,
@@ -407,6 +409,8 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
         };
         saveScanConfig(scanId, JSON.stringify({
             ...scanConfig,
+            effectiveParallelAgents: 1,
+            executionMode: 'single-agent',
             idorUsers: legacyIdorUsers.map((entry: any) => ({
                 ...entry,
                 password: entry?.password ? '[REDACTED]' : undefined,
@@ -414,11 +418,7 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
             authStartup: redactAuthStartupConfig(authStartup),
         }));
 
-        // Start scan asynchronously
-        startWebScan(scanId, targetUrl, scanConfig).catch(err => {
-            logger.error('Web scan failed', { scanId, error: err.message });
-            updateScanStatus(scanId, 'failed', err.message);
-        });
+        scanRuntimeService.launchWebScan(scanId, targetUrl, scanConfig);
 
         res.json({
             scanId,
@@ -452,11 +452,7 @@ router.post('/mobile', authenticateToken, upload.single('apk'), async (req: Auth
 
         logApiUsage('/api/scans/mobile', user.id, { filename: file.originalname });
 
-        // Start scan asynchronously
-        startMobileScan(scanId, file.path).catch(err => {
-            logger.error('Mobile scan failed', { scanId, error: err.message });
-            updateScanStatus(scanId, 'failed', err.message);
-        });
+        mobileScanService.launch(scanId, file.path);
 
         res.json({
             scanId,
@@ -484,13 +480,13 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
         if (!pendingId) {
             return res.status(400).json({ error: true, message: 'pendingId is required' });
         }
-        const entry = takePendingRequest(pendingId);
-        if (!entry) {
+        const pendingEntry = peekPendingRequest(pendingId);
+        if (!pendingEntry) {
             return res.status(404).json({ error: true, message: 'Pending request not found or already used' });
         }
         let targetUrl: string;
         try {
-            targetUrl = new URL(entry.url.startsWith('http') ? entry.url : `https://${entry.url}`).toString();
+            targetUrl = new URL(pendingEntry.url.startsWith('http') ? pendingEntry.url : `https://${pendingEntry.url}`).toString();
         } catch {
             return res.status(400).json({ error: true, message: 'Invalid URL in request' });
         }
@@ -500,6 +496,10 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
                 error: true,
                 message: 'Target URL not in your whitelist. Contact admin.'
             });
+        }
+        const entry = takePendingRequest(pendingId);
+        if (!entry) {
+            return res.status(409).json({ error: true, message: 'Pending request was already consumed by another action' });
         }
         const validModes = ['version_aware', 'full_source_aware'];
         const resolvedSourceMode = sourceAnalysisMode && validModes.includes(sourceAnalysisMode) ? sourceAnalysisMode : undefined;
@@ -536,7 +536,7 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
         setScanInitialRequest(scanId, entry.rawRequest);
         logApiUsage('/api/scans/from-burp', user.id, { target: targetUrl });
         const rateLimit = Number(reqRateLimit) || 5;
-        const parallelAgents = Math.max(1, Math.min(10, Number(reqParallelAgents) || 1));
+        const requestedParallelAgents = Math.max(1, Math.min(10, Number(reqParallelAgents) || 1));
         const maxIterations = Number(iterations) || 50;
         const maxPlanRounds = reqMaxPlanRounds === undefined || reqMaxPlanRounds === null || reqMaxPlanRounds === ''
             ? 0
@@ -548,7 +548,8 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
             useNuclei: false,
             useFfuf: false,
             idorUsers: [] as any[],
-            parallelAgents,
+            parallelAgents: 1,
+            requestedParallelAgents,
             maxIterations,
             maxPlanRounds,
             customSystemPrompt: scanInstructions || undefined,
@@ -560,12 +561,11 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
         };
         saveScanConfig(scanId, JSON.stringify({
             ...scanConfig,
+            effectiveParallelAgents: 1,
+            executionMode: 'single-agent',
             authStartup: redactAuthStartupConfig(authStartup),
         }));
-        startWebScan(scanId, targetUrl, scanConfig).catch(err => {
-            logger.error('From-Burp scan failed', { scanId, error: err.message });
-            updateScanStatus(scanId, 'failed', err.message);
-        });
+        scanRuntimeService.launchWebScan(scanId, targetUrl, scanConfig);
         return res.json({
             scanId,
             message: 'Scan started from Burp request',
@@ -586,6 +586,7 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
 
         const vulnerabilities = getVulnerabilitiesByScan(id);
         const endpointInventory = scanRuntimeService.getEndpointInventory(id);
+        const runtimeCheckpoint = scanRuntimeService.getRuntimeCheckpoint(id);
 
         res.json({
             id: scan.id,
@@ -598,6 +599,7 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
             sourcePackagePath: scan.source_package_path || null,
             sourceAnalysisMode: scan.source_analysis_mode || null,
             endpointInventory,
+            runtimeCheckpoint,
             vulnerabilities: vulnerabilities.map(v => ({
                 id: v.id,
                 name: v.name,
@@ -804,110 +806,23 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
 // Send a request to Burp tools (Repeater / Intruder / Active Scan)
 router.post('/burp/send', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
-        const { rawRequest, vulnName, target } = req.body;
-        const validTargets = ['repeater', 'intruder', 'scanner'];
-        const sendTarget = validTargets.includes(target) ? target : 'repeater';
-
-        if (!rawRequest && sendTarget !== 'scanner') {
-            res.status(400).json({ error: true, message: 'rawRequest is required' });
-            return;
-        }
-
-        const burp = new BurpMCPClient();
-        const available = await burp.isAvailable();
-        if (!available) {
-            res.status(503).json({ error: true, message: 'Burp Suite is not connected' });
-            return;
-        }
-
-        // Parse host, port, https from the raw request
-        let host = '';
-        let port = 443;
-        let useHttps = true;
-        let finalRequest = rawRequest || '';
-        let fullUrl = ''; // Used for active scan
-
-        const lines = finalRequest.split(/\r?\n/);
-        const requestLine = lines[0] || '';
-
-        // Check if request line has full URL: "GET https://example.com/path HTTP/1.1"
-        const fullUrlMatch = requestLine.match(/(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(https?:\/\/[^\s]+)/i);
-        if (fullUrlMatch) {
-            try {
-                const url = new URL(fullUrlMatch[2]);
-                host = url.hostname;
-                port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-                useHttps = url.protocol === 'https:';
-                fullUrl = fullUrlMatch[2];
-                // Rewrite request line to path only
-                finalRequest = finalRequest.replace(fullUrlMatch[2], url.pathname + url.search);
-            } catch { /* fallback to Host header */ }
-        }
-
-        // Fallback: extract from Host header
-        if (!host) {
-            const hostLine = lines.find((l: string) => l.toLowerCase().startsWith('host:'));
-            if (hostLine) {
-                const hostValue = hostLine.replace(/^host:\s*/i, '').trim();
-                const parts = hostValue.split(':');
-                host = parts[0];
-                port = parts[1] ? parseInt(parts[1]) : 443;
-                useHttps = port === 443 || port === 8443;
-            }
-        }
-
-        if (!host) {
-            res.status(400).json({ error: true, message: 'Could not determine host from request. Ensure Host header or full URL is present.' });
-            return;
-        }
-
-        // Build full URL if not already present (needed for scanner)
-        if (!fullUrl) {
-            const pathMatch = requestLine.match(/(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\S+)/i);
-            const urlPath = pathMatch ? pathMatch[2] : '/';
-            fullUrl = `${useHttps ? 'https' : 'http'}://${host}${port !== (useHttps ? 443 : 80) ? ':' + port : ''}${urlPath}`;
-        }
-
-        // Ensure Host header is present in the request
-        const hasHostHeader = finalRequest.split(/\r?\n/).some((l: string) => l.toLowerCase().startsWith('host:'));
-        if (!hasHostHeader) {
-            const hostValue = port === (useHttps ? 443 : 80) ? host : `${host}:${port}`;
-            const firstNewline = finalRequest.indexOf('\n');
-            if (firstNewline !== -1) {
-                finalRequest = finalRequest.substring(0, firstNewline + 1) + `Host: ${hostValue}\n` + finalRequest.substring(firstNewline + 1);
-            } else {
-                finalRequest += `\nHost: ${hostValue}\n\n`;
-            }
-        }
-
-        // Normalize line endings to \r\n for Burp
-        const normalized = finalRequest.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
-
-        const targetLabels: Record<string, string> = { repeater: 'Repeater', intruder: 'Intruder', scanner: 'Active Scan' };
-
-        if (sendTarget === 'repeater') {
-            await burp.callTool('send_to_repeater', {
-                host, port, useHttps,
-                request: normalized,
-                name: vulnName || 'PenPard Finding'
-            });
-        } else if (sendTarget === 'intruder') {
-            await burp.callTool('send_to_intruder', {
-                host, port, useHttps,
-                request: normalized
-            });
-        } else if (sendTarget === 'scanner') {
-            await burp.callTool('send_to_scanner', {
-                host, port, useHttps,
-                request: normalized,
-                url: fullUrl
-            });
-        }
-
-        res.json({ success: true, message: `Sent to Burp ${targetLabels[sendTarget]}: ${host}` });
+        const { rawRequest, vulnName, target, url } = req.body;
+        const result = await burpDispatchService.dispatch({
+            rawRequest,
+            vulnName,
+            target: typeof target === 'string' ? target : undefined,
+            url: typeof url === 'string' ? url : undefined,
+        });
+        res.json({ success: true, message: result.message });
     } catch (error: any) {
         logger.error('Send to Burp error', { error: error.message });
-        res.status(500).json({ error: true, message: error.message || 'Failed to send to Burp' });
+        const message = error.message || 'Failed to send to Burp';
+        const statusCode = /rawRequest is required|Could not normalize/i.test(message)
+            ? 400
+            : /Burp Suite is not connected/i.test(message)
+                ? 503
+                : 500;
+        res.status(statusCode).json({ error: true, message });
     }
 });
 
@@ -967,42 +882,6 @@ router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res
         res.status(400).json({ error: true, message: error.message });
     }
 });
-
-// Async scan functions
-
-async function startWebScan(scanId: string, targetUrl: string, config: any = {}): Promise<void> {
-    await scanRuntimeService.startWebScan(scanId, targetUrl, config);
-}
-
-async function startMobileScan(scanId: string, apkPath: string): Promise<void> {
-    logger.info('Starting mobile scan', { scanId, apkPath });
-
-    updateScanStatus(scanId, 'analyzing');
-
-    try {
-        const mobsf = new MobSFService();
-
-        // Check if MobSF is available
-        const mobsfAvailable = await mobsf.isAvailable();
-
-        if (mobsfAvailable) {
-            await mobsf.analyze(scanId, apkPath);
-        } else {
-            // MobSF is required for mobile scanning — fail loudly instead of simulating
-            const errorMsg = 'MobSF is not connected. Cannot start mobile scan without MobSF. Please ensure MobSF is running and configured in Settings.';
-            logger.error(errorMsg, { scanId });
-            updateScanStatus(scanId, 'failed', errorMsg);
-            return;
-        }
-
-        updateScanStatus(scanId, 'completed');
-        logger.info('Mobile scan completed', { scanId });
-    } catch (error: any) {
-        logger.error('Mobile scan error', { scanId, error: error.message });
-        updateScanStatus(scanId, 'failed', error.message);
-        throw error;
-    }
-}
 
 export default router;
 
