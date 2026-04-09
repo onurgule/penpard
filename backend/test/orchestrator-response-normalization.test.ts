@@ -3,9 +3,19 @@ import assert from 'node:assert/strict';
 
 const { OrchestratorLlmResponseParser } = require('../src/agents/orchestrator/OrchestratorLlmResponseParser') as typeof import('../src/agents/orchestrator/OrchestratorLlmResponseParser');
 const { OrchestratorContextSignals } = require('../src/agents/orchestrator/OrchestratorContextSignals') as typeof import('../src/agents/orchestrator/OrchestratorContextSignals');
+const { OrchestratorToolRegistry } = require('../src/agents/orchestrator/OrchestratorToolRegistry') as typeof import('../src/agents/orchestrator/OrchestratorToolRegistry');
 
 function createParser() {
-    return new OrchestratorLlmResponseParser('https://app.example.com', () => false);
+    const registry = new OrchestratorToolRegistry({
+        handlers: {
+            send_http_request: async () => ({}),
+            get_proxy_history: async () => ({}),
+            get_sitemap: async () => ({}),
+            spider_url: async () => ({}),
+            browser_navigate: async () => ({}),
+        },
+    });
+    return new OrchestratorLlmResponseParser('https://app.example.com', () => false, registry);
 }
 
 test('parseAgentResponse recovers tool wrappers and preserves reflection fields', () => {

@@ -34,6 +34,7 @@ import {
     buildOperatorInstructionMessages,
 } from '../prompts/orchestratorPrompts';
 import { OrchestratorBrowserSession } from './orchestrator/OrchestratorBrowserSession';
+import { OrchestratorBrowserTools } from './orchestrator/OrchestratorBrowserTools';
 import { OrchestratorContextSignals } from './orchestrator/OrchestratorContextSignals';
 import { OrchestratorFallbackPlanner } from './orchestrator/OrchestratorFallbackPlanner';
 import { OrchestratorFindingTracker } from './orchestrator/OrchestratorFindingTracker';
@@ -42,6 +43,7 @@ import { OrchestratorLogLedger } from './orchestrator/OrchestratorLogLedger';
 import { OrchestratorLlmResponseParser } from './orchestrator/OrchestratorLlmResponseParser';
 import { OrchestratorPlanner } from './orchestrator/OrchestratorPlanner';
 import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
+import { OrchestratorScanSurface } from './orchestrator/OrchestratorScanSurface';
 import { buildInitialRequestContext, type OrchestratorInitialRequestContext } from './orchestrator/OrchestratorInitialRequestContext';
 import { OrchestratorSingleAgentHarness } from './orchestrator/OrchestratorSingleAgentHarness';
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
@@ -391,7 +393,6 @@ export class OrchestratorAgent {
 
     // Mindset library — loaded TTPs from past report analyses
     private mindsetTTPs: MindsetTTP[] = [];
-
     private startupAuthInventory: AuthStartupInventory | null = null;
     private endpointInventory: EndpointInventorySnapshot | null = null;
 
@@ -408,6 +409,8 @@ export class OrchestratorAgent {
     private readonly planner: OrchestratorPlanner;
     private readonly fallbackPlanner: OrchestratorFallbackPlanner;
     private readonly browserSession: OrchestratorBrowserSession;
+    private readonly browserTools: OrchestratorBrowserTools;
+    private readonly scanSurface: OrchestratorScanSurface;
     private readonly requestExecutor: OrchestratorRequestExecutor;
     private readonly findingTracker: OrchestratorFindingTracker;
     private readonly scanStatus: OrchestratorScanStatus;
@@ -443,28 +446,21 @@ export class OrchestratorAgent {
 
         // Initialize auth state engine
         this.authManager = new AuthStateManager(scanId, targetUrl);
-        this.llmResponseParser = new OrchestratorLlmResponseParser(
-            targetUrl,
-            () => this.isFocusedScope,
-            (channel, message) => this.log(channel, message),
-        );
-        this.instructionAnalyzer = new OrchestratorInstructionAnalyzer(
-            this.llmResponseParser,
-            (channel, message) => this.log(channel, message),
-        );
-        this.contextSignals = new OrchestratorContextSignals((channel, message) => this.log(channel, message));
-        this.planner = new OrchestratorPlanner({
-            parser: this.llmResponseParser,
-            log: (channel, message) => this.log(channel, message),
-            delay: (ms) => this.delay(ms),
-            handleRateLimitError: (error) => this.handleRateLimitError(error),
-        });
-        this.fallbackPlanner = new OrchestratorFallbackPlanner((channel, message) => this.log(channel, message));
         this.browserSession = new OrchestratorBrowserSession({
             userId: config.userId,
             targetUrl,
             scanId,
             authManager: this.authManager,
+            log: (channel, message) => this.log(channel, message),
+        });
+        this.scanSurface = new OrchestratorScanSurface({
+            scanId,
+            userId: config.userId,
+            targetUrl,
+            burp,
+            authManager: this.authManager,
+            browserSession: this.browserSession,
+            coverageTracker: this.coverageTracker,
             log: (channel, message) => this.log(channel, message),
         });
         this.requestExecutor = new OrchestratorRequestExecutor({
@@ -479,14 +475,7 @@ export class OrchestratorAgent {
             setRateLimitPauseUntil: (until) => {
                 this.rateLimitPauseUntil = until;
             },
-            onEndpointDiscovered: (url) => {
-                try {
-                    const parsed = new URL(url);
-                    this.discoveredEndpoints.add(parsed.pathname);
-                } catch {
-                    /* ignore */
-                }
-            },
+            onEndpointDiscovered: (url) => this.scanSurface.noteRequestDiscoveredEndpoint(url),
             onManagedAuthRefreshed: (identityId) => this.browserSession.seedBrowserFromAuthManager(identityId),
         });
         this.findingTracker = new OrchestratorFindingTracker({
@@ -499,6 +488,17 @@ export class OrchestratorAgent {
             },
         });
         this.scanStatus = new OrchestratorScanStatus(scanId);
+        this.browserTools = new OrchestratorBrowserTools({
+            browserSession: this.browserSession,
+            scanSurface: this.scanSurface,
+            log: (channel, message) => this.log(channel, message),
+            onFrontendDelta: (trigger, newEndpoints) => {
+                this.conversationHistory.push({
+                    role: 'user',
+                    content: `[SYSTEM] Frontend analysis update (after ${trigger}): New endpoints: ${newEndpoints.join(', ')}`,
+                });
+            },
+        });
         this.toolRegistry = new OrchestratorToolRegistry({
             handlers: {
                 send_http_request: (toolCall) => this.executeSendHttpRequest(toolCall),
@@ -523,13 +523,13 @@ export class OrchestratorAgent {
                 generate_payloads: (toolCall) => this.burp.callTool('generate_payloads', toolCall.args),
                 extract_links: (toolCall) => this.burp.callTool('extract_links', toolCall.args),
                 analyze_response: async () => ({ status: 'Analysis requested - handled by LLM' }),
-                browser_navigate: (toolCall) => this.executeBrowserNavigate(toolCall),
-                browser_get_page_state: () => this.executeBrowserPageState(),
-                browser_get_frontend_analysis: () => this.executeBrowserFrontendAnalysis(),
-                browser_fill_and_submit: (toolCall) => this.executeBrowserFillSubmit(toolCall),
-                browser_evaluate_js: (toolCall) => this.executeBrowserEvaluateJs(toolCall),
-                browser_screenshot: () => this.executeBrowserScreenshot(),
-                browser_correlate_burp: () => this.executeBrowserCorrelateBurp(),
+                browser_navigate: (toolCall) => this.browserTools.navigate(toolCall),
+                browser_get_page_state: () => this.browserTools.getPageState(),
+                browser_get_frontend_analysis: () => this.browserTools.getFrontendAnalysis(),
+                browser_fill_and_submit: (toolCall) => this.browserTools.fillAndSubmit(toolCall),
+                browser_evaluate_js: (toolCall) => this.browserTools.evaluateJs(toolCall),
+                browser_screenshot: () => this.browserTools.screenshot(),
+                browser_correlate_burp: () => this.browserTools.correlateBurp(),
                 harvest_traffic: () => this.executeHarvestTraffic(),
                 get_hypotheses: (toolCall) => this.executeGetHypotheses(toolCall),
                 get_coverage: () => this.executeGetCoverage(),
@@ -537,6 +537,24 @@ export class OrchestratorAgent {
                 none: async () => ({ status: 'No tool call (step complete)' }),
             },
         });
+        this.llmResponseParser = new OrchestratorLlmResponseParser(
+            targetUrl,
+            () => this.isFocusedScope,
+            this.toolRegistry,
+            (channel, message) => this.log(channel, message),
+        );
+        this.instructionAnalyzer = new OrchestratorInstructionAnalyzer(
+            this.llmResponseParser,
+            (channel, message) => this.log(channel, message),
+        );
+        this.contextSignals = new OrchestratorContextSignals((channel, message) => this.log(channel, message));
+        this.planner = new OrchestratorPlanner({
+            parser: this.llmResponseParser,
+            log: (channel, message) => this.log(channel, message),
+            delay: (ms) => this.delay(ms),
+            handleRateLimitError: (error) => this.handleRateLimitError(error),
+        });
+        this.fallbackPlanner = new OrchestratorFallbackPlanner((channel, message) => this.log(channel, message));
         this.toolDispatcher = new OrchestratorToolDispatcher({
             log: (channel, message) => this.log(channel as any, message),
             guard: (toolCall) => {
@@ -690,8 +708,8 @@ export class OrchestratorAgent {
             this.log('system', `Restored ${this.findings.length} existing findings`);
         }
         if (opts.existingEndpoints) {
-            opts.existingEndpoints.forEach((endpoint) => this.discoveredEndpoints.add(endpoint));
-            this.log('system', `Restored ${this.discoveredEndpoints.size} discovered endpoints`);
+            const restored = this.scanSurface.restoreDiscoveredEndpoints(opts.existingEndpoints);
+            this.log('system', `Restored ${restored} discovered endpoints`);
         }
 
         const burpOk = await this.burp.isAvailable();
@@ -741,7 +759,7 @@ PREVIOUS FINDINGS (${this.findings.length} total):
 ${findingsSummary}
 
 DISCOVERED ENDPOINTS:
-${[...this.discoveredEndpoints].join('\n') || 'None recorded'}
+${this.scanSurface.getDiscoveredEndpoints().join('\n') || 'None recorded'}
 
 You have ${extraRounds} planning round(s) to execute this instruction. ${opts.planningEnabled ? 'Use the PLAN → EXECUTE → REPLAN cycle.' : 'Skip planning — execute the instruction directly with tool calls.'} Be thorough within the given rounds.`,
         });
@@ -935,8 +953,8 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
             maxPlanRounds: this.maxPlanRounds,
             maxIterations: this.maxIterations,
             findingsCount: this.findings.length,
-            discoveredEndpointsCount: this.discoveredEndpoints.size,
-            discoveredEndpointsPreview: Array.from(this.discoveredEndpoints).slice(0, 25),
+            discoveredEndpointsCount: this.scanSurface.getDiscoveredEndpointCount(),
+            discoveredEndpointsPreview: this.scanSurface.getDiscoveredEndpointPreview(25),
             currentPlan: this.currentPlan ? {
                 round: this.currentPlan.round,
                 steps: this.currentPlan.steps.map((step) => ({
@@ -953,10 +971,10 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
                 activeHypotheses: hypothesisSummary.activeHypotheses,
             },
             coverage: coverageSummary,
-            endpointInventory: this.endpointInventory ? {
-                summary: this.endpointInventory.summary,
-                authSurfaceCount: this.endpointInventory.authRelevantCount,
-                endpointCount: this.endpointInventory.records.length,
+            endpointInventory: this.scanSurface.getEndpointInventory() ? {
+                summary: this.scanSurface.getEndpointInventory()!.summary,
+                authSurfaceCount: this.scanSurface.getEndpointInventory()!.authRelevantCount,
+                endpointCount: this.scanSurface.getEndpointInventory()!.records.length,
             } : null,
         };
     }
@@ -1043,7 +1061,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         this.log('system', `✓ Auth State Engine: ${this.authManager.identityRegistry.size} identities, ${this.authManager.getTotalCookies()} cookies, ${this.authManager.getTotalTokens()} tokens`);
 
         // ── Browser-first auth discovery and session acquisition must complete before normal planning ──
-        await this.runAuthFirstStartup(authStartup);
+        await this.scanSurface.runAuthStartup(authStartup);
 
         // Run source analysis after startup auth inventory is complete so planning always sees auth intelligence first
         let sourceContextBlock = '';
@@ -1065,8 +1083,8 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
         // Generate the auth block for the system prompt (tells LLM auth is automatic)
         const sessionCookiesBlock = this.authManager.getSystemPromptBlock();
-        const startupAuthBlock = this.buildStartupAuthPromptBlock();
-        const endpointInventoryBlock = this.buildEndpointInventoryPromptBlock();
+        const startupAuthBlock = this.scanSurface.buildStartupAuthPromptBlock();
+        const endpointInventoryBlock = this.scanSurface.buildEndpointInventoryPromptBlock();
 
         // Build system prompt
         const promptTemplate = await this.loadPromptTemplate();
@@ -1100,16 +1118,16 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
             content: systemPrompt
         });
 
-        if (this.startupAuthInventory) {
+        if (this.scanSurface.getStartupAuthInventory()) {
             this.conversationHistory.push({
                 role: 'user',
-                content: `[SYSTEM] Web Scan auth startup completed before planning.\n${this.buildStartupAuthSummary(this.startupAuthInventory)}\nTreat this inventory as established evidence and keep planning auth-surface-first in round 1 before generic crawling or fuzzing.`,
+                content: `[SYSTEM] Web Scan auth startup completed before planning.\n${this.scanSurface.buildStartupAuthSummary()}\nTreat this inventory as established evidence and keep planning auth-surface-first in round 1 before generic crawling or fuzzing.`,
             });
         }
-        if (this.endpointInventory) {
+        if (this.scanSurface.getEndpointInventory()) {
             this.conversationHistory.push({
                 role: 'user',
-                content: `[SYSTEM] Endpoint intelligence captured before planning.\n${this.buildEndpointInventorySummary(this.endpointInventory)}\nUse this for round 1 auth-surface-first planning and avoid already-filtered noise.`,
+                content: `[SYSTEM] Endpoint intelligence captured before planning.\n${this.scanSurface.buildEndpointInventorySummary()}\nUse this for round 1 auth-surface-first planning and avoid already-filtered noise.`,
             });
         }
 
@@ -1497,7 +1515,7 @@ Rules for subsequent work:
 
             // ── DELTA FRONTEND ANALYSIS: Check for new state after round ──
             try {
-                await this.deltaFrontendAnalysis('round-end');
+                await this.browserTools.runDeltaFrontendAnalysis('round-end');
             } catch (e: any) {
                 this.log('error', `Delta analysis failed (non-fatal): ${e.message}`);
             }
@@ -1547,7 +1565,7 @@ Rules for subsequent work:
                 const vulnList = vulns.map((v: any) => `[${v.severity.toUpperCase()}] ${v.name}`).join('\n');
                 const summary = await llmQueue.enqueue({
                     systemPrompt: 'You are a security report writer. Provide a concise executive summary of the penetration test findings. Include: total vulns by severity, most critical issues, and key recommendations.',
-                    userPrompt: `Target: ${this.targetUrl}\nPlanning rounds completed: ${this.planRound}\nEndpoints tested: ${this.discoveredEndpoints.size}\n\nFindings:\n${vulnList}`
+                    userPrompt: `Target: ${this.targetUrl}\nPlanning rounds completed: ${this.planRound}\nEndpoints tested: ${this.scanSurface.getDiscoveredEndpointCount()}\n\nFindings:\n${vulnList}`
                 });
                 this.log('agent', `Executive Summary:\n${summary.text.substring(0, 500)}`);
             } catch (e: any) {
@@ -1559,7 +1577,7 @@ Rules for subsequent work:
         this.phase = 'completed';
         this.scanStatus.completed();
         this.log('system', `\n═══ SCAN COMPLETED ═══`);
-        this.log('system', `Rounds: ${this.planRound} | Endpoints: ${this.discoveredEndpoints.size} | Findings: ${vulns.length}`);
+        this.log('system', `Rounds: ${this.planRound} | Endpoints: ${this.scanSurface.getDiscoveredEndpointCount()} | Findings: ${vulns.length}`);
 
         // Cleanup browser session when scan completes
         await this.cleanupBrowserSession();
@@ -1576,16 +1594,16 @@ Rules for subsequent work:
             rateLimitPauseUntil: this.rateLimitPauseUntil,
             planRound: this.planRound,
             findingsCount: this.findings.length,
-            endpointsSummary: this.discoveredEndpoints.size > 0
-                ? Array.from(this.discoveredEndpoints).slice(0, 30).join(', ')
+            endpointsSummary: this.scanSurface.getDiscoveredEndpointCount() > 0
+                ? this.scanSurface.getDiscoveredEndpoints().slice(0, 30).join(', ')
                 : 'None yet - initial discovery needed',
             previousResults: this.stepResults.length > 0
                 ? this.stepResults.slice(-10).map((result) =>
                     `Step "${result.step.objective}": ${result.step.result || 'completed'} (${result.toolResults.length} tool calls)`,
                 ).join('\n')
                 : 'This is the first round - no previous results.',
-            authStartupSummary: this.startupAuthInventory
-                ? this.buildStartupAuthSummary(this.startupAuthInventory)
+            authStartupSummary: this.scanSurface.getStartupAuthInventory()
+                ? this.scanSurface.buildStartupAuthSummary()
                 : 'No startup auth inventory was captured.',
             authStartupDirective: this.buildAuthStartupDirective(),
             operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
@@ -1610,9 +1628,9 @@ Rules for subsequent work:
             targetUrl: this.targetUrl,
             planRound: this.planRound,
             instructionAnalysis: this.instructionAnalysis,
-            startupAuthInventory: this.startupAuthInventory,
+            startupAuthInventory: this.scanSurface.getStartupAuthInventory(),
             authStartupMode: this.config.authStartup?.mode || 'no_credentials',
-            discoveredEndpoints: this.discoveredEndpoints,
+            discoveredEndpoints: this.scanSurface.getDiscoveredEndpoints(),
         });
     }
 
@@ -1636,7 +1654,7 @@ Rules for subsequent work:
             rateLimitPauseUntil: this.rateLimitPauseUntil,
             roundResults,
             findings: this.findings,
-            discoveredEndpoints: Array.from(this.discoveredEndpoints),
+            discoveredEndpoints: this.scanSurface.getDiscoveredEndpoints(),
             hypothesisStatus: this.hypothesisEngine.getSummaryForPrompt(),
             coverageStatus: this.coverageTracker.getSummaryForPrompt(),
             operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
@@ -2293,7 +2311,7 @@ Rules for subsequent work:
             this.coverageTracker.addRoute(req.path, req.method, 'burp');
             this.coverageTracker.inferWorkflowFromRoute(req.path);
         }
-        await this.refreshEndpointInventory('harvest', false);
+        await this.scanSurface.refreshEndpointInventory('harvest', false);
 
         // 3. Promote top candidates
         const promoted = this.harvester.getPromotionCandidates(5);
@@ -2597,7 +2615,7 @@ Rules for subsequent work:
                 untested: covSummary.untestedRoutes.length,
                 coveragePercentage: covSummary.coveragePercentage,
             },
-            endpointInventory: this.endpointInventory,
+            endpointInventory: this.scanSurface.getEndpointInventory(),
         };
     }
 }
