@@ -12,7 +12,7 @@
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
-import { updateScanStatus, addVulnerability, saveScanLogs, db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
+import { addVulnerability, saveScanLogs, db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
 import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
@@ -25,11 +25,15 @@ import { HypothesisEngine, VulnHypothesis, MutationTemplate } from '../services/
 import { CoverageTracker } from '../services/CoverageTracker';
 import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
 import { browserService } from '../services/BrowserService';
-import { AuthStateManager, AuthInjector, IdentityRegistry, AuthStartupConfig, AuthStartupInventory, RequestAuthIntent } from '../services/auth';
+import { AuthStateManager, AuthInjector, IdentityRegistry, AuthStartupConfig, AuthStartupInventory } from '../services/auth';
 import { getHeaderValue, parseRawBurpRequest } from '../services/burp-request';
 import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
 import { WebAuthStartupService } from '../services/WebAuthStartupService';
 import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
+import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
+import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
+import { evaluateToolExecutionGuard, hasCustomAuthHeader, resolveAuthIdentityId, resolveRequestAuthIntent } from './orchestrator/OrchestratorToolPolicy';
+import { ToolCall } from './orchestrator/types';
 
 type AgentPhase = 'planning' | 'executing' | 'replanning' | 'reporting' | 'completed' | 'failed' | 'stopped';
 
@@ -56,11 +60,6 @@ interface ScanConfig {
     sourceAnalysisMode?: string;
     /** Explicit startup auth discovery/login strategy for Web Scans. */
     authStartup?: AuthStartupConfig;
-}
-
-interface ToolCall {
-    tool: string;
-    args: Record<string, any>;
 }
 
 interface PlanStep {
@@ -521,6 +520,8 @@ export class OrchestratorAgent {
 
     // ── Auth State Engine ──
     public authManager: AuthStateManager;
+    private readonly scanStatus: OrchestratorScanStatus;
+    private readonly toolDispatcher: OrchestratorToolDispatcher;
 
     constructor(scanId: string, targetUrl: string, config: ScanConfig, burp: BurpMCPClient) {
         this.scanId = scanId;
@@ -539,6 +540,59 @@ export class OrchestratorAgent {
 
         // Initialize auth state engine
         this.authManager = new AuthStateManager(scanId, targetUrl);
+        this.scanStatus = new OrchestratorScanStatus(scanId);
+        this.toolDispatcher = new OrchestratorToolDispatcher({
+            log: (channel, message) => this.log(channel as any, message),
+            guard: (toolCall) => {
+                const guardResult = evaluateToolExecutionGuard({
+                    toolName: toolCall.tool,
+                    isFocusedScope: this.isFocusedScope,
+                    rateLimitPauseUntil: this.rateLimitPauseUntil,
+                });
+
+                if (!guardResult.allowed && guardResult.logMessage) {
+                    this.log('tool', guardResult.logMessage);
+                }
+
+                return guardResult.allowed ? null : guardResult.response;
+            },
+            handlers: {
+                send_http_request: (toolCall) => this.executeSendHttpRequest(toolCall),
+                get_proxy_history: async (toolCall) => ({
+                    items: normalizeProxyHistoryItems(
+                        await this.burp.callTool('get_proxy_history', { ...toolCall.args, excludePenPard: true }),
+                    ),
+                }),
+                get_session_cookies: async (toolCall) => normalizeSessionCookieResult(
+                    await this.burp.callTool('get_session_cookies', { host: toolCall.args?.host || new URL(this.targetUrl).hostname }),
+                ),
+                get_cookies_and_auth_for_host: async (toolCall) => ({
+                    entries: normalizeCookiesAndAuthEntries(await this.burp.callTool('get_cookies_and_auth_for_host', {
+                        host: toolCall.args?.host || new URL(this.targetUrl).hostname,
+                        maxItems: toolCall.args?.maxItems ?? 50,
+                    })),
+                }),
+                send_to_scanner: (toolCall) => this.burp.callTool('send_to_scanner', toolCall.args),
+                get_sitemap: (toolCall) => this.burp.callTool('get_sitemap', toolCall.args || {}),
+                spider_url: (toolCall) => this.burp.callTool('spider_url', toolCall.args),
+                check_authorization: (toolCall) => this.burp.callTool('check_authorization', toolCall.args),
+                generate_payloads: (toolCall) => this.burp.callTool('generate_payloads', toolCall.args),
+                extract_links: (toolCall) => this.burp.callTool('extract_links', toolCall.args),
+                analyze_response: async () => ({ status: 'Analysis requested - handled by LLM' }),
+                browser_navigate: (toolCall) => this.executeBrowserNavigate(toolCall),
+                browser_get_page_state: () => this.executeBrowserPageState(),
+                browser_get_frontend_analysis: () => this.executeBrowserFrontendAnalysis(),
+                browser_fill_and_submit: (toolCall) => this.executeBrowserFillSubmit(toolCall),
+                browser_evaluate_js: (toolCall) => this.executeBrowserEvaluateJs(toolCall),
+                browser_screenshot: () => this.executeBrowserScreenshot(),
+                browser_correlate_burp: () => this.executeBrowserCorrelateBurp(),
+                harvest_traffic: () => this.executeHarvestTraffic(),
+                get_hypotheses: (toolCall) => this.executeGetHypotheses(toolCall),
+                get_coverage: () => this.executeGetCoverage(),
+                repeater_test: (toolCall) => this.executeRepeaterTest(toolCall),
+                none: async () => ({ status: 'No tool call (step complete)' }),
+            },
+        });
     }
 
     /**
@@ -655,7 +709,7 @@ ${vulns}
         this.log('system', `Orchestrator Agent started for target: ${this.targetUrl}`);
 
         try {
-            updateScanStatus(this.scanId, 'initializing');
+            this.scanStatus.initializing();
 
             if (!this.targetUrl) {
                 throw new Error('Target URL is required');
@@ -673,7 +727,7 @@ ${vulns}
         } catch (error: any) {
             this.phase = 'failed';
             this.log('error', `Critical Failure: ${error.message}`);
-            updateScanStatus(this.scanId, 'failed', error.message);
+            this.scanStatus.failed(error.message);
         } finally {
             this.isRunning = false;
             this.saveLogs();
@@ -707,7 +761,7 @@ ${vulns}
         this.log('system', `Additional rounds: ${extraRounds}, Planning: ${opts.planningEnabled ? 'ON' : 'OFF'}`);
 
         try {
-            updateScanStatus(this.scanId, 'testing');
+            this.scanStatus.testing();
 
             // Restore existing state from DB
             if (opts.existingFindings) {
@@ -844,7 +898,7 @@ Proceed with testing.`
 
         } catch (error: any) {
             this.log('error', `Continuation failed: ${error.message}`);
-            updateScanStatus(this.scanId, 'failed', error.message);
+            this.scanStatus.failed(error.message);
         } finally {
             this.isRunning = false;
             this.saveLogs();
@@ -856,7 +910,7 @@ Proceed with testing.`
      */
     private async phaseDirectExecution(instruction: string, maxRounds: number) {
         this.phase = 'executing';
-        updateScanStatus(this.scanId, 'testing');
+        this.scanStatus.testing();
         this.log('system', '═══ DIRECT EXECUTION MODE (No Planning) ═══');
 
         let totalActions = 0;
@@ -1008,7 +1062,7 @@ Proceed with testing.`
 
     private async phaseInit() {
         this.phase = 'planning';
-        updateScanStatus(this.scanId, 'planning');
+        this.scanStatus.planning();
         this.log('system', '═══ PHASE: INITIALIZATION ═══');
 
         // Check Burp connection
@@ -1486,7 +1540,7 @@ Rules for subsequent work:
 
     private async phaseIterativeTesting() {
         this.phase = 'planning';
-        updateScanStatus(this.scanId, 'testing');
+        this.scanStatus.testing();
         this.log('system', '═══ PHASE: ITERATIVE TESTING ═══');
 
         let totalActions = 0;
@@ -1681,7 +1735,7 @@ Rules for subsequent work:
 
     private async phaseReporting() {
         this.phase = 'reporting';
-        updateScanStatus(this.scanId, 'reporting');
+        this.scanStatus.reporting();
         this.log('system', '═══ PHASE: REPORTING ═══');
 
         const vulns = db.prepare('SELECT * FROM vulnerabilities WHERE scan_id = ?').all(this.scanId) as any[];
@@ -1702,7 +1756,7 @@ Rules for subsequent work:
 
         await this.delay(1000);
         this.phase = 'completed';
-        updateScanStatus(this.scanId, 'completed');
+        this.scanStatus.completed();
         this.log('system', `\n═══ SCAN COMPLETED ═══`);
         this.log('system', `Rounds: ${this.planRound} | Endpoints: ${this.discoveredEndpoints.size} | Findings: ${vulns.length}`);
 
@@ -2042,136 +2096,13 @@ Rules for subsequent work:
     }
 
     private async executeToolCall(toolCall: ToolCall): Promise<any> {
-        this.log('tool', `Executing: ${toolCall.tool}`);
-
-        try {
-            if (this.rateLimitPauseUntil && new Date() < this.rateLimitPauseUntil) {
-                const remainingMs = this.rateLimitPauseUntil.getTime() - Date.now();
-                const remainingMin = Math.ceil(remainingMs / 60000);
-                this.log('tool', `⏳ Rate limited - waiting ${remainingMin} more minutes`);
-                return { error: `Rate limited. Waiting ${remainingMin} minutes.`, skipped: true };
-            }
-
-            // FOCUSED SCOPE GUARD: Block enumeration tools when operator specified exact targets
-            if (this.isFocusedScope) {
-                const blockedTools = ['spider_url', 'get_sitemap', 'extract_links'];
-                if (blockedTools.includes(toolCall.tool)) {
-                    this.log('tool', `🚫 BLOCKED: "${toolCall.tool}" — Operator instructions define a focused scope. Enumeration is not allowed. Go directly to the specified endpoint(s).`);
-                    return {
-                        error: `Tool "${toolCall.tool}" is blocked because operator instructions define a specific scope. Do NOT enumerate. Go directly to the target endpoint and test for the specified vulnerability type.`,
-                        blocked: true,
-                    };
-                }
-            }
-
-            switch (toolCall.tool) {
-                case 'send_http_request':
-                    return await this.executeSendHttpRequest(toolCall);
-
-                case 'get_proxy_history':
-                    // Always exclude PenPard agent requests — only show user's real traffic
-                    return {
-                        items: normalizeProxyHistoryItems(
-                            await this.burp.callTool('get_proxy_history', { ...toolCall.args, excludePenPard: true }),
-                        ),
-                    };
-
-                case 'get_session_cookies':
-                    return normalizeSessionCookieResult(
-                        await this.burp.callTool('get_session_cookies', { host: toolCall.args?.host || new URL(this.targetUrl).hostname }),
-                    );
-
-                case 'get_cookies_and_auth_for_host':
-                    return {
-                        entries: normalizeCookiesAndAuthEntries(await this.burp.callTool('get_cookies_and_auth_for_host', {
-                            host: toolCall.args?.host || new URL(this.targetUrl).hostname,
-                            maxItems: toolCall.args?.maxItems ?? 50
-                        })),
-                    };
-
-                case 'send_to_scanner':
-                    return await this.burp.callTool('send_to_scanner', toolCall.args);
-
-                case 'get_sitemap':
-                    return await this.burp.callTool('get_sitemap', toolCall.args || {});
-
-                case 'spider_url':
-                    return await this.burp.callTool('spider_url', toolCall.args);
-
-                case 'check_authorization':
-                    return await this.burp.callTool('check_authorization', toolCall.args);
-
-                case 'generate_payloads':
-                    return await this.burp.callTool('generate_payloads', toolCall.args);
-
-                case 'extract_links':
-                    return await this.burp.callTool('extract_links', toolCall.args);
-
-                case 'analyze_response':
-                    return { status: 'Analysis requested - handled by LLM' };
-
-                // ── Browser Tools ──
-                case 'browser_navigate':
-                    return await this.executeBrowserNavigate(toolCall);
-
-                case 'browser_get_page_state':
-                    return await this.executeBrowserPageState();
-
-                case 'browser_get_frontend_analysis':
-                    return await this.executeBrowserFrontendAnalysis();
-
-                case 'browser_fill_and_submit':
-                    return await this.executeBrowserFillSubmit(toolCall);
-
-                case 'browser_evaluate_js':
-                    return await this.executeBrowserEvaluateJs(toolCall);
-
-                case 'browser_screenshot':
-                    return await this.executeBrowserScreenshot();
-
-                case 'browser_correlate_burp':
-                    return await this.executeBrowserCorrelateBurp();
-
-                // ── Pentester Loop Tools (v2) ──
-                case 'harvest_traffic':
-                    return await this.executeHarvestTraffic();
-
-                case 'get_hypotheses':
-                    return await this.executeGetHypotheses(toolCall);
-
-                case 'get_coverage':
-                    return await this.executeGetCoverage();
-
-                case 'repeater_test':
-                    return await this.executeRepeaterTest(toolCall);
-
-                case 'none':
-                    return { status: 'No tool call (step complete)' };
-
-                default:
-                    this.log('error', `Unknown tool: ${toolCall.tool}`);
-                    return { error: `Unknown tool: ${toolCall.tool}. Available: send_http_request, get_proxy_history, get_session_cookies, send_to_scanner, get_sitemap, spider_url, check_authorization, generate_payloads, extract_links, browser_navigate, browser_get_page_state, browser_get_frontend_analysis, browser_fill_and_submit, browser_evaluate_js, browser_screenshot, browser_correlate_burp, harvest_traffic, get_hypotheses, get_coverage, repeater_test` };
-            }
-        } catch (e: any) {
-            this.log('error', `Tool error: ${e.message}`);
-            return { error: e.message };
-        }
+        return this.toolDispatcher.execute(toolCall);
     }
 
     private normalizeRequestBody(rawBody: any): string {
         if (rawBody === undefined || rawBody === null) return '';
         if (typeof rawBody === 'string') return rawBody;
         return JSON.stringify(rawBody);
-    }
-
-    private resolveAuthIdentityId(args: Record<string, any> | undefined): string {
-        if (typeof args?.identityId === 'string' && args.identityId.trim()) {
-            return args.identityId.trim();
-        }
-        if (args?.disableAutoAuth === true) {
-            return IdentityRegistry.ANONYMOUS_ID;
-        }
-        return 'primary-user';
     }
 
     private buildRequestHistoryKey(
@@ -2228,44 +2159,6 @@ Rules for subsequent work:
         }
     }
 
-    private hasCustomAuthHeader(headers: Record<string, string> | undefined): boolean {
-        if (!headers) return false;
-        return Object.entries(headers).some(([name, value]) => {
-            const lower = name.toLowerCase();
-            return [
-                'x-api-key',
-                'x-auth-token',
-                'x-access-token',
-                'x-session-token',
-                'api-key',
-                'apikey',
-                'x-token',
-            ].includes(lower) && typeof value === 'string' && value.trim().length > 0;
-        });
-    }
-
-    private resolveRequestAuthIntent(url: string, method: string, requestedIntent?: unknown, identityId?: string): RequestAuthIntent {
-        if (typeof requestedIntent === 'string') {
-            const normalized = requestedIntent.trim().toLowerCase() as RequestAuthIntent;
-            if ([
-                'authenticated',
-                'anonymous_auth_probe',
-                'account_creation',
-                'session_refresh',
-                'browser_sync',
-                'unknown',
-            ].includes(normalized)) {
-                return normalized;
-            }
-        }
-
-        const inferred = this.authManager.inferRequestIntent(url, method);
-        if (identityId === IdentityRegistry.ANONYMOUS_ID && inferred === 'authenticated') {
-            return 'unknown';
-        }
-        return inferred;
-    }
-
     private async syncAuthFromBrowser(identityId: string = 'primary-user'): Promise<void> {
         if (!this.browserSessionId || !browserService.isSessionAlive(this.browserSessionId)) {
             return;
@@ -2303,7 +2196,7 @@ Rules for subsequent work:
     private async executeSendHttpRequest(toolCall: ToolCall): Promise<any> {
         const url = toolCall.args.url;
         const method = toolCall.args.method || 'GET';
-        const identityId = this.resolveAuthIdentityId(toolCall.args);
+        const identityId = resolveAuthIdentityId(toolCall.args);
         const preserveExplicitAuth = toolCall.args?.preserveExplicitAuth === true;
 
         // Block SQLMap-style UNION SELECT null enumeration
@@ -2324,11 +2217,15 @@ Rules for subsequent work:
 
         const originalBody = this.normalizeRequestBody(toolCall.args.body ?? toolCall.args.data ?? '');
         const originalHeaders = toolCall.args.headers as Record<string, string> | undefined;
-        const requestIntent = this.resolveRequestAuthIntent(url, method, toolCall.args.requestIntent, identityId);
+        const requestIntent = resolveRequestAuthIntent({
+            requestedIntent: toolCall.args.requestIntent,
+            identityId,
+            inferIntent: () => this.authManager.inferRequestIntent(url, method),
+        });
         const existingAuthContext = this.authManager.inject(url, method, identityId, requestIntent);
         const explicitAuthorization = getHeaderValue(originalHeaders, 'authorization');
         const explicitCookie = getHeaderValue(originalHeaders, 'cookie');
-        const explicitCustomAuth = this.hasCustomAuthHeader(originalHeaders);
+        const explicitCustomAuth = hasCustomAuthHeader(originalHeaders);
 
         if (
             !preserveExplicitAuth &&
@@ -4253,7 +4150,7 @@ Rules for subsequent work:
         this.log('tool', `🔬 repeater_test: ${request.method} ${request.path} (${mutations.length} mutation(s))`);
 
         const results: any[] = [];
-        const defaultIdentityId = this.resolveAuthIdentityId(toolCall.args);
+        const defaultIdentityId = resolveAuthIdentityId(toolCall.args);
         const defaultPreserveExplicitAuth = toolCall.args?.preserveExplicitAuth === true;
 
         for (const mutation of mutations) {
@@ -4453,3 +4350,4 @@ Rules for subsequent work:
         };
     }
 }
+

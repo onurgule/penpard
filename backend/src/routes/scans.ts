@@ -13,33 +13,22 @@ import {
     deleteScans,
     getVulnerabilitiesByScan,
     getUserWhitelists,
-    saveScanLogs,
-    getScanLogs,
     saveChatMessage,
     getChatMessages,
     saveScanConfig,
-    getScanEndpointInventory,
 } from '../db/init';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
 import { logger, logApiUsage } from '../utils/logger';
 import { BurpMCPClient } from '../services/burp-mcp';
 import { MobSFService } from '../services/mobsf';
-import { OrchestratorAgent } from '../agents/OrchestratorAgent';
-import { AgentPool } from '../agents/AgentPool';
 import { llmProvider } from '../services/LLMProviderService';
 import { activityMonitor } from '../services/ActivityMonitorService';
 import { takePendingRequest } from './penpard';
 import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
-import { browserService } from '../services/BrowserService';
 import { extractRoutes } from '../services/source-analysis/utils/route-extractor';
 import { defaultAuthStartupConfig, redactAuthStartupConfig, resolveAuthStartupConfig, toLegacyIdorUsers } from '../services/web-auth-startup-config';
+import { scanRuntimeService } from '../services/runtime/ScanRuntimeService';
 import os from 'os';
-
-export const activeAgents = new Map<string, OrchestratorAgent>();
-export const activePools = new Map<string, AgentPool>();
-
-// Cache logs after agent/pool completes so the UI can still display them
-export const scanLogCache = new Map<string, { logs: string[], phase: string }>();
 
 const router = Router();
 
@@ -590,8 +579,7 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
         }
 
         const vulnerabilities = getVulnerabilitiesByScan(id);
-        const agent = activeAgents.get(id);
-        const endpointInventory = agent?.getState?.().endpointInventory || getScanEndpointInventory(id);
+        const endpointInventory = scanRuntimeService.getEndpointInventory(id);
 
         res.json({
             id: scan.id,
@@ -636,7 +624,7 @@ router.post('/:id/command', authenticateToken, async (req: AuthRequest, res: Res
             return;
         }
 
-        const agent = activeAgents.get(id);
+        const agent = scanRuntimeService.getActiveAgent(id);
 
         // Persist user command to DB
         saveChatMessage(id, 'human', command);
@@ -731,37 +719,8 @@ router.post('/:id/stop', authenticateToken, async (req: AuthRequest, res: Respon
             return;
         }
 
-        const agent = activeAgents.get(id);
-        const pool = activePools.get(id);
-
-        if (pool) {
-            // Cache + persist logs before stopping
-            const allLogs = pool.getLogs(0);
-            scanLogCache.set(id, { logs: allLogs, phase: 'stopped' });
-            saveScanLogs(id, allLogs);
-            pool.stop();
-            activePools.delete(id);
-            updateScanStatus(id, 'stopped', 'Scan stopped by user');
-            logger.info('Pool scan stopped by user', { scanId: id, userId: user.id });
-            res.json({ message: 'Pool scan stopped successfully' });
-        } else if (agent) {
-            // Cache + persist logs before stopping
-            const allLogs = agent.getLogs(0);
-            scanLogCache.set(id, { logs: allLogs, phase: 'stopped' });
-            // Flush only unflushed logs (agent handles incremental persistence)
-            agent.flushLogsToDB();
-            agent.stop();
-            activeAgents.delete(id);
-            updateScanStatus(id, 'stopped', 'Scan stopped by user');
-            logger.info('Scan stopped by user', { scanId: id, userId: user.id });
-            res.json({ message: 'Scan stopped successfully' });
-        } else {
-            // No active agent, but update status anyway
-            if (scan.status !== 'completed' && scan.status !== 'failed') {
-                updateScanStatus(id, 'stopped', 'Scan stopped by user');
-            }
-            res.json({ message: 'Scan was not actively running, status updated' });
-        }
+        const result = await scanRuntimeService.stopScan(id, user.id, scan.status);
+        res.json(result);
 
     } catch (error: any) {
         logger.error('Stop scan error', { error: error.message });
@@ -786,21 +745,7 @@ router.post('/:id/pause', authenticateToken, async (req: AuthRequest, res: Respo
             return;
         }
 
-        const agent = activeAgents.get(id);
-        const pool = activePools.get(id);
-
-        if (pool) {
-            pool.pause();
-            updateScanStatus(id, 'paused');
-            logger.info('Pool scan paused by user', { scanId: id, userId: user.id });
-        } else if (agent) {
-            agent.pause();
-            updateScanStatus(id, 'paused');
-            logger.info('Scan paused by user', { scanId: id, userId: user.id });
-        } else {
-            res.status(400).json({ error: true, message: 'No active scan to pause' });
-            return;
-        }
+        const result = await scanRuntimeService.pauseScan(id, user.id);
 
         // Auto-start activity monitor when scan is paused so it can detect user's manual testing
         if (!activityMonitor.getStatus().running) {
@@ -809,11 +754,12 @@ router.post('/:id/pause', authenticateToken, async (req: AuthRequest, res: Respo
             });
         }
 
-        res.json({ message: 'Scan paused. Activity monitor is watching your manual testing.' });
+        res.json(result);
 
     } catch (error: any) {
         logger.error('Pause scan error', { error: error.message });
-        res.status(500).json({ error: true, message: 'Failed to pause scan' });
+        const statusCode = error.message === 'No active scan to pause' ? 400 : 500;
+        res.status(statusCode).json({ error: true, message: statusCode === 400 ? error.message : 'Failed to pause scan' });
     }
 });
 
@@ -834,27 +780,13 @@ router.post('/:id/resume', authenticateToken, async (req: AuthRequest, res: Resp
             return;
         }
 
-        const agent = activeAgents.get(id);
-        const pool = activePools.get(id);
-
-        if (pool) {
-            pool.resume();
-            updateScanStatus(id, 'testing');
-            logger.info('Pool scan resumed by user', { scanId: id, userId: user.id });
-        } else if (agent) {
-            agent.resume();
-            updateScanStatus(id, 'testing');
-            logger.info('Scan resumed by user', { scanId: id, userId: user.id });
-        } else {
-            res.status(400).json({ error: true, message: 'No active scan to resume' });
-            return;
-        }
-
-        res.json({ message: 'Scan resumed. Automated testing continues.' });
+        const result = await scanRuntimeService.resumeScan(id, user.id);
+        res.json(result);
 
     } catch (error: any) {
         logger.error('Resume scan error', { error: error.message });
-        res.status(500).json({ error: true, message: 'Failed to resume scan' });
+        const statusCode = error.message === 'No active scan to resume' ? 400 : 500;
+        res.status(statusCode).json({ error: true, message: statusCode === 400 ? error.message : 'Failed to resume scan' });
     }
 });
 
@@ -881,8 +813,8 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
             return;
         }
 
-        // Check if there's already an active agent
-        if (activeAgents.has(id) || activePools.has(id)) {
+        // Check if there's already an active runtime
+        if (scanRuntimeService.hasActiveRuntime(id)) {
             res.status(400).json({ error: true, message: 'Scan is already running. Use the command input instead.' });
             return;
         }
@@ -893,83 +825,18 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
             return;
         }
 
-        // Gather existing context
-        const existingFindings = getVulnerabilitiesByScan(id);
-        const existingEndpoints: string[] = [];
+        const result = await scanRuntimeService.continueCompletedScan(scan as any, {
+            instruction,
+            iterations: Math.min(Math.max(Number(iterations), 1), 20),
+            planningEnabled: !!planningEnabled,
+        });
 
-        // Try to extract discovered endpoints from findings
-        for (const f of existingFindings) {
-            if (f.request) {
-                const urlMatch = f.request.match(/(?:GET|POST|PUT|DELETE|PATCH)\s+(https?:\/\/[^\s]+)/i);
-                if (urlMatch) existingEndpoints.push(urlMatch[1]);
-            }
-        }
-
-        // Create a fresh Burp connection
-        const burpMCP = new BurpMCPClient();
-        let mcpAvailable = false;
-        try {
-            mcpAvailable = await burpMCP.isAvailable();
-        } catch (e) {
-            logger.warn('Burp MCP not available for continuation');
-        }
-
-        if (!mcpAvailable) {
-            res.status(400).json({ error: true, message: 'Burp Suite is not connected. Please ensure Burp is running with the PenPard extension.' });
-            return;
-        }
-
-        // Create a new agent for continuation (include original Burp request if scan was started from Send to PenPard)
-        const initialRequest = (scan.initial_request && String(scan.initial_request).trim()) ? String(scan.initial_request).trim() : undefined;
-        const agentConfig = {
-            userId: scan.user_id,
-            rateLimit: 5,
-            useNuclei: false,
-            useFfuf: false,
-            idorUsers: [],
-            customSystemPrompt: instruction,
-            initialRequest,
-        };
-
-        const agent = new OrchestratorAgent(id, scan.target, agentConfig, burpMCP);
-        activeAgents.set(id, agent);
-
-        // Save user instruction as chat message
-        saveChatMessage(id, 'human', `[CONTINUE SCAN] ${instruction} (${iterations} rounds, planning: ${planningEnabled ? 'ON' : 'OFF'})`);
-
-        // Respond immediately — scan runs in background
-        res.json({ message: `Scan continuing with ${iterations} rounds. Instruction: "${instruction.slice(0, 100)}..."` });
-
-        // Run continuation in background
-        (async () => {
-            try {
-                await agent.continueScan({
-                    instruction,
-                    iterations: Math.min(Math.max(Number(iterations), 1), 20),
-                    planningEnabled: !!planningEnabled,
-                    existingFindings,
-                    existingEndpoints: [...new Set(existingEndpoints)],
-                });
-
-                updateScanStatus(id, 'completed');
-                logger.info('Scan continuation completed', { scanId: id });
-            } catch (error: any) {
-                logger.error('Scan continuation error', { scanId: id, error: error.message });
-                updateScanStatus(id, 'failed', error.message);
-            } finally {
-                const state = agent.getState();
-                const allLogs = agent.getLogs(0);
-                scanLogCache.set(id, { logs: allLogs, phase: state.phase });
-                // Final flush of any remaining unflushed logs
-                agent.flushLogsToDB();
-                activeAgents.delete(id);
-                burpMCP.disconnect();
-            }
-        })();
+        res.json(result);
 
     } catch (error: any) {
         logger.error('Continue scan error', { error: error.message });
-        res.status(500).json({ error: true, message: 'Failed to continue scan' });
+        const statusCode = /Burp Suite is not connected/i.test(error.message) ? 400 : 500;
+        res.status(statusCode).json({ error: true, message: statusCode === 400 ? error.message : 'Failed to continue scan' });
     }
 });
 
@@ -1112,96 +979,7 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
             return;
         }
 
-        const agent = activeAgents.get(id);
-        const pool = activePools.get(id);
-
-        if (pool) {
-            // Pool is active - return pool data
-            const state = pool.getState();
-            const logs = pool.getLogs(since);
-
-            res.json({
-                isActive: true,
-                isPool: true,
-                phase: 'testing',
-                isRunning: state.isRunning,
-                isPaused: false,
-                logs: logs,
-                logsCount: state.logsCount,
-                burpConnected: true,
-                activeAgents: state.workerCount,
-                workers: state.workers,
-                stats: state.stats,
-                endpointInventory: null,
-            });
-        } else if (agent) {
-            // Agent is active - return live data
-            const state = agent.getState();
-            const logs = agent.getLogs(since);
-
-            // Don't check Burp on every poll - too many requests
-            // Just report based on agent being active
-            const browserSessionId = agent.getBrowserSessionId?.() || null;
-            const browserVisibility = browserSessionId ? browserService.getSessionVisibility(browserSessionId) : null;
-
-            res.json({
-                isActive: true,
-                isPool: false,
-                phase: state.phase,
-                isRunning: state.isRunning,
-                isPaused: state.isPaused,
-                logs: logs,
-                logsCount: state.logsCount,
-                burpConnected: true, // Assume connected if agent is running
-                activeAgents: activeAgents.size,
-                browserSessionId,
-                browserIsHeadless: browserVisibility?.isHeadless ?? null,
-                browserTransitioning: browserVisibility?.transitioning ?? false,
-                browserLifecycleState: browserVisibility?.lifecycleState ?? null,
-                browserIsLive: browserVisibility?.isLive ?? false,
-                browserStatusDetail: browserVisibility?.detail ?? null,
-                // Pentester Loop v2 state
-                harvestedRequestCount: state.harvestedRequestCount || 0,
-                promotedRequestCount: state.promotedRequestCount || 0,
-                hypothesisCount: state.hypothesisCount || { new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 },
-                coverageSummary: state.coverageSummary || null,
-                endpointInventory: state.endpointInventory || null,
-            });
-        } else {
-            // No active agent - check memory cache first, then DB
-            let cached = scanLogCache.get(id);
-
-            // If not in memory cache, load from database
-            if (!cached) {
-                const dbLogs = getScanLogs(id);
-                if (dbLogs.length > 0) {
-                    cached = { logs: dbLogs, phase: scan.status };
-                    // Re-populate memory cache for subsequent polls
-                    scanLogCache.set(id, cached);
-                }
-            }
-
-            const cachedLogs = cached ? cached.logs.slice(since) : [];
-            const cachedLogsCount = cached ? cached.logs.length : 0;
-
-            // For completed/stopped scans, indicate completion rather than "disconnected"
-            const isCompleted = scan.status === 'completed' || scan.status === 'stopped' || scan.status === 'failed';
-
-            res.json({
-                isActive: false,
-                isPool: false,
-                phase: cached?.phase || scan.status,
-                isRunning: false,
-                isPaused: false,
-                logs: cachedLogs,
-                logsCount: cachedLogsCount,
-                // Completed scans should not show as "disconnected" — they finished normally
-                burpConnected: isCompleted ? null : false,
-                activeAgents: activeAgents.size + activePools.size,
-                scanCompleted: isCompleted,
-                endpointInventory: getScanEndpointInventory(id),
-            });
-        }
+        res.json(scanRuntimeService.getLiveStatus(id, scan as any, since));
     } catch (error: any) {
         logger.error('Live status error', { error: error.message });
         res.status(500).json({ error: true, message: 'Failed to get live status' });
@@ -1212,20 +990,7 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
 router.post('/:id/browser/show', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const agent = activeAgents.get(id);
-        if (!agent) {
-            res.status(400).json({ error: true, message: 'No active scan agent' });
-            return;
-        }
-
-        const browserSessionId = agent.getBrowserSessionId?.();
-        if (!browserSessionId) {
-            res.status(400).json({ error: true, message: 'No browser session for this scan' });
-            return;
-        }
-
-        const visibility = await browserService.showBrowser(browserSessionId);
-        res.json({ ...visibility, browserSessionId });
+        res.json(await scanRuntimeService.showScanBrowser(id));
     } catch (error: any) {
         logger.error('Show browser for scan failed', { error: error.message });
         res.status(400).json({ error: true, message: error.message });
@@ -1236,20 +1001,7 @@ router.post('/:id/browser/show', authenticateToken, async (req: AuthRequest, res
 router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const agent = activeAgents.get(id);
-        if (!agent) {
-            res.status(400).json({ error: true, message: 'No active scan agent' });
-            return;
-        }
-
-        const browserSessionId = agent.getBrowserSessionId?.();
-        if (!browserSessionId) {
-            res.status(400).json({ error: true, message: 'No browser session for this scan' });
-            return;
-        }
-
-        const visibility = await browserService.hideBrowser(browserSessionId);
-        res.json({ ...visibility, browserSessionId });
+        res.json(await scanRuntimeService.hideScanBrowser(id));
     } catch (error: any) {
         logger.error('Hide browser for scan failed', { error: error.message });
         res.status(400).json({ error: true, message: error.message });
@@ -1259,136 +1011,7 @@ router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res
 // Async scan functions
 
 async function startWebScan(scanId: string, targetUrl: string, config: any = {}): Promise<void> {
-    logger.info('Starting web scan', {
-        scanId,
-        targetUrl,
-        config: {
-            ...config,
-            idorUsers: Array.isArray(config.idorUsers)
-                ? config.idorUsers.map((entry: any) => ({ ...entry, password: entry?.password ? '[REDACTED]' : undefined }))
-                : [],
-            authStartup: config.authStartup ? redactAuthStartupConfig(config.authStartup) : undefined,
-        },
-    });
-
-    updateScanStatus(scanId, 'initializing');
-
-    try {
-        // Use Burp MCP only
-        const burpMCP = new BurpMCPClient();
-        let mcpAvailable = false;
-
-        try {
-            mcpAvailable = await burpMCP.isAvailable();
-        } catch (e) {
-            logger.warn('Burp MCP connection check failed');
-        }
-
-        if (mcpAvailable) {
-            logger.info('Using Burp MCP for scanning', { scanId });
-
-            const requestedParallelAgents = config.parallelAgents || 1;
-            const authFirstStartupRequired = true;
-            const parallelAgents = authFirstStartupRequired ? 1 : requestedParallelAgents;
-            logger.info(`parallelAgents config value: ${requestedParallelAgents} (effective: ${parallelAgents})`, { scanId, config });
-
-            if (requestedParallelAgents > 1) {
-                logger.warn('Web Scan startup now requires a single orchestrator so browser-driven auth inventory, Burp traffic correlation, and session state stay consistent across the scan lifecycle.', {
-                    scanId,
-                    requestedParallelAgents,
-                });
-            }
-
-            if (parallelAgents > 1) {
-                // Multi-agent parallel scanning
-                logger.info(`🚀 Using AgentPool with ${parallelAgents} parallel workers`, { scanId });
-
-                // Calculate worker distribution
-                const poolConfig = {
-                    crawlerCount: Math.max(1, Math.floor(parallelAgents * 0.2)),  // 20% crawlers
-                    scannerCount: Math.max(1, Math.floor(parallelAgents * 0.4)),  // 40% scanners
-                    fuzzerCount: Math.max(1, Math.floor(parallelAgents * 0.25)),  // 25% fuzzers
-                    analyzerCount: Math.max(1, Math.floor(parallelAgents * 0.15)), // 15% analyzers
-                    maxIterationsPerWorker: 25,
-                    rateLimit: config.rateLimit || 5
-                };
-
-                const pool = new AgentPool(scanId, targetUrl, burpMCP, poolConfig);
-                activePools.set(scanId, pool);
-
-                try {
-                    await pool.start();
-                } finally {
-                    // Cache logs before removing the pool
-                    const state = pool.getState();
-                    const allLogs = pool.getLogs(0);
-                    scanLogCache.set(scanId, { logs: allLogs, phase: 'completed' });
-
-                    // Persist all pool logs to database (pool doesn't have incremental flush yet)
-                    saveScanLogs(scanId, allLogs);
-
-                    activePools.delete(scanId);
-                    burpMCP.disconnect();
-                    if (scanLogCache.size > 20) {
-                        const oldest = scanLogCache.keys().next().value;
-                        if (oldest) scanLogCache.delete(oldest);
-                    }
-                }
-            } else {
-                // Single agent mode (original behavior)
-                const agentConfig = {
-                    userId: config.userId,
-                    rateLimit: config.rateLimit || 5,
-                    maxIterations: config.maxIterations,
-                    maxPlanRounds: config.maxPlanRounds,
-                    useNuclei: config.useNuclei || false,
-                    useFfuf: config.useFfuf || false,
-                    idorUsers: config.idorUsers || [],
-                    sessionCookies: config.sessionCookies,
-                    initialRequest: config.initialRequest,
-                    sourcePackagePath: config.sourcePackagePath,
-                    sourceAnalysisMode: config.sourceAnalysisMode,
-                    authStartup: config.authStartup || defaultAuthStartupConfig(),
-                };
-
-                const agent = new OrchestratorAgent(scanId, targetUrl, agentConfig, burpMCP);
-                activeAgents.set(scanId, agent);
-
-                try {
-                    await agent.start();
-                } finally {
-                    // Cache logs before removing the agent so the UI can still display them
-                    const state = agent.getState();
-                    const allLogs = agent.getLogs(0);
-                    scanLogCache.set(scanId, { logs: allLogs, phase: state.phase });
-
-                    // Final flush — agent handles incremental persistence internally;
-                    // this flushes any remaining unflushed logs
-                    agent.flushLogsToDB();
-
-                    activeAgents.delete(scanId);
-                    burpMCP.disconnect();
-                    // Clean up old cache entries (keep last 20)
-                    if (scanLogCache.size > 20) {
-                        const oldest = scanLogCache.keys().next().value;
-                        if (oldest) scanLogCache.delete(oldest);
-                    }
-                }
-            }
-        } else {
-            // Burp MCP is required for real scanning — fail loudly instead of simulating
-            const errorMsg = 'Burp Suite is not connected. Cannot start scan without Burp MCP. Please ensure Burp Suite is running with the PenPard extension loaded (port 9876).';
-            logger.error(errorMsg, { scanId });
-            updateScanStatus(scanId, 'failed', errorMsg);
-            return;
-        }
-
-        logger.info('Web scan completed', { scanId });
-    } catch (error: any) {
-        logger.error('Web scan error', { scanId, error: error.message });
-        updateScanStatus(scanId, 'failed', error.message);
-        throw error;
-    }
+    await scanRuntimeService.startWebScan(scanId, targetUrl, config);
 }
 
 async function startMobileScan(scanId: string, apkPath: string): Promise<void> {
@@ -1422,3 +1045,4 @@ async function startMobileScan(scanId: string, apkPath: string): Promise<void> {
 }
 
 export default router;
+
