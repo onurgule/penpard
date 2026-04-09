@@ -7,19 +7,23 @@
  * 3. EXECUTE: Run each step, collect results
  * 4. REPLAN: Analyze results, create next 5-step plan
  * 5. REPEAT until testing is thorough or max iterations reached
+ *
+ * Ownership split (post-refactor):
+ *   - OrchestratorScanState: owns all mutable per-scan execution state
+ *   - OrchestratorSingleAgentHarness: owns the execution loop, phase machine,
+ *     pause polling, iteration counting, checkpoint scheduling
+ *   - OrchestratorAgent: owns reasoning — prompt building, LLM interaction,
+ *     plan creation, tool selection, finding detection, instruction analysis
  */
 
-import { BurpMCPClient } from '../services/burp-mcp';
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
-import { db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
 import { logger } from '../utils/logger';
 import path from 'path';
 import { mindsetService, MindsetTTP } from '../services/mindset-service';
 import { analyzeSource, buildAgentContextBlock } from '../services/source-analysis/SourceAnalysisService';
 import { SourceAnalysisMode } from '../services/source-analysis/SourceAnalysisMode';
 import { AuthStateManager, AuthStartupConfig, AuthStartupInventory } from '../services/auth';
-import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
 import { EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
 import { ScanRuntimeCheckpoint } from '../services/runtime/ScanRuntimeCheckpointService';
 import {
@@ -27,6 +31,7 @@ import {
     buildContinuationScopeMessage,
     buildOperatorInstructionMessages,
 } from '../prompts/orchestratorPrompts';
+import { createBurpToolHandlers, BurpToolClient } from './orchestrator/OrchestratorBurpToolHandlers';
 import { OrchestratorBrowserSession } from './orchestrator/OrchestratorBrowserSession';
 import { OrchestratorBrowserTools } from './orchestrator/OrchestratorBrowserTools';
 import { OrchestratorContextSignals } from './orchestrator/OrchestratorContextSignals';
@@ -40,7 +45,9 @@ import { OrchestratorPlanner } from './orchestrator/OrchestratorPlanner';
 import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
 import { OrchestratorScanSurface } from './orchestrator/OrchestratorScanSurface';
 import { buildInitialRequestContext, type OrchestratorInitialRequestContext } from './orchestrator/OrchestratorInitialRequestContext';
-import { OrchestratorSingleAgentHarness } from './orchestrator/OrchestratorSingleAgentHarness';
+import { OrchestratorSingleAgentHarness, HarnessAgentContract } from './orchestrator/OrchestratorSingleAgentHarness';
+import { OrchestratorScanState } from './orchestrator/OrchestratorScanState';
+import { OrchestratorPersistenceSeam } from './orchestrator/OrchestratorPersistenceSeam';
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
 import { OrchestratorToolRegistry } from './orchestrator/OrchestratorToolRegistry';
 import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
@@ -355,31 +362,13 @@ export class OrchestratorAgent {
     private scanId: string;
     private targetUrl: string;
     private config: ScanConfig;
-    private burp: BurpMCPClient;
+    private burp: BurpToolClient;
 
-    // Agent-native reasoning state
-    private isRunning: boolean = false;
-    private isPaused: boolean = false;
-    private phase: AgentPhase = 'planning';
-    private humanCommandQueue: string[] = [];
-    private findings: any[] = [];
-    private conversationHistory: ConversationMessage[] = [];
-    private maxIterations: number;
-
-    // Planning state (agent-native: the agent decides what to test next)
-    private currentPlan: AttackPlan | null = null;
-    private planRound: number = 0;
-    /** 0 = no fixed limit (model decides); otherwise max planning rounds. */
-    private maxPlanRounds: number = 0;
-    private stepResults: StepExecutionResult[] = [];
-    private rateLimitPauseUntil: Date | null = null;
-    private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
+    // ── State container — owns all mutable per-scan state ──
+    public readonly state: OrchestratorScanState;
 
     // Incremental log persistence — flush to DB periodically to survive crashes
     private readonly logLedger: OrchestratorLogLedger;
-
-    // Cached system prompt (always index 0 in conversationHistory)
-    private systemPromptContent: string = '';
 
     // Instruction analysis — LLM-parsed understanding of operator's scan instructions
     private isFocusedScope: boolean = false;
@@ -408,23 +397,30 @@ export class OrchestratorAgent {
     private readonly harness: OrchestratorSingleAgentHarness<ContinueScanOptions>;
     private readonly initialRequestContext: OrchestratorInitialRequestContext | null;
     private readonly domainCoordinator: OrchestratorDomainCoordinator;
+    private readonly persistence: OrchestratorPersistenceSeam;
+
+    private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
 
     constructor(
         scanId: string,
         targetUrl: string,
         config: ScanConfig,
-        burp: BurpMCPClient,
+        burp: BurpToolClient,
         private readonly hooks: OrchestratorAgentHooks = {},
     ) {
         this.scanId = scanId;
         this.targetUrl = targetUrl;
         this.config = config;
         this.burp = burp;
-        this.maxIterations = config.maxIterations ?? 50;
-        // maxPlanRounds: 0 or undefined = no fixed limit (model decides)
+
+        // ── Initialize state container ──
+        const maxIterations = config.maxIterations ?? 50;
         const requested = config.maxPlanRounds ?? 0;
-        this.maxPlanRounds = requested > 0 ? requested : 0;
+        const maxPlanRounds = requested > 0 ? requested : 0;
+        this.state = new OrchestratorScanState({ maxIterations, maxPlanRounds });
+
         this.logLedger = new OrchestratorLogLedger({ scanId });
+        this.persistence = new OrchestratorPersistenceSeam();
         this.initialRequestContext = config.initialRequest?.trim()
             ? buildInitialRequestContext(config.initialRequest.trim())
             : null;
@@ -474,7 +470,7 @@ export class OrchestratorAgent {
             maxSameRequest: 2,
             rateLimitPauseMs: this.RATE_LIMIT_PAUSE_MS,
             setRateLimitPauseUntil: (until) => {
-                this.rateLimitPauseUntil = until;
+                this.state.setRateLimitPauseUntil(until);
             },
             onEndpointDiscovered: (url) => this.scanSurface.noteRequestDiscoveredEndpoint(url),
             onManagedAuthRefreshed: (identityId) => this.browserSession.seedBrowserFromAuthManager(identityId),
@@ -485,7 +481,7 @@ export class OrchestratorAgent {
             log: (channel, message) => this.log(channel as any, message),
             getLastExchange: () => this.requestExecutor.getLastExchange(),
             onFindingSaved: (finding) => {
-                this.findings.push(finding);
+                this.state.pushFinding(finding);
             },
         });
         this.scanStatus = new OrchestratorScanStatus(scanId);
@@ -494,36 +490,21 @@ export class OrchestratorAgent {
             scanSurface: this.scanSurface,
             log: (channel, message) => this.log(channel, message),
             onFrontendDelta: (trigger, newEndpoints) => {
-                this.conversationHistory.push({
+                this.state.pushMessage({
                     role: 'user',
                     content: `[SYSTEM] Frontend analysis update (after ${trigger}): New endpoints: ${newEndpoints.join(', ')}`,
                 });
             },
         });
+        // Burp passthrough handlers are created by the extracted factory
+        const burpHandlers = createBurpToolHandlers({ burp, targetUrl });
         this.toolRegistry = new OrchestratorToolRegistry({
             handlers: {
+                // Burp passthrough tools (owned by OrchestratorBurpToolHandlers)
+                ...burpHandlers,
+                // Request executor (owns auth-aware HTTP dispatch)
                 send_http_request: (toolCall) => this.requestExecutor.execute(toolCall),
-                get_proxy_history: async (toolCall) => ({
-                    items: normalizeProxyHistoryItems(
-                        await this.burp.callTool('get_proxy_history', { ...toolCall.args, excludePenPard: true }),
-                    ),
-                }),
-                get_session_cookies: async (toolCall) => normalizeSessionCookieResult(
-                    await this.burp.callTool('get_session_cookies', { host: toolCall.args?.host || new URL(this.targetUrl).hostname }),
-                ),
-                get_cookies_and_auth_for_host: async (toolCall) => ({
-                    entries: normalizeCookiesAndAuthEntries(await this.burp.callTool('get_cookies_and_auth_for_host', {
-                        host: toolCall.args?.host || new URL(this.targetUrl).hostname,
-                        maxItems: toolCall.args?.maxItems ?? 50,
-                    })),
-                }),
-                send_to_scanner: (toolCall) => this.burp.callTool('send_to_scanner', toolCall.args),
-                get_sitemap: (toolCall) => this.burp.callTool('get_sitemap', toolCall.args || {}),
-                spider_url: (toolCall) => this.burp.callTool('spider_url', toolCall.args),
-                check_authorization: (toolCall) => this.burp.callTool('check_authorization', toolCall.args),
-                generate_payloads: (toolCall) => this.burp.callTool('generate_payloads', toolCall.args),
-                extract_links: (toolCall) => this.burp.callTool('extract_links', toolCall.args),
-                analyze_response: async () => ({ status: 'Analysis requested - handled by LLM' }),
+                // Browser tools (owned by OrchestratorBrowserTools)
                 browser_navigate: (toolCall) => this.browserTools.navigate(toolCall),
                 browser_get_page_state: () => this.browserTools.getPageState(),
                 browser_get_frontend_analysis: () => this.browserTools.getFrontendAnalysis(),
@@ -531,11 +512,11 @@ export class OrchestratorAgent {
                 browser_evaluate_js: (toolCall) => this.browserTools.evaluateJs(toolCall),
                 browser_screenshot: () => this.browserTools.screenshot(),
                 browser_correlate_burp: () => this.browserTools.correlateBurp(),
+                // Domain engines (owned by OrchestratorDomainCoordinator)
                 harvest_traffic: () => this.domainCoordinator.executeHarvestTraffic(),
                 get_hypotheses: (toolCall) => this.domainCoordinator.executeGetHypotheses(toolCall),
                 get_coverage: () => this.domainCoordinator.executeGetCoverage(),
                 repeater_test: (toolCall) => this.domainCoordinator.executeRepeaterTest(toolCall),
-                none: async () => ({ status: 'No tool call (step complete)' }),
             },
         });
         this.llmResponseParser = new OrchestratorLlmResponseParser(
@@ -562,7 +543,7 @@ export class OrchestratorAgent {
                 const guardResult = evaluateToolExecutionGuard({
                     toolName: toolCall.tool,
                     isFocusedScope: this.isFocusedScope,
-                    rateLimitPauseUntil: this.rateLimitPauseUntil,
+                    rateLimitPauseUntil: this.state.rateLimitPauseUntil,
                 });
 
                 if (!guardResult.allowed && guardResult.logMessage) {
@@ -573,12 +554,29 @@ export class OrchestratorAgent {
             },
             handlers: this.toolRegistry.getHandlers(),
         });
-        this.harness = new OrchestratorSingleAgentHarness<ContinueScanOptions>({
+
+        // ── Build the harness agent contract ──
+        const agentContract: HarnessAgentContract<ContinueScanOptions> = {
             beforeRun: (kind) => this.prepareRun(kind),
-            runInitial: () => this.executeInitialRun(),
-            runContinuation: (options) => this.executeContinuationRun(options),
-            handleFailure: (kind, error) => this.handleRunFailure(kind, error),
             finalizeRun: () => this.finalizeRun(),
+            handleFailure: (kind, error) => this.handleRunFailure(kind, error),
+            runInit: () => this.phaseInit(),
+            prepareContinuation: (opts) => this.prepareContinuation(opts),
+            createPlan: () => this.createPlanForHarness(),
+            executeStep: (step, stepToolResults, totalActions) => this.executeStepForHarness(step, stepToolResults, totalActions),
+            shouldContinueTesting: (roundResults) => this.shouldContinueTesting(roundResults),
+            processHumanCommand: (cmd) => this.processHumanCommand(cmd),
+            runPostRoundWork: () => this.runPostRoundWork(),
+            runReporting: () => this.phaseReporting(),
+            runDirectExecution: (instruction, maxRounds) => this.phaseDirectExecution(instruction, maxRounds),
+            log: (channel, message) => this.log(channel, message),
+            persistCheckpoint: (reason) => this.persistRuntimeCheckpoint(reason),
+            delay: (ms) => this.delay(ms),
+        };
+
+        this.harness = new OrchestratorSingleAgentHarness<ContinueScanOptions>({
+            state: this.state,
+            agent: agentContract,
         });
     }
 
@@ -623,12 +621,8 @@ export class OrchestratorAgent {
         return this.contextSignals.buildOperatorInstructionsReminder(this.config.customSystemPrompt, this.instructionAnalysis);
     }
 
-    private isStoppedPhase(): boolean {
-        return this.phase === 'stopped';
-    }
-
     private async finalizeRun(): Promise<void> {
-        this.isRunning = false;
+        this.state.setRunning(false);
         await this.persistRuntimeCheckpoint('run-finalizing');
         try {
             await this.browserSession.cleanup();
@@ -644,13 +638,13 @@ export class OrchestratorAgent {
     }
 
     private prepareRun(kind: 'initial' | 'continuation'): void {
-        this.isRunning = true;
+        this.state.setRunning(true);
         this.contextSignals.resetBudgetSignals();
         if (kind === 'initial') {
             this.log('system', `Orchestrator Agent started for target: ${this.targetUrl}`);
             return;
         }
-        this.phase = 'planning';
+        this.state.setPhase('planning');
     }
 
     public async start() {
@@ -666,37 +660,156 @@ export class OrchestratorAgent {
     }
 
     private handleRunFailure(kind: 'initial' | 'continuation', error: any): void {
-        if (this.isStoppedPhase()) {
+        if (this.state.isStoppedPhase()) {
             return;
         }
 
-        this.phase = 'failed';
+        this.state.transitionToFailed();
         const message = error?.message || String(error);
         this.log('error', kind === 'continuation' ? `Continuation failed: ${message}` : `Critical Failure: ${message}`);
         this.scanStatus.failed(message);
     }
 
-    private async executeInitialRun(): Promise<void> {
-        this.scanStatus.initializing();
+    // ═════════════════════════════════════════════════════════════
+    //  Agent contract: harness calls these at loop boundaries
+    // ═════════════════════════════════════════════════════════════
 
-        if (!this.targetUrl) {
-            throw new Error('Target URL is required');
+    /**
+     * Create a plan for the harness. Returns structured decision:
+     * - { kind: 'plan', plan } — created a new plan
+     * - { kind: 'complete' } — LLM says testing is done
+     * - null — fallback plan created
+     */
+    private async createPlanForHarness(): Promise<{ kind: 'plan'; plan: AttackPlan } | { kind: 'complete' } | null> {
+        const decision = await this.planner.createPlan({
+            systemPrompt: this.state.systemPromptContent,
+            conversationHistory: this.state.conversationHistory,
+            rateLimitPauseUntil: this.state.rateLimitPauseUntil,
+            planRound: this.state.planRound,
+            findingsCount: this.state.findingsCount,
+            endpointsSummary: this.scanSurface.getDiscoveredEndpointCount() > 0
+                ? this.scanSurface.getDiscoveredEndpoints().slice(0, 30).join(', ')
+                : 'None yet - initial discovery needed',
+            previousResults: this.state.stepResults.length > 0
+                ? this.state.stepResults.slice(-10).map((result) =>
+                    `Step "${result.step.objective}": ${result.step.result || 'completed'} (${result.toolResults.length} tool calls)`,
+                ).join('\n')
+                : 'This is the first round - no previous results.',
+            authStartupSummary: this.scanSurface.getStartupAuthInventory()
+                ? this.scanSurface.buildStartupAuthSummary()
+                : 'No startup auth inventory was captured.',
+            authStartupDirective: this.buildAuthStartupDirective(),
+            operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
+            mindsetTtps: this.mindsetTTPs.length > 0
+                ? mindsetService.formatTTPsForPlanning(this.mindsetTTPs)
+                : 'None loaded — no past reports analyzed yet.',
+        });
+
+        if (!decision) {
+            return { kind: 'plan', plan: this.createFallbackPlan() };
         }
 
-        await this.phaseInit();
-        if (!this.isRunning || this.isStoppedPhase()) {
-            return;
+        if (decision.kind === 'complete') {
+            return { kind: 'complete' };
         }
 
-        await this.phaseIterativeTesting();
-        if (!this.isRunning || this.isStoppedPhase()) {
-            return;
-        }
-
-        await this.phaseReporting();
+        return { kind: 'plan', plan: decision.plan };
     }
 
-    private async executeContinuationRun(opts: ContinueScanOptions): Promise<void> {
+    /**
+     * Execute a single step within a plan round. Called by the harness per-action.
+     * Returns a normalized result that the harness can interpret:
+     *   - stepFindings: findings discovered
+     *   - toolResultSummary: string summary of tool result
+     *   - stepComplete: whether the step is done
+     */
+    private async executeStepForHarness(
+        step: PlanStep,
+        previousResults: string[],
+        totalActions: number,
+    ): Promise<{ stepFindings: any[]; toolResultSummary: string | null; stepComplete: boolean }> {
+        const response = await this.askLLMForStepExecution(step, previousResults, totalActions);
+
+        if (!response) {
+            return { stepFindings: [], toolResultSummary: null, stepComplete: true };
+        }
+
+        // Log thought
+        if (response.thought) {
+            this.log('agent', `Thought: ${response.thought.substring(0, 200)}...`);
+        }
+        this.logReflection(response.reflection);
+
+        // Process findings
+        const stepFindings: any[] = [];
+        if (response.finding) {
+            this.saveFinding(response.finding);
+            stepFindings.push(response.finding);
+        }
+        if (response.findings && response.findings.length > 0) {
+            for (const finding of response.findings) {
+                this.saveFinding(finding);
+                stepFindings.push(finding);
+            }
+        }
+
+        // Execute action
+        if (response.action && response.action.tool) {
+            this.log('tool', `→ ${response.action.tool}: ${JSON.stringify(response.action.args).substring(0, 150)}`);
+            const result = await this.executeToolCall(response.action);
+
+            // Analyze for auto-detected vulns
+            if (result && !result.error && !result.skipped) {
+                this.findingTracker.analyzeResponseForVulns(response.action, result);
+            }
+
+            const resultSummary = JSON.stringify(result).substring(0, 1500);
+            const toolResultSummary = `[${response.action.tool}] ${resultSummary}`;
+
+            // Feed result back to conversation
+            this.state.pushMessage({
+                role: 'user',
+                content: `Tool result for step "${step.objective}": ${resultSummary}`
+            });
+
+            return { stepFindings, toolResultSummary, stepComplete: false };
+        } else if (response.answer) {
+            // Step is done
+            this.log('agent', `Step complete: ${response.answer.substring(0, 100)}`);
+            return { stepFindings, toolResultSummary: null, stepComplete: true };
+        } else {
+            // No action, no answer - LLM is done with this step
+            return { stepFindings, toolResultSummary: null, stepComplete: true };
+        }
+    }
+
+    /**
+     * Post-round work: harvest cycle and delta frontend analysis.
+     * Called by the harness after each round's steps complete.
+     */
+    private async runPostRoundWork(): Promise<void> {
+        // ── HARVEST: Pull and classify Burp traffic after round ──
+        try {
+            await this.domainCoordinator.runHarvestCycle();
+            const harvestSummary = this.domainCoordinator.getHarvestConversationSummary();
+            this.state.pushMessage({ role: 'user', content: harvestSummary });
+        } catch (e: any) {
+            this.log('error', `Harvest cycle failed (non-fatal): ${e.message}`);
+        }
+
+        // ── DELTA FRONTEND ANALYSIS: Check for new state after round ──
+        try {
+            await this.browserTools.runDeltaFrontendAnalysis('round-end');
+        } catch (e: any) {
+            this.log('error', `Delta analysis failed (non-fatal): ${e.message}`);
+        }
+    }
+
+    /**
+     * Prepare the agent state for a continuation run.
+     * Called by the harness before the continuation loop begins.
+     */
+    private async prepareContinuation(opts: ContinueScanOptions): Promise<void> {
         const extraRounds = Math.min(Math.max(opts.iterations, 1), 20);
 
         this.log('system', `═══ CONTINUING SCAN ═══`);
@@ -705,8 +818,8 @@ export class OrchestratorAgent {
         this.scanStatus.testing();
 
         if (opts.existingFindings) {
-            this.findings = opts.existingFindings;
-            this.log('system', `Restored ${this.findings.length} existing findings`);
+            this.state.setFindings(opts.existingFindings);
+            this.log('system', `Restored ${this.state.findingsCount} existing findings`);
         }
         if (opts.existingEndpoints) {
             const restored = this.scanSurface.restoreDiscoveredEndpoints(opts.existingEndpoints);
@@ -726,7 +839,7 @@ export class OrchestratorAgent {
         }
         this.log('system', '✓ LLM: Connected');
 
-        if (this.conversationHistory.length === 0) {
+        if (this.state.conversationHistory.length === 0) {
             const promptTemplate = await this.loadPromptTemplate();
             const accountsJson = JSON.stringify(this.buildAccountPromptContext(), null, 2);
             let systemPrompt = promptTemplate
@@ -737,26 +850,26 @@ export class OrchestratorAgent {
                 systemPrompt += this.initialRequestContext.systemPromptAppendix;
             }
 
-            this.systemPromptContent = systemPrompt;
-            this.conversationHistory.push({ role: 'system', content: systemPrompt });
+            this.state.setSystemPromptContent(systemPrompt);
+            this.state.pushMessage({ role: 'system', content: systemPrompt });
         }
 
         if (this.initialRequestContext) {
-            this.conversationHistory.push(...this.initialRequestContext.continuationMessages);
+            this.state.pushMessages(this.initialRequestContext.continuationMessages);
             this.log('system', `✓ ${this.initialRequestContext.logSummary}`);
         }
 
-        const findingsSummary = this.findings.length > 0
-            ? this.findings.map((finding) => `- [${finding.severity?.toUpperCase()}] ${finding.name}`).join('\n')
+        const findingsSummary = this.state.findingsCount > 0
+            ? this.state.findings.map((finding: any) => `- [${finding.severity?.toUpperCase()}] ${finding.name}`).join('\n')
             : 'No findings yet.';
 
-        this.conversationHistory.push({
+        this.state.pushMessage({
             role: 'user',
             content: `⚠️ [OPERATOR COMMAND — SCAN CONTINUATION] The operator has resumed this completed scan with new instructions:
 
 INSTRUCTION: ${opts.instruction}
 
-PREVIOUS FINDINGS (${this.findings.length} total):
+PREVIOUS FINDINGS (${this.state.findingsCount} total):
 ${findingsSummary}
 
 DISCOVERED ENDPOINTS:
@@ -769,74 +882,58 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
         if (this.instructionAnalysis?.is_focused) {
             this.isFocusedScope = true;
-            this.conversationHistory.push(buildContinuationScopeMessage(this.instructionAnalysis));
+            this.state.pushMessage(buildContinuationScopeMessage(this.instructionAnalysis));
         }
 
-        const savedRound = this.planRound;
-        const savedMaxPlanRounds = this.maxPlanRounds;
-        const savedMaxIterations = this.maxIterations;
-        this.planRound = 0;
-        this.maxPlanRounds = extraRounds;
-        this.maxIterations = extraRounds * 10;
+        // Swap budget for continuation scope
+        const restoreBudget = this.state.swapContinuationBudget(extraRounds);
         await this.persistRuntimeCheckpoint('continuation-prepared');
 
-        if (opts.planningEnabled) {
-            await this.phaseIterativeTesting();
-        } else {
-            await this.phaseDirectExecution(opts.instruction, extraRounds);
-        }
-
-        const completedContinuationRounds = opts.planningEnabled ? this.planRound : 0;
-        this.planRound = savedRound + completedContinuationRounds;
-        this.maxPlanRounds = savedMaxPlanRounds;
-        this.maxIterations = savedMaxIterations;
-
-        if (!this.isStoppedPhase()) {
-            this.log('system', '═══ CONTINUATION COMPLETE ═══');
-            this.log('system', `Total findings after continuation: ${this.findings.length}`);
-        }
+        // Store the restorer and resolved max rounds on the opts so the run method can use them
+        (opts as any)._restoreBudget = restoreBudget;
+        (opts as any)._resolvedMaxRounds = extraRounds;
     }
 
     /**
      * Direct execution mode — no planning, just let LLM execute instructions with tools.
      */
     private async phaseDirectExecution(_instruction: string, maxRounds: number) {
-        this.phase = 'executing';
+        this.state.setPhase('executing');
         this.scanStatus.testing();
         this.log('system', '═══ DIRECT EXECUTION MODE (No Planning) ═══');
 
         let totalActions = 0;
         const maxActions = maxRounds * 10;
 
-        for (let round = 0; round < maxRounds && this.isRunning && totalActions < maxActions; round++) {
+        for (let round = 0; round < maxRounds && this.state.isRunning && totalActions < maxActions; round++) {
             // Process any human commands
-            while (this.humanCommandQueue.length > 0) {
-                const cmd = this.humanCommandQueue.shift()!;
+            while (this.state.hasHumanCommands()) {
+                const cmd = this.state.shiftHumanCommand()!;
                 await this.processHumanCommand(cmd);
             }
 
             // Handle pause
-            while (this.isPaused && this.isRunning) {
+            while (this.state.isPaused && this.state.isRunning) {
                 await this.delay(1000);
             }
 
-            if (!this.isRunning) break;
+            if (!this.state.isRunning) break;
 
             this.log('system', `Direct execution round ${round + 1}/${maxRounds}`);
 
             // Rate limit protection
-            if (this.rateLimitPauseUntil && new Date() < this.rateLimitPauseUntil) {
-                const waitMs = this.rateLimitPauseUntil.getTime() - Date.now();
+            if (this.state.isRateLimited()) {
+                const waitMs = this.state.getRateLimitWaitMs();
                 this.log('system', `Rate limited. Waiting ${Math.ceil(waitMs / 1000)}s...`);
                 await this.delay(waitMs);
-                this.rateLimitPauseUntil = null;
+                this.state.clearRateLimitPause();
             }
 
             try {
                 const parsed = await this.planner.executeDirectInstructionTurn({
-                    systemPrompt: this.systemPromptContent,
-                    conversationHistory: this.conversationHistory,
-                    rateLimitPauseUntil: this.rateLimitPauseUntil,
+                    systemPrompt: this.state.systemPromptContent,
+                    conversationHistory: this.state.conversationHistory,
+                    rateLimitPauseUntil: this.state.rateLimitPauseUntil,
                     round: round + 1,
                     maxRounds,
                 });
@@ -861,7 +958,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
                 if (parsed.action) {
                     const result = await this.executeToolCall(parsed.action);
                     totalActions++;
-                    this.conversationHistory.push({
+                    this.state.pushMessage({
                         role: 'user',
                         content: `Tool result for ${parsed.action.tool}: ${JSON.stringify(result).slice(0, 3000)}`
                     });
@@ -869,7 +966,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
                     for (const action of parsed.actions) {
                         const result = await this.executeToolCall(action);
                         totalActions++;
-                        this.conversationHistory.push({
+                        this.state.pushMessage({
                             role: 'user',
                             content: `Tool result for ${action.tool}: ${JSON.stringify(result).slice(0, 3000)}`
                         });
@@ -893,9 +990,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     }
 
     public stop() {
-        this.isRunning = false;
-        this.isPaused = false;
-        this.phase = 'stopped';
+        this.state.transitionToStopped();
         this.log('system', 'Stop command received. Terminating agent...');
         this.scanStatus.stopped('Scan stopped by user');
         // Cleanup browser session
@@ -903,32 +998,33 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     }
 
     public pause() {
-        if (!this.isRunning || this.isPaused) return;
-        this.isPaused = true;
+        if (!this.state.isRunning || this.state.isPaused) return;
+        this.state.setPaused(true);
         this.log('system', '⏸ Scan paused by user.');
     }
 
     public resume() {
-        if (!this.isPaused) return;
-        this.isPaused = false;
+        if (!this.state.isPaused) return;
+        this.state.setPaused(false);
         this.log('system', '▶ Scan resumed by user.');
     }
 
     public handleUserCommand(command: string) {
         this.log('human', `User Command: ${command}`);
-        this.humanCommandQueue.push(command);
+        this.state.pushHumanCommand(command);
     }
 
     public getState() {
         const loopState = this.getPentesterLoopState();
+        const stateSnapshot = this.state.getStateSnapshot();
         return {
-            phase: this.phase,
-            isRunning: this.isRunning,
-            isPaused: this.isPaused,
+            phase: stateSnapshot.phase,
+            isRunning: stateSnapshot.isRunning,
+            isPaused: stateSnapshot.isPaused,
             logsCount: this.logLedger.count,
-            findingsCount: this.findings.length,
-            planRound: this.planRound,
-            currentPlan: this.currentPlan,
+            findingsCount: stateSnapshot.findingsCount,
+            planRound: stateSnapshot.planRound,
+            currentPlan: stateSnapshot.currentPlan,
             ...loopState,
         };
     }
@@ -939,30 +1035,23 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
     public getRuntimeCheckpointSnapshot(reason: string): ScanRuntimeCheckpoint {
         const domainCheckpoint = this.domainCoordinator.getCheckpointSummary();
+        const stateCheckpoint = this.state.getCheckpointSnapshot();
 
         return {
             version: 1,
             executionMode: 'single-agent',
             reason,
             updatedAt: new Date().toISOString(),
-            phase: this.phase,
-            isRunning: this.isRunning,
-            isPaused: this.isPaused,
-            planRound: this.planRound,
-            maxPlanRounds: this.maxPlanRounds,
-            maxIterations: this.maxIterations,
-            findingsCount: this.findings.length,
+            phase: stateCheckpoint.phase,
+            isRunning: stateCheckpoint.isRunning,
+            isPaused: stateCheckpoint.isPaused,
+            planRound: stateCheckpoint.planRound,
+            maxPlanRounds: stateCheckpoint.maxPlanRounds,
+            maxIterations: stateCheckpoint.maxIterations,
+            findingsCount: stateCheckpoint.findingsCount,
             discoveredEndpointsCount: this.scanSurface.getDiscoveredEndpointCount(),
             discoveredEndpointsPreview: this.scanSurface.getDiscoveredEndpointPreview(25),
-            currentPlan: this.currentPlan ? {
-                round: this.currentPlan.round,
-                steps: this.currentPlan.steps.map((step) => ({
-                    step: step.step,
-                    objective: step.objective,
-                    status: step.status,
-                    tools: [...step.tools],
-                })),
-            } : null,
+            currentPlan: stateCheckpoint.currentPlan,
             harvested: domainCheckpoint.harvested,
             hypotheses: domainCheckpoint.hypotheses,
             coverage: domainCheckpoint.coverage,
@@ -995,7 +1084,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     // ═══════════════════════════════════════════════════════════
 
     private async phaseInit() {
-        this.phase = 'planning';
+        this.state.setPhase('planning');
         this.scanStatus.planning();
         this.log('system', '═══ PHASE: INITIALIZATION ═══');
 
@@ -1107,20 +1196,20 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
             systemPrompt += this.initialRequestContext.systemPromptAppendix;
         }
 
-        this.systemPromptContent = systemPrompt;
-        this.conversationHistory.push({
+        this.state.setSystemPromptContent(systemPrompt);
+        this.state.pushMessage({
             role: 'system',
             content: systemPrompt
         });
 
         if (this.scanSurface.getStartupAuthInventory()) {
-            this.conversationHistory.push({
+            this.state.pushMessage({
                 role: 'user',
                 content: `[SYSTEM] Web Scan auth startup completed before planning.\n${this.scanSurface.buildStartupAuthSummary()}\nTreat this inventory as established evidence and keep planning auth-surface-first in round 1 before generic crawling or fuzzing.`,
             });
         }
         if (this.scanSurface.getEndpointInventory()) {
-            this.conversationHistory.push({
+            this.state.pushMessage({
                 role: 'user',
                 content: `[SYSTEM] Endpoint intelligence captured before planning.\n${this.scanSurface.buildEndpointInventorySummary()}\nUse this for round 1 auth-surface-first planning and avoid already-filtered noise.`,
             });
@@ -1137,16 +1226,19 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         // Inject operator instructions into conversation based on analysis
         if (this.config.customSystemPrompt) {
             const instr = this.config.customSystemPrompt;
-            this.conversationHistory.push(...buildOperatorInstructionMessages(instr, this.instructionAnalysis));
+            this.state.pushMessages(buildOperatorInstructionMessages(instr, this.instructionAnalysis));
 
             this.log('system', `✓ Operator instructions processed: "${instr.substring(0, 100)}${instr.length > 100 ? '...' : ''}"`);
         }
 
         // Request sent from Burp "Send to PenPard" — parse and inject structured data
         if (this.initialRequestContext) {
-            this.conversationHistory.push(...this.initialRequestContext.initialMessages);
+            this.state.pushMessages(this.initialRequestContext.initialMessages);
             this.log('system', `✓ ${this.initialRequestContext.logSummary}`);
         }
+
+        // Set scan status to testing — harness loop will start after this
+        this.scanStatus.testing();
 
         await this.persistRuntimeCheckpoint('initialization-complete');
     }
@@ -1183,199 +1275,9 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
     private buildAuthStartupDirective(): string {
         return this.contextSignals.buildAuthStartupDirective(
-            this.planRound,
+            this.state.planRound,
             this.config.authStartup?.mode || 'no_credentials',
         );
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  PHASE: ITERATIVE PLAN → EXECUTE → REPLAN
-    // ═══════════════════════════════════════════════════════════
-
-    private async phaseIterativeTesting() {
-        this.phase = 'planning';
-        this.scanStatus.testing();
-        this.log('system', '═══ PHASE: ITERATIVE TESTING ═══');
-
-        let totalActions = 0;
-
-        while (this.isRunning && (this.maxPlanRounds === 0 || this.planRound < this.maxPlanRounds) && totalActions < this.maxIterations) {
-            // Handle pause
-            while (this.isPaused && this.isRunning) {
-                if (this.humanCommandQueue.length > 0) {
-                    const cmd = this.humanCommandQueue.shift()!;
-                    await this.processHumanCommand(cmd);
-                }
-                await this.delay(1000);
-            }
-            if (!this.isRunning) break;
-
-            // ── PLAN ──
-            this.planRound++;
-            this.phase = 'planning';
-            this.log('system', `\n╔══════════════════════════════════════╗`);
-            this.log('system', this.maxPlanRounds > 0
-                ? `║  PLANNING ROUND ${this.planRound}/${this.maxPlanRounds}              ║`
-                : `║  PLANNING ROUND ${this.planRound} (model decides)     ║`);
-            this.log('system', `╚══════════════════════════════════════╝`);
-
-            const plan = await this.createPlan();
-            if (!plan) {
-                this.log('system', 'LLM indicates testing is complete or failed to create plan.');
-                break;
-            }
-
-            this.currentPlan = plan;
-            this.log('agent', `Plan analysis: ${plan.analysis.substring(0, 200)}...`);
-
-            for (const step of plan.steps) {
-                this.log('plan', `Step ${step.step}: ${step.objective} [${step.tools.join(', ')}]`);
-            }
-
-            // ── EXECUTE ──
-            this.phase = 'executing';
-            const roundResults: StepExecutionResult[] = [];
-
-            for (let i = 0; i < plan.steps.length; i++) {
-                if (!this.isRunning || totalActions >= this.maxIterations) break;
-
-                // Handle pause between steps
-                while (this.isPaused && this.isRunning) {
-                    await this.delay(1000);
-                }
-                if (!this.isRunning) break;
-
-                // Handle human commands
-                if (this.humanCommandQueue.length > 0) {
-                    const cmd = this.humanCommandQueue.shift()!;
-                    await this.processHumanCommand(cmd);
-                }
-
-                const step = plan.steps[i];
-                step.status = 'executing';
-
-                this.log('system', `\n── Executing Step ${step.step}: ${step.objective} ──`);
-
-                const stepFindings: any[] = [];
-                const stepToolResults: string[] = [];
-
-                // Each step can do up to 5 tool calls (multi-step execution)
-                const maxActionsPerStep = 5;
-                let stepActions = 0;
-
-                while (stepActions < maxActionsPerStep && this.isRunning && totalActions < this.maxIterations) {
-                    await this.delay(2000); // Rate limiting between LLM calls
-
-                    try {
-                        const response = await this.askLLMForStepExecution(step, stepToolResults, totalActions);
-                        totalActions++;
-                        stepActions++;
-
-                        if (!response) {
-                            this.log('error', 'No valid response from LLM for step execution');
-                            break;
-                        }
-
-                        // Log thought
-                        if (response.thought) {
-                            this.log('agent', `Thought: ${response.thought.substring(0, 200)}...`);
-                        }
-                        this.logReflection(response.reflection);
-
-                        // Process findings
-                        if (response.finding) {
-                            this.saveFinding(response.finding);
-                            stepFindings.push(response.finding);
-                        }
-                        if (response.findings && response.findings.length > 0) {
-                            for (const finding of response.findings) {
-                                this.saveFinding(finding);
-                                stepFindings.push(finding);
-                            }
-                        }
-
-                        // Execute action
-                        if (response.action && response.action.tool) {
-                            this.log('tool', `→ ${response.action.tool}: ${JSON.stringify(response.action.args).substring(0, 150)}`);
-                            const result = await this.executeToolCall(response.action);
-
-                            // Analyze for auto-detected vulns
-                            if (result && !result.error && !result.skipped) {
-                                this.findingTracker.analyzeResponseForVulns(response.action, result);
-                            }
-
-                            const resultSummary = JSON.stringify(result).substring(0, 1500);
-                            stepToolResults.push(`[${response.action.tool}] ${resultSummary}`);
-
-                            // Feed result back to conversation
-                            this.conversationHistory.push({
-                                role: 'user',
-                                content: `Tool result for step "${step.objective}": ${resultSummary}`
-                            });
-                        } else if (response.answer) {
-                            // Step is done
-                            this.log('agent', `Step complete: ${response.answer.substring(0, 100)}`);
-                            break;
-                        } else {
-                            // No action, no answer - LLM is done with this step
-                            break;
-                        }
-
-                    } catch (e: any) {
-                        this.log('error', `Step execution error: ${e.message}`);
-                        stepToolResults.push(`[ERROR] ${e.message}`);
-                        break;
-                    }
-                }
-
-                step.status = 'completed';
-                step.result = stepFindings.length > 0
-                    ? `Found ${stepFindings.length} vulnerabilities`
-                    : `Completed - ${stepToolResults.length} tool calls`;
-
-                roundResults.push({ step, findings: stepFindings, toolResults: stepToolResults });
-            }
-
-            this.stepResults = [...this.stepResults, ...roundResults];
-
-            // ── HARVEST: Pull and classify Burp traffic after round ──
-            try {
-                await this.domainCoordinator.runHarvestCycle();
-                const harvestSummary = this.domainCoordinator.getHarvestConversationSummary();
-                this.conversationHistory.push({ role: 'user', content: harvestSummary });
-            } catch (e: any) {
-                this.log('error', `Harvest cycle failed (non-fatal): ${e.message}`);
-            }
-
-            // ── DELTA FRONTEND ANALYSIS: Check for new state after round ──
-            try {
-                await this.browserTools.runDeltaFrontendAnalysis('round-end');
-            } catch (e: any) {
-                this.log('error', `Delta analysis failed (non-fatal): ${e.message}`);
-            }
-
-            // ── REPLAN ──
-            this.phase = 'replanning';
-            this.log('system', `\nRound ${this.planRound} complete. Findings this round: ${roundResults.reduce((sum, r) => sum + r.findings.length, 0)}`);
-            this.log('system', `Total findings: ${this.findings.length} | Total actions: ${totalActions}/${this.maxIterations}`);
-            await this.persistRuntimeCheckpoint(`planning-round-${this.planRound}`);
-
-            // Check if LLM wants to continue
-            if (totalActions >= this.maxIterations) {
-                this.log('system', `Reached max iterations (${this.maxIterations}). Moving to reporting.`);
-                break;
-            }
-
-            const shouldContinue = await this.shouldContinueTesting(roundResults);
-            if (!shouldContinue) {
-                this.log('system', 'LLM determined testing is thorough enough.');
-                break;
-            }
-        }
-
-        if (this.maxPlanRounds > 0 && this.planRound >= this.maxPlanRounds) {
-            this.log('system', `Reached max plan rounds (${this.maxPlanRounds}).`);
-        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1383,15 +1285,15 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     // ═══════════════════════════════════════════════════════════
 
     private async phaseReporting() {
-        if (!this.isRunning || this.isStoppedPhase()) {
+        if (!this.state.isRunning || this.state.isStoppedPhase()) {
             return;
         }
 
-        this.phase = 'reporting';
+        this.state.setPhase('reporting');
         this.scanStatus.reporting();
         this.log('system', '═══ PHASE: REPORTING ═══');
 
-        const vulns = db.prepare('SELECT * FROM vulnerabilities WHERE scan_id = ?').all(this.scanId) as any[];
+        const vulns = this.persistence.loadVulnerabilitiesForReporting(this.scanId);
         this.log('agent', `Total findings: ${vulns.length}`);
 
         if (vulns.length > 0) {
@@ -1399,7 +1301,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
                 const vulnList = vulns.map((v: any) => `[${v.severity.toUpperCase()}] ${v.name}`).join('\n');
                 const summary = await llmQueue.enqueue({
                     systemPrompt: 'You are a security report writer. Provide a concise executive summary of the penetration test findings. Include: total vulns by severity, most critical issues, and key recommendations.',
-                    userPrompt: `Target: ${this.targetUrl}\nPlanning rounds completed: ${this.planRound}\nEndpoints tested: ${this.scanSurface.getDiscoveredEndpointCount()}\n\nFindings:\n${vulnList}`
+                    userPrompt: `Target: ${this.targetUrl}\nPlanning rounds completed: ${this.state.planRound}\nEndpoints tested: ${this.scanSurface.getDiscoveredEndpointCount()}\n\nFindings:\n${vulnList}`
                 });
                 this.log('agent', `Executive Summary:\n${summary.text.substring(0, 500)}`);
             } catch (e: any) {
@@ -1408,10 +1310,10 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         }
 
         await this.delay(1000);
-        this.phase = 'completed';
+        this.state.setPhase('completed');
         this.scanStatus.completed();
         this.log('system', `\n═══ SCAN COMPLETED ═══`);
-        this.log('system', `Rounds: ${this.planRound} | Endpoints: ${this.scanSurface.getDiscoveredEndpointCount()} | Findings: ${vulns.length}`);
+        this.log('system', `Rounds: ${this.state.planRound} | Endpoints: ${this.scanSurface.getDiscoveredEndpointCount()} | Findings: ${vulns.length}`);
 
         // Cleanup browser session when scan completes
         await this.browserSession.cleanup();
@@ -1421,46 +1323,10 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     //  LLM INTERACTION: PLAN / EXECUTE / REPLAN
     // ═══════════════════════════════════════════════════════════
 
-    private async createPlan(): Promise<AttackPlan | null> {
-        const decision = await this.planner.createPlan({
-            systemPrompt: this.systemPromptContent,
-            conversationHistory: this.conversationHistory,
-            rateLimitPauseUntil: this.rateLimitPauseUntil,
-            planRound: this.planRound,
-            findingsCount: this.findings.length,
-            endpointsSummary: this.scanSurface.getDiscoveredEndpointCount() > 0
-                ? this.scanSurface.getDiscoveredEndpoints().slice(0, 30).join(', ')
-                : 'None yet - initial discovery needed',
-            previousResults: this.stepResults.length > 0
-                ? this.stepResults.slice(-10).map((result) =>
-                    `Step "${result.step.objective}": ${result.step.result || 'completed'} (${result.toolResults.length} tool calls)`,
-                ).join('\n')
-                : 'This is the first round - no previous results.',
-            authStartupSummary: this.scanSurface.getStartupAuthInventory()
-                ? this.scanSurface.buildStartupAuthSummary()
-                : 'No startup auth inventory was captured.',
-            authStartupDirective: this.buildAuthStartupDirective(),
-            operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
-            mindsetTtps: this.mindsetTTPs.length > 0
-                ? mindsetService.formatTTPsForPlanning(this.mindsetTTPs)
-                : 'None loaded — no past reports analyzed yet.',
-        });
-
-        if (!decision) {
-            return this.createFallbackPlan();
-        }
-
-        if (decision.kind === 'complete') {
-            return null;
-        }
-
-        return decision.plan;
-    }
-
     private createFallbackPlan(): AttackPlan {
         return this.fallbackPlanner.createPlan({
             targetUrl: this.targetUrl,
-            planRound: this.planRound,
+            planRound: this.state.planRound,
             instructionAnalysis: this.instructionAnalysis,
             startupAuthInventory: this.scanSurface.getStartupAuthInventory(),
             authStartupMode: this.config.authStartup?.mode || 'no_credentials',
@@ -1470,9 +1336,9 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
     private async askLLMForStepExecution(step: PlanStep, previousResults: string[], totalActions: number): Promise<LLMResponse | null> {
         return this.planner.askForStepExecution({
-            systemPrompt: this.systemPromptContent,
-            conversationHistory: this.conversationHistory,
-            rateLimitPauseUntil: this.rateLimitPauseUntil,
+            systemPrompt: this.state.systemPromptContent,
+            conversationHistory: this.state.conversationHistory,
+            rateLimitPauseUntil: this.state.rateLimitPauseUntil,
             step,
             previousResults,
             totalActions,
@@ -1483,16 +1349,16 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
     private async shouldContinueTesting(roundResults: StepExecutionResult[]): Promise<boolean> {
         return this.planner.shouldContinueTesting({
-            systemPrompt: this.systemPromptContent,
-            conversationHistory: this.conversationHistory,
-            rateLimitPauseUntil: this.rateLimitPauseUntil,
+            systemPrompt: this.state.systemPromptContent,
+            conversationHistory: this.state.conversationHistory,
+            rateLimitPauseUntil: this.state.rateLimitPauseUntil,
             roundResults,
-            findings: this.findings,
+            findings: this.state.findings,
             discoveredEndpoints: this.scanSurface.getDiscoveredEndpoints(),
             hypothesisStatus: this.domainCoordinator.hypothesisEngine.getSummaryForPrompt(),
             coverageStatus: this.domainCoordinator.coverageTracker.getSummaryForPrompt(),
             operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
-            planRound: this.planRound,
+            planRound: this.state.planRound,
         });
     }
 
@@ -1501,7 +1367,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     // ═══════════════════════════════════════════════════════════
 
     private getBudgetPressureReminder(totalActions: number): string {
-        return this.contextSignals.buildBudgetPressureReminder(totalActions, this.maxIterations);
+        return this.contextSignals.buildBudgetPressureReminder(totalActions, this.state.maxIterations);
     }
 
     private logReflection(reflection?: AgentReflection) {
@@ -1552,7 +1418,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
     private async processHumanCommand(cmd: string) {
         this.log('system', `Processing operator command: ${cmd}`);
-        this.conversationHistory.push({
+        this.state.pushMessage({
             role: 'user',
             content: `⚠️ [OPERATOR COMMAND — HIGHEST PRIORITY] The human operator has issued the following directive. You MUST follow this immediately and override any current plan:\n\n${cmd}\n\nACKNOWLEDGE this command and adjust your next actions accordingly.`
         });
@@ -1572,15 +1438,9 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         }
 
         // Priority 2: Check legacy custom prompts (from Settings > Prompt Templates)
-        try {
-            const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('prompts') as any;
-            if (row) {
-                const prompts = JSON.parse(row.value);
-                const webPrompt = prompts.find((p: any) => p.key === 'web_prompt');
-                if (webPrompt?.template) return webPrompt.template;
-            }
-        } catch (e) {
-            logger.warn('Could not load custom prompts, using default');
+        const legacyTemplate = this.persistence.loadLegacyPromptTemplate();
+        if (legacyTemplate) {
+            return legacyTemplate;
         }
 
         // Priority 3: Built-in default
@@ -1598,7 +1458,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     private handleRateLimitError(e: any) {
         const errorMsg = e.message || String(e);
         if (errorMsg.includes('429') || errorMsg.includes('Too Many Requests') || errorMsg.includes('Resource exhausted')) {
-            this.rateLimitPauseUntil = new Date(Date.now() + this.RATE_LIMIT_PAUSE_MS);
+            this.state.applyRateLimitPause();
             this.log('error', `🚫 LLM Rate Limited! Pausing for 1 minute...`);
         }
     }

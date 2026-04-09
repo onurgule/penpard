@@ -26,8 +26,12 @@ test('start skips reporting when the orchestrator is stopped mid-run', async () 
     let reportingCalls = 0;
 
     (agent as any).phaseInit = async () => {};
-    (agent as any).phaseIterativeTesting = async () => {
+    // The iterative testing loop is now in the harness, but phaseInit succeeds
+    // and scanStatus.testing() is called. The harness then drives the loop.
+    // To simulate a stop mid-run, we override via the createPlanForHarness:
+    (agent as any).createPlanForHarness = async () => {
         agent.stop();
+        return { kind: 'complete' };
     };
     (agent as any).phaseReporting = async () => {
         reportingCalls += 1;
@@ -44,7 +48,7 @@ test('start skips reporting when the orchestrator is stopped mid-run', async () 
 test('stop clears paused state so terminal status is truthful', () => {
     const agent = createAgent();
 
-    (agent as any).isRunning = true;
+    agent.state.setRunning(true);
     agent.pause();
     agent.stop();
 

@@ -1,11 +1,15 @@
 import { saveScanAuthInventory, saveScanEndpointInventory } from '../../db/init';
 import { CoverageTracker } from '../../services/CoverageTracker';
 import { browserService } from '../../services/BrowserService';
-import { BurpMCPClient } from '../../services/burp-mcp';
 import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../../services/EndpointIntelligenceService';
 import { AuthStartupConfig, AuthStartupInventory, AuthStateManager } from '../../services/auth';
 import { WebAuthStartupService } from '../../services/WebAuthStartupService';
 import { OrchestratorBrowserSession } from './OrchestratorBrowserSession';
+
+/** Narrow interface — the scan surface only needs callTool from the Burp client */
+interface ScanSurfaceBurp {
+    callTool(tool: string, args: Record<string, any>): Promise<any>;
+}
 
 type LogFn = (channel: 'system' | 'error' | 'debug', message: string) => void;
 
@@ -24,7 +28,7 @@ interface OrchestratorScanSurfaceOptions {
     scanId: string;
     userId?: number;
     targetUrl: string;
-    burp: BurpMCPClient;
+    burp: ScanSurfaceBurp;
     authManager: AuthStateManager;
     browserSession: OrchestratorBrowserSession;
     coverageTracker: CoverageTracker;
@@ -153,7 +157,7 @@ export class OrchestratorScanSurface {
                 this.options.scanId,
                 this.options.userId || 1,
                 this.options.targetUrl,
-                this.options.burp,
+                this.options.burp as any,
                 this.options.authManager,
                 (kind, message) => this.options.log?.(kind === 'burp' ? 'debug' : kind, message),
             );
@@ -174,7 +178,7 @@ export class OrchestratorScanSurface {
                 const service = new EndpointIntelligenceService(
                     this.options.scanId,
                     this.options.targetUrl,
-                    this.options.burp,
+                    this.options.burp as any,
                     (level, message) => this.options.log?.(
                         level === 'error' ? 'error' : level === 'system' ? 'system' : 'debug',
                         message,
