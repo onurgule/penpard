@@ -1,29 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { OrchestratorAgent } = require('../src/agents/OrchestratorAgent') as typeof import('../src/agents/OrchestratorAgent');
+const { OrchestratorLlmResponseParser } = require('../src/agents/orchestrator/OrchestratorLlmResponseParser') as typeof import('../src/agents/orchestrator/OrchestratorLlmResponseParser');
+const { OrchestratorContextSignals } = require('../src/agents/orchestrator/OrchestratorContextSignals') as typeof import('../src/agents/orchestrator/OrchestratorContextSignals');
 
-function createAgent(maxIterations: number = 12) {
-    return new OrchestratorAgent(
-        'scan-normalizer-test',
-        'https://app.example.com',
-        {
-            rateLimit: 0,
-            maxIterations,
-            useNuclei: false,
-            useFfuf: false,
-            idorUsers: [],
-        },
-        {
-            isAvailable: async () => true,
-            callTool: async () => ({}),
-        } as any,
-    );
+function createParser() {
+    return new OrchestratorLlmResponseParser('https://app.example.com', () => false);
 }
 
 test('parseAgentResponse recovers tool wrappers and preserves reflection fields', () => {
-    const agent = createAgent();
-    const parsed = (agent as any).parseAgentResponse(`Tool call:
+    const parser = createParser();
+    const parsed = parser.parseAgentResponse(`Tool call:
 {
   "name": "sendHttpRequest",
   "arguments": "{\\"url\\":\\"https://app.example.com/api/me\\",\\"method\\":\\"post\\"}",
@@ -42,8 +29,8 @@ test('parseAgentResponse recovers tool wrappers and preserves reflection fields'
 });
 
 test('parseAgentResponse canonicalizes action names and coerces primitive tool input', () => {
-    const agent = createAgent();
-    const parsed = (agent as any).parseAgentResponse(JSON.stringify({
+    const parser = createParser();
+    const parsed = parser.parseAgentResponse(JSON.stringify({
         action: {
             browserNavigate: 'https://app.example.com/account',
         },
@@ -57,8 +44,8 @@ test('parseAgentResponse canonicalizes action names and coerces primitive tool i
 });
 
 test('parseAgentResponse reuses root-level parameters for string action names', () => {
-    const agent = createAgent();
-    const parsed = (agent as any).parseAgentResponse(JSON.stringify({
+    const parser = createParser();
+    const parsed = parser.parseAgentResponse(JSON.stringify({
         action: 'getProxyHistory',
         count: 8,
         memory: 'Stay focused on real user traffic only',
@@ -72,19 +59,19 @@ test('parseAgentResponse reuses root-level parameters for string action names', 
 });
 
 test('budget pressure reminders emit only at tightening and critical thresholds', () => {
-    const agent = createAgent(12);
+    const logs: string[] = [];
+    const signals = new OrchestratorContextSignals((_channel, message) => logs.push(message));
 
-    const early = (agent as any).getBudgetPressureReminder(3);
-    const tightening = (agent as any).getBudgetPressureReminder(7);
-    const tighteningAgain = (agent as any).getBudgetPressureReminder(8);
-    const critical = (agent as any).getBudgetPressureReminder(10);
+    const early = signals.buildBudgetPressureReminder(3, 12);
+    const tightening = signals.buildBudgetPressureReminder(7, 12);
+    const tighteningAgain = signals.buildBudgetPressureReminder(8, 12);
+    const critical = signals.buildBudgetPressureReminder(10, 12);
 
     assert.equal(early, '');
     assert.match(tightening, /ACTION BUDGET WARNING/);
     assert.match(tighteningAgain, /ACTION BUDGET WARNING/);
     assert.match(critical, /ACTION BUDGET WARNING/);
 
-    const logs = agent.getLogs();
     const tighteningLogs = logs.filter((line: string) => line.includes('Action budget tightening:'));
     const criticalLogs = logs.filter((line: string) => line.includes('Action budget critical:'));
 

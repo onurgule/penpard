@@ -7,6 +7,7 @@ import { parseRawBurpRequest, serializeStructuredBurpRequest } from '../src/serv
 
 process.env.DATABASE_PATH = process.env.DATABASE_PATH || path.join(process.cwd(), 'tmp', 'penpard-test.db');
 const { OrchestratorAgent } = require('../src/agents/OrchestratorAgent') as typeof import('../src/agents/OrchestratorAgent');
+const { OrchestratorFallbackPlanner } = require('../src/agents/orchestrator/OrchestratorFallbackPlanner') as typeof import('../src/agents/orchestrator/OrchestratorFallbackPlanner');
 
 function makeJwt(exp: number): string {
     const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -109,7 +110,7 @@ test('explicit Authorization is not stripped when managed auth store was missing
 
     await initializeAuth(agent, burp);
 
-    await (agent as any).executeSendHttpRequest({
+    await (agent as any).requestExecutor.execute({
         tool: 'send_http_request',
         args: {
             method: 'GET',
@@ -163,7 +164,7 @@ test('401 without outgoing auth retries once with stored Burp token', async () =
 
     await initializeAuth(agent, burp, initialRequest);
 
-    const result = await (agent as any).executeSendHttpRequest({
+    const result = await (agent as any).requestExecutor.execute({
         tool: 'send_http_request',
         args: {
             method: 'GET',
@@ -193,7 +194,7 @@ test('expired token path does not falsely pass when no refresh plan exists', asy
 
     await initializeAuth(agent, burp, initialRequest);
 
-    const result = await (agent as any).executeSendHttpRequest({
+    const result = await (agent as any).requestExecutor.execute({
         tool: 'send_http_request',
         args: {
             method: 'GET',
@@ -233,7 +234,7 @@ test('warning is emitted when a Burp-originated request leaves without Authoriza
 
     await initializeAuth(agent, burp, initialRequest);
 
-    const result = await (agent as any).executeSendHttpRequest({
+    const result = await (agent as any).requestExecutor.execute({
         tool: 'send_http_request',
         args: {
             method: 'GET',
@@ -248,18 +249,9 @@ test('warning is emitted when a Burp-originated request leaves without Authoriza
 });
 
 test('round-one fallback plan stays auth-first for no-credential web startup', () => {
-    const burp = new FakeBurp();
-    const agent = createAgent({
-        authStartup: {
-            mode: 'no_credentials',
-            credentials: [],
-            allowAccountCreation: true,
-            preferSharedPassword: true,
-        },
-    }, burp);
+    const planner = new OrchestratorFallbackPlanner();
 
-    (agent as any).planRound = 1;
-    (agent as any).startupAuthInventory = {
+    const startupAuthInventory = {
         mode: 'no_credentials',
         status: 'completed',
         browserSessionId: 'browser-1',
@@ -293,7 +285,14 @@ test('round-one fallback plan stays auth-first for no-credential web startup', (
         summary: 'Auth-first startup summary',
     };
 
-    const plan = (agent as any).createFallbackPlan();
+    const plan = planner.createPlan({
+        targetUrl: 'https://app.example.com',
+        planRound: 1,
+        instructionAnalysis: null,
+        startupAuthInventory,
+        authStartupMode: 'no_credentials',
+        discoveredEndpoints: [],
+    });
 
     assert.match(plan.analysis, /auth/i);
     assert.match(plan.steps[0].objective, /auth|register|login/i);

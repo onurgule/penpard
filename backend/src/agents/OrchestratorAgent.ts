@@ -12,10 +12,9 @@
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
-import { saveScanLogs, db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
-import { logger, formatLogTimestamp } from '../utils/logger';
+import { db, saveScanAuthInventory, saveScanEndpointInventory } from '../db/init';
+import { logger } from '../utils/logger';
 import path from 'path';
-import fs from 'fs';
 import { mindsetService, MindsetTTP } from '../services/mindset-service';
 import { analyzeSource, buildAgentContextBlock } from '../services/source-analysis/SourceAnalysisService';
 import { SourceAnalysisMode } from '../services/source-analysis/SourceAnalysisMode';
@@ -25,7 +24,7 @@ import { CoverageTracker } from '../services/CoverageTracker';
 import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
 import { browserService } from '../services/BrowserService';
 import { AuthStateManager, AuthStartupConfig, AuthStartupInventory } from '../services/auth';
-import { parseRawBurpRequest } from '../services/burp-request';
+import { parseRawBurpRequest, type ParsedBurpRequest } from '../services/burp-request';
 import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
 import { WebAuthStartupService } from '../services/WebAuthStartupService';
 import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
@@ -33,11 +32,13 @@ import {
     DEFAULT_WEB_PROMPT,
     buildContinuationScopeMessage,
     buildOperatorInstructionMessages,
-    buildOperatorInstructionsReminder,
 } from '../prompts/orchestratorPrompts';
 import { OrchestratorBrowserSession } from './orchestrator/OrchestratorBrowserSession';
+import { OrchestratorContextSignals } from './orchestrator/OrchestratorContextSignals';
+import { OrchestratorFallbackPlanner } from './orchestrator/OrchestratorFallbackPlanner';
 import { OrchestratorFindingTracker } from './orchestrator/OrchestratorFindingTracker';
 import { OrchestratorInstructionAnalyzer } from './orchestrator/OrchestratorInstructionAnalyzer';
+import { OrchestratorLogLedger } from './orchestrator/OrchestratorLogLedger';
 import { OrchestratorLlmResponseParser } from './orchestrator/OrchestratorLlmResponseParser';
 import { OrchestratorPlanner } from './orchestrator/OrchestratorPlanner';
 import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
@@ -348,11 +349,9 @@ export class OrchestratorAgent {
     private isPaused: boolean = false;
     private phase: AgentPhase = 'planning';
     private humanCommandQueue: string[] = [];
-    private logs: string[] = [];
     private findings: any[] = [];
     private conversationHistory: ConversationMessage[] = [];
     private maxIterations: number;
-    private readonly emittedBudgetSignals: Set<number> = new Set();
 
     // Planning state
     private currentPlan: AttackPlan | null = null;
@@ -365,10 +364,7 @@ export class OrchestratorAgent {
     private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
 
     // Incremental log persistence — flush to DB periodically to survive crashes
-    private lastFlushedLogIndex: number = 0;
-    private lastFlushTime: number = Date.now();
-    private static readonly LOG_FLUSH_INTERVAL_MS = 60_000; // 60 seconds
-    private static readonly LOG_FLUSH_BATCH_SIZE = 50;     // or every 50 new logs
+    private readonly logLedger: OrchestratorLogLedger;
 
     // Cached system prompt (always index 0 in conversationHistory)
     private systemPromptContent: string = '';
@@ -392,7 +388,9 @@ export class OrchestratorAgent {
     public authManager: AuthStateManager;
     private readonly llmResponseParser: OrchestratorLlmResponseParser;
     private readonly instructionAnalyzer: OrchestratorInstructionAnalyzer;
+    private readonly contextSignals: OrchestratorContextSignals;
     private readonly planner: OrchestratorPlanner;
+    private readonly fallbackPlanner: OrchestratorFallbackPlanner;
     private readonly browserSession: OrchestratorBrowserSession;
     private readonly requestExecutor: OrchestratorRequestExecutor;
     private readonly findingTracker: OrchestratorFindingTracker;
@@ -408,6 +406,7 @@ export class OrchestratorAgent {
         // maxPlanRounds: 0 or undefined = no fixed limit (model decides)
         const requested = config.maxPlanRounds ?? 0;
         this.maxPlanRounds = requested > 0 ? requested : 0;
+        this.logLedger = new OrchestratorLogLedger({ scanId });
 
         // Initialize pentester loop services
         this.harvester = new RequestHarvester();
@@ -425,12 +424,14 @@ export class OrchestratorAgent {
             this.llmResponseParser,
             (channel, message) => this.log(channel, message),
         );
+        this.contextSignals = new OrchestratorContextSignals((channel, message) => this.log(channel, message));
         this.planner = new OrchestratorPlanner({
             parser: this.llmResponseParser,
             log: (channel, message) => this.log(channel, message),
             delay: (ms) => this.delay(ms),
             handleRateLimitError: (error) => this.handleRateLimitError(error),
         });
+        this.fallbackPlanner = new OrchestratorFallbackPlanner((channel, message) => this.log(channel, message));
         this.browserSession = new OrchestratorBrowserSession({
             userId: config.userId,
             targetUrl,
@@ -562,7 +563,7 @@ export class OrchestratorAgent {
      * Injected into every planning/execution/replanning prompt.
      */
     private getOperatorInstructionsReminder(): string {
-        return buildOperatorInstructionsReminder(this.config.customSystemPrompt, this.instructionAnalysis);
+        return this.contextSignals.buildOperatorInstructionsReminder(this.config.customSystemPrompt, this.instructionAnalysis);
     }
 
     private isStoppedPhase(): boolean {
@@ -572,7 +573,7 @@ export class OrchestratorAgent {
     public async start() {
         if (this.isRunning) return;
         this.isRunning = true;
-        this.emittedBudgetSignals.clear();
+        this.contextSignals.resetBudgetSignals();
         this.log('system', `Orchestrator Agent started for target: ${this.targetUrl}`);
 
         try {
@@ -607,6 +608,7 @@ export class OrchestratorAgent {
         } finally {
             this.isRunning = false;
             this.saveLogs();
+            this.browserSession.cleanup();
         }
     }
 
@@ -629,7 +631,7 @@ export class OrchestratorAgent {
 
         this.isRunning = true;
         this.phase = 'planning';
-        this.emittedBudgetSignals.clear();
+        this.contextSignals.resetBudgetSignals();
         const extraRounds = Math.min(Math.max(opts.iterations, 1), 20); // clamp 1-20
 
         this.log('system', `═══ CONTINUING SCAN ═══`);
@@ -666,7 +668,7 @@ export class OrchestratorAgent {
             // Build system prompt if not already set (includes initialRequest headers)
             if (this.conversationHistory.length === 0) {
                 const promptTemplate = await this.loadPromptTemplate();
-                const accountsJson = JSON.stringify(this.config.idorUsers || [], null, 2);
+                const accountsJson = JSON.stringify(this.buildAccountPromptContext(), null, 2);
                 let sysPrompt = promptTemplate
                     .replace('{TARGET_WEBSITE}', this.targetUrl)
                     .replace('{TARGET_WEBSITE_ACCOUNTS}', accountsJson);
@@ -770,6 +772,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         } finally {
             this.isRunning = false;
             this.saveLogs();
+            this.browserSession.cleanup();
         }
     }
 
@@ -868,6 +871,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
 
     public stop() {
         this.isRunning = false;
+        this.isPaused = false;
         this.phase = 'stopped';
         this.log('system', 'Stop command received. Terminating agent...');
         this.scanStatus.stopped('Scan stopped by user');
@@ -898,7 +902,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
             phase: this.phase,
             isRunning: this.isRunning,
             isPaused: this.isPaused,
-            logsCount: this.logs.length,
+            logsCount: this.logLedger.count,
             findingsCount: this.findings.length,
             planRound: this.planRound,
             currentPlan: this.currentPlan,
@@ -907,7 +911,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     }
 
     public getLogs(since: number = 0): string[] {
-        return this.logs.slice(since);
+        return this.logLedger.getLogs(since);
     }
 
     public async checkBurpConnection(): Promise<boolean> {
@@ -1332,16 +1336,10 @@ Rules for subsequent work:
     }
 
     private buildAuthStartupDirective(): string {
-        const mode = this.config.authStartup?.mode || 'no_credentials';
-        if (this.planRound > 1) {
-            return 'Auth startup already executed. Reuse its inventory and only expand into generic crawling when auth surfaces, session transport, and created identities are already understood.';
-        }
-
-        if (mode === 'provided_credentials') {
-            return 'Round 1 MUST stay auth-surface-first: verify the login entry point, confirm browser-driven sign-in/session carry, inventory auth routes/forms/buttons, and reuse the normalized session state before generic recon.';
-        }
-
-        return 'Round 1 MUST stay auth-surface-first: inventory login/register/reset/SSO/onboarding flows, attempt safe self-registration when available, preserve any created identities, and only then widen into generic recon.';
+        return this.contextSignals.buildAuthStartupDirective(
+            this.planRound,
+            this.config.authStartup?.mode || 'no_credentials',
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1611,95 +1609,14 @@ Rules for subsequent work:
     }
 
     private createFallbackPlan(): AttackPlan {
-        const baseUrl = this.targetUrl.replace(/\/$/, '');
-        const startupInventory = this.startupAuthInventory;
-        const authMode = this.config.authStartup?.mode || 'no_credentials';
-
-        // Use LLM-analyzed instruction data if available
-        if (this.instructionAnalysis?.is_focused) {
-            const analysis = this.instructionAnalysis;
-            const endpoints = analysis.focused_endpoints.length > 0
-                ? analysis.focused_endpoints
-                : [baseUrl];
-            const vulnLabel = analysis.focused_vulns.length > 0
-                ? analysis.focused_vulns.join(', ')
-                : 'common vulnerabilities';
-
-            this.log('system', `Generating focused fallback plan: ${endpoints.join(', ')} → ${vulnLabel}`);
-
-            return {
-                round: this.planRound,
-                analysis: `Focused fallback: Testing ${endpoints.join(', ')} for ${vulnLabel}`,
-                steps: endpoints.slice(0, 3).flatMap((ep, i) => [
-                    {
-                        step: i * 2 + 1,
-                        objective: `Test ${ep} for ${vulnLabel}`,
-                        approach: `Send targeted ${vulnLabel} payloads to ${ep}`,
-                        tools: ['send_http_request', 'generate_payloads'],
-                        status: 'pending' as const,
-                    },
-                    {
-                        step: i * 2 + 2,
-                        objective: `Deep scan ${ep} with Burp Scanner for ${vulnLabel}`,
-                        approach: `Send ${ep} to Burp Scanner for thorough automated testing`,
-                        tools: ['send_to_scanner'],
-                        status: 'pending' as const,
-                    },
-                ]).slice(0, 5),
-            };
-        }
-
-        // No operator instructions — force auth-surface-first in the first round
-        if (this.planRound <= 1) {
-            const authTargets = startupInventory?.authRoutes?.slice(0, 6).map((route) => {
-                try {
-                    return route.startsWith('http') ? route : new URL(route, this.targetUrl).toString();
-                } catch {
-                    return route;
-                }
-            }) || [];
-            const primaryAuthRoute = authTargets[0] || `${baseUrl}/login`;
-            const registrationRoute = authTargets.find((route) => /register|sign[\s-]?up|create-account/i.test(route)) || `${baseUrl}/register`;
-            const resetRoute = authTargets.find((route) => /forgot|reset|recover/i.test(route)) || `${baseUrl}/forgot-password`;
-
-            if (authMode === 'provided_credentials') {
-                return {
-                    round: this.planRound,
-                    analysis: 'Fallback: round-one auth startup continuation with provided credentials',
-                    steps: [
-                        { step: 1, objective: 'Validate discovered login surface and auth controls', approach: `Review startup auth inventory and revisit ${primaryAuthRoute} in the browser to confirm login fields, DOM triggers, hidden inputs, and CSRF handling`, tools: ['browser_navigate', 'browser_get_page_state', 'browser_correlate_burp'], status: 'pending' },
-                        { step: 2, objective: 'Complete browser-driven login with supplied identity', approach: 'Use the discovered login form and real browser session to confirm authenticated state instead of replaying blind raw requests', tools: ['browser_fill_and_submit', 'browser_get_page_state'], status: 'pending' },
-                        { step: 3, objective: 'Harvest and normalize auth traffic', approach: 'Pull Burp history and harvested requests for the login flow to capture cookies, Authorization headers, CSRF values, redirect chains, and storage-backed session data', tools: ['get_proxy_history', 'harvest_traffic'], status: 'pending' },
-                        { step: 4, objective: 'Validate authenticated reachability with managed auth state', approach: 'Replay an authenticated endpoint using the normalized auth/session model captured during startup', tools: ['send_http_request'], status: 'pending' },
-                        { step: 5, objective: 'Map secondary identities for later authorization tests', approach: 'Prepare alternate provided users and confirm whether role or privilege differences exist for later IDOR/BAC testing', tools: ['browser_get_page_state', 'send_http_request'], status: 'pending' },
-                    ],
-                };
-            }
-
-            return {
-                round: this.planRound,
-                analysis: 'Fallback: round-one auth-surface-first startup continuation without credentials',
-                steps: [
-                    { step: 1, objective: 'Revisit discovered auth entry points in the browser', approach: `Use the startup inventory to review ${primaryAuthRoute}, ${registrationRoute}, and other discovered auth routes for forms, buttons, hidden inputs, CSRF, validation, and SSO triggers`, tools: ['browser_navigate', 'browser_get_page_state', 'browser_correlate_burp'], status: 'pending' },
-                    { step: 2, objective: 'Attempt safe self-registration or onboarding identity creation', approach: `If registration or invite onboarding exists, try to create one or more test accounts starting at ${registrationRoute} and preserve the resulting credentials and roles`, tools: ['browser_fill_and_submit', 'browser_get_page_state'], status: 'pending' },
-                    { step: 3, objective: 'Inventory password reset, recovery, OTP, and activation gates', approach: `Examine ${resetRoute} and other recovery checkpoints to understand recovery routes, email verification, MFA/TOTP, and session bootstrap requirements`, tools: ['browser_navigate', 'browser_get_page_state'], status: 'pending' },
-                    { step: 4, objective: 'Harvest proxied auth traffic and session transport evidence', approach: 'Use Burp history and harvested requests to capture Set-Cookie behavior, redirect chains, storage-backed tokens, Authorization headers, and CSRF transport from real browser execution', tools: ['get_proxy_history', 'harvest_traffic'], status: 'pending' },
-                    { step: 5, objective: 'Carry normalized auth intelligence into the first authenticated checks', approach: 'Replay a startup-discovered auth or post-auth endpoint with the managed auth/session state to validate that later scan rounds can reuse the captured identities safely', tools: ['send_http_request'], status: 'pending' },
-                ],
-            };
-        }
-
-        return {
-            round: this.planRound,
-            analysis: 'Fallback: Testing discovered endpoints',
-            steps: Array.from(this.discoveredEndpoints).slice(0, 5).map((endpoint, i) => ({
-                step: i + 1,
-                objective: `Test ${endpoint} for common vulns`,
-                approach: `Send test payloads to ${endpoint}`,
-                tools: ['send_http_request', 'send_to_scanner'],
-                status: 'pending' as const,
-            })),
-        };
+        return this.fallbackPlanner.createPlan({
+            targetUrl: this.targetUrl,
+            planRound: this.planRound,
+            instructionAnalysis: this.instructionAnalysis,
+            startupAuthInventory: this.startupAuthInventory,
+            authStartupMode: this.config.authStartup?.mode || 'no_credentials',
+            discoveredEndpoints: this.discoveredEndpoints,
+        });
     }
 
     private async askLLMForStepExecution(step: PlanStep, previousResults: string[], totalActions: number): Promise<LLMResponse | null> {
@@ -1735,24 +1652,7 @@ Rules for subsequent work:
     // ═══════════════════════════════════════════════════════════
 
     private getBudgetPressureReminder(totalActions: number): string {
-        const remaining = Math.max(0, this.maxIterations - totalActions);
-        if (remaining <= 2) {
-            if (!this.emittedBudgetSignals.has(2)) {
-                this.emittedBudgetSignals.add(2);
-                this.log('system', `Action budget critical: only ${remaining} iteration(s) remain. Prioritize decisive validation and conclude cleanly.`);
-            }
-            return `\n\n[ACTION BUDGET WARNING]\nOnly ${remaining} iteration(s) remain before the scan must stop. Do not broaden scope. Prioritize the single highest-value validation or finish with a clear answer if the current step is already proven.\n`;
-        }
-
-        if (remaining <= 5) {
-            if (!this.emittedBudgetSignals.has(5)) {
-                this.emittedBudgetSignals.add(5);
-                this.log('system', `Action budget tightening: ${remaining} iteration(s) remain. Focus on the highest-confidence validations.`);
-            }
-            return `\n\n[ACTION BUDGET WARNING]\nOnly ${remaining} iteration(s) remain in the global action budget. Narrow to the highest-confidence proof path, reuse existing evidence, and avoid speculative expansion.\n`;
-        }
-
-        return '';
+        return this.contextSignals.buildBudgetPressureReminder(totalActions, this.maxIterations);
     }
 
     private logReflection(reflection?: AgentReflection) {
@@ -1797,15 +1697,8 @@ Rules for subsequent work:
      * Parse a raw HTTP request string (from Burp "Send to PenPard") into structured components.
      * Returns { method, url, headers, body } or null if parsing fails.
      */
-    private parseRawHttpRequest(raw: string): { method: string; url: string; headers: Record<string, string>; body: string } | null {
-        const parsed = parseRawBurpRequest(raw);
-        if (!parsed) return null;
-        return {
-            method: parsed.method,
-            url: parsed.url,
-            headers: parsed.headers,
-            body: parsed.body,
-        };
+    private parseRawHttpRequest(raw: string): ParsedBurpRequest | null {
+        return parseRawBurpRequest(raw);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2567,69 +2460,26 @@ Rules for subsequent work:
     private async delay(ms: number) {
         await new Promise(r => setTimeout(r, ms));
     }
-
     private log(type: string, message: string) {
-        const timestamp = formatLogTimestamp();
-        const line = `[${timestamp}] [${type.toUpperCase()}] ${message}`;
-        this.logs.push(line);
-        logger.info(message, { scanId: this.scanId, type });
-
-        // Check if we should flush to DB
-        this.maybeFlushLogs();
-    }
-
-    /**
-     * Periodically flush new logs to the scan_logs DB table.
-     * Called automatically from log() — flushes every LOG_FLUSH_BATCH_SIZE entries
-     * or every LOG_FLUSH_INTERVAL_MS, whichever comes first.
-     */
-    private maybeFlushLogs() {
-        const newLogCount = this.logs.length - this.lastFlushedLogIndex;
-        const timeSinceFlush = Date.now() - this.lastFlushTime;
-
-        if (newLogCount >= OrchestratorAgent.LOG_FLUSH_BATCH_SIZE ||
-            (newLogCount > 0 && timeSinceFlush >= OrchestratorAgent.LOG_FLUSH_INTERVAL_MS)) {
-            this.flushLogsToDB();
-        }
+        this.logLedger.append(type, message);
     }
 
     /**
      * Flush unflushed logs to the database incrementally.
-     * Safe to call multiple times — only writes new entries since last flush.
+     * Safe to call multiple times - only writes entries that have not yet been persisted.
      * Returns the number of logs flushed.
      */
     public flushLogsToDB(): number {
-        const newLogs = this.logs.slice(this.lastFlushedLogIndex);
-        if (newLogs.length === 0) return 0;
-
-        try {
-            saveScanLogs(this.scanId, newLogs);
-            this.lastFlushedLogIndex = this.logs.length;
-            this.lastFlushTime = Date.now();
-            return newLogs.length;
-        } catch (e: any) {
-            // Log flush failure must not crash the scan
-            logger.error('Failed to flush logs to DB', { scanId: this.scanId, error: e.message });
-            return 0;
-        }
+        return this.logLedger.flushToDB();
     }
 
     /** Number of logs that have NOT yet been persisted to the database. */
     public get unflushedLogCount(): number {
-        return this.logs.length - this.lastFlushedLogIndex;
+        return this.logLedger.unflushedCount;
     }
 
     private saveLogs() {
-        try {
-            const logsDir = path.join(__dirname, '../../logs');
-            if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-            fs.writeFileSync(path.join(logsDir, `${this.scanId}.log`), this.logs.join('\n'));
-        } catch (e) {
-            logger.error('Failed to save logs', { error: (e as any).message });
-        }
-
-        // Final DB flush — only write logs not yet flushed
-        this.flushLogsToDB();
+        this.logLedger.persistToFile(path.join(__dirname, '../../logs', `${this.scanId}.log`));
     }
 
     //  PENTESTER LOOP v2: Harvest → Classify → Hypothesize → Validate
@@ -3003,5 +2853,3 @@ Rules for subsequent work:
         };
     }
 }
-
-

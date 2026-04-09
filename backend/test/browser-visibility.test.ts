@@ -464,7 +464,7 @@ test('orchestrator lazily relaunches after browser loss so scans degrade gracefu
     })) as any;
 
     try {
-        const sessionId = await (agent as any).ensureBrowserSession();
+        const sessionId = await (agent as any).browserSession.ensureSession();
         assert.equal(sessionId, 'replacement-session');
         assert.equal(agent.getBrowserSessionId(), 'replacement-session');
     } finally {

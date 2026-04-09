@@ -217,6 +217,22 @@ function isWhitelisted(url: string, whitelists: any[]): boolean {
     }
 }
 
+function getOwnedScanOrRespond(scanId: string, userId: number, res: Response): any | null {
+    const scan = getScan(scanId);
+
+    if (!scan) {
+        res.status(404).json({ error: true, message: 'Scan not found' });
+        return null;
+    }
+
+    if (scan.user_id !== userId) {
+        res.status(403).json({ error: true, message: 'Access denied' });
+        return null;
+    }
+
+    return scan;
+}
+
 // List user's scans
 router.get('/', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
@@ -565,18 +581,8 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
         const user = req.user!;
-
-        const scan = getScan(id);
-
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
-
-        if (scan.user_id !== user.id) {
-            res.status(403).json({ error: true, message: 'Access denied' });
-            return;
-        }
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
 
         const vulnerabilities = getVulnerabilitiesByScan(id);
         const endpointInventory = scanRuntimeService.getEndpointInventory(id);
@@ -624,6 +630,8 @@ router.post('/:id/command', authenticateToken, async (req: AuthRequest, res: Res
             return;
         }
 
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
         const agent = scanRuntimeService.getActiveAgent(id);
 
         // Persist user command to DB
@@ -635,17 +643,6 @@ router.post('/:id/command', authenticateToken, async (req: AuthRequest, res: Res
             res.json({ message: 'Command sent to agent' });
         } else {
             // No active agent - use LLM directly with scan context
-            const scan = getScan(id);
-            if (!scan) {
-                res.status(404).json({ error: true, message: 'Scan not found' });
-                return;
-            }
-
-            if (scan.user_id !== user.id) {
-                res.status(403).json({ error: true, message: 'Access denied' });
-                return;
-            }
-
             // Get vulnerabilities for context
             const vulnerabilities = getVulnerabilitiesByScan(id);
 
@@ -706,18 +703,8 @@ router.post('/:id/stop', authenticateToken, async (req: AuthRequest, res: Respon
     try {
         const { id } = req.params;
         const user = req.user!;
-
-        const scan = getScan(id);
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
-
-        // Check user permission
-        if (scan.user_id !== user.id) {
-            res.status(403).json({ error: true, message: 'Access denied' });
-            return;
-        }
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
 
         const result = await scanRuntimeService.stopScan(id, user.id, scan.status);
         res.json(result);
@@ -733,17 +720,8 @@ router.post('/:id/pause', authenticateToken, async (req: AuthRequest, res: Respo
     try {
         const { id } = req.params;
         const user = req.user!;
-
-        const scan = getScan(id);
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
-
-        if (scan.user_id !== user.id) {
-            res.status(403).json({ error: true, message: 'Access denied' });
-            return;
-        }
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
 
         const result = await scanRuntimeService.pauseScan(id, user.id);
 
@@ -768,17 +746,8 @@ router.post('/:id/resume', authenticateToken, async (req: AuthRequest, res: Resp
     try {
         const { id } = req.params;
         const user = req.user!;
-
-        const scan = getScan(id);
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
-
-        if (scan.user_id !== user.id) {
-            res.status(403).json({ error: true, message: 'Access denied' });
-            return;
-        }
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
 
         const result = await scanRuntimeService.resumeScan(id, user.id);
         res.json(result);
@@ -802,16 +771,8 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
             return;
         }
 
-        const scan = getScan(id);
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
-
-        if (scan.user_id !== user.id) {
-            res.status(403).json({ error: true, message: 'Access denied' });
-            return;
-        }
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
 
         // Check if there's already an active runtime
         if (scanRuntimeService.hasActiveRuntime(id)) {
@@ -954,11 +915,9 @@ router.post('/burp/send', authenticateToken, async (req: AuthRequest, res: Respo
 router.get('/:id/chat', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const scan = getScan(id);
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
+        const user = req.user!;
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
         const messages = getChatMessages(id);
         res.json({ messages });
     } catch (error: any) {
@@ -972,12 +931,9 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
     try {
         const { id } = req.params;
         const since = parseInt(req.query.since as string) || 0;
-
-        const scan = getScan(id);
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
+        const user = req.user!;
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
 
         res.json(scanRuntimeService.getLiveStatus(id, scan as any, since));
     } catch (error: any) {
@@ -990,6 +946,8 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
 router.post('/:id/browser/show', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
+        const user = req.user!;
+        if (!getOwnedScanOrRespond(id, user.id, res)) return;
         res.json(await scanRuntimeService.showScanBrowser(id));
     } catch (error: any) {
         logger.error('Show browser for scan failed', { error: error.message });
@@ -1001,6 +959,8 @@ router.post('/:id/browser/show', authenticateToken, async (req: AuthRequest, res
 router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
+        const user = req.user!;
+        if (!getOwnedScanOrRespond(id, user.id, res)) return;
         res.json(await scanRuntimeService.hideScanBrowser(id));
     } catch (error: any) {
         logger.error('Hide browser for scan failed', { error: error.message });
