@@ -18,15 +18,9 @@ import path from 'path';
 import { mindsetService, MindsetTTP } from '../services/mindset-service';
 import { analyzeSource, buildAgentContextBlock } from '../services/source-analysis/SourceAnalysisService';
 import { SourceAnalysisMode } from '../services/source-analysis/SourceAnalysisMode';
-import { RequestHarvester } from '../services/RequestHarvester';
-import { HypothesisEngine } from '../services/HypothesisEngine';
-import { CoverageTracker } from '../services/CoverageTracker';
-import { diffResponses, ResponseSnapshot } from '../services/ResponseDiffer';
-import { browserService } from '../services/BrowserService';
 import { AuthStateManager, AuthStartupConfig, AuthStartupInventory } from '../services/auth';
 import { normalizeCookiesAndAuthEntries, normalizeProxyHistoryItems, normalizeSendHttpResponse, normalizeSessionCookieResult } from '../services/burp-tool-result';
-import { WebAuthStartupService } from '../services/WebAuthStartupService';
-import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
+import { EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
 import { ScanRuntimeCheckpoint } from '../services/runtime/ScanRuntimeCheckpointService';
 import {
     DEFAULT_WEB_PROMPT,
@@ -36,6 +30,7 @@ import {
 import { OrchestratorBrowserSession } from './orchestrator/OrchestratorBrowserSession';
 import { OrchestratorBrowserTools } from './orchestrator/OrchestratorBrowserTools';
 import { OrchestratorContextSignals } from './orchestrator/OrchestratorContextSignals';
+import { OrchestratorDomainCoordinator } from './orchestrator/OrchestratorDomainCoordinator';
 import { OrchestratorFallbackPlanner } from './orchestrator/OrchestratorFallbackPlanner';
 import { OrchestratorFindingTracker } from './orchestrator/OrchestratorFindingTracker';
 import { OrchestratorInstructionAnalyzer } from './orchestrator/OrchestratorInstructionAnalyzer';
@@ -362,7 +357,7 @@ export class OrchestratorAgent {
     private config: ScanConfig;
     private burp: BurpMCPClient;
 
-    // State
+    // Agent-native reasoning state
     private isRunning: boolean = false;
     private isPaused: boolean = false;
     private phase: AgentPhase = 'planning';
@@ -371,12 +366,11 @@ export class OrchestratorAgent {
     private conversationHistory: ConversationMessage[] = [];
     private maxIterations: number;
 
-    // Planning state
+    // Planning state (agent-native: the agent decides what to test next)
     private currentPlan: AttackPlan | null = null;
     private planRound: number = 0;
     /** 0 = no fixed limit (model decides); otherwise max planning rounds. */
     private maxPlanRounds: number = 0;
-    private discoveredEndpoints: Set<string> = new Set();
     private stepResults: StepExecutionResult[] = [];
     private rateLimitPauseUntil: Date | null = null;
     private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
@@ -393,16 +387,11 @@ export class OrchestratorAgent {
 
     // Mindset library — loaded TTPs from past report analyses
     private mindsetTTPs: MindsetTTP[] = [];
-    private startupAuthInventory: AuthStartupInventory | null = null;
-    private endpointInventory: EndpointInventorySnapshot | null = null;
-
-    // ── Pentester Loop Services (v2) ──
-    private harvester: RequestHarvester;
-    private hypothesisEngine: HypothesisEngine;
-    private coverageTracker: CoverageTracker;
 
     // ── Auth State Engine ──
     public authManager: AuthStateManager;
+
+    // ── Extracted collaborators ──
     private readonly llmResponseParser: OrchestratorLlmResponseParser;
     private readonly instructionAnalyzer: OrchestratorInstructionAnalyzer;
     private readonly contextSignals: OrchestratorContextSignals;
@@ -418,6 +407,7 @@ export class OrchestratorAgent {
     private readonly toolRegistry: OrchestratorToolRegistry;
     private readonly harness: OrchestratorSingleAgentHarness<ContinueScanOptions>;
     private readonly initialRequestContext: OrchestratorInitialRequestContext | null;
+    private readonly domainCoordinator: OrchestratorDomainCoordinator;
 
     constructor(
         scanId: string,
@@ -439,13 +429,24 @@ export class OrchestratorAgent {
             ? buildInitialRequestContext(config.initialRequest.trim())
             : null;
 
-        // Initialize pentester loop services
-        this.harvester = new RequestHarvester();
-        this.hypothesisEngine = new HypothesisEngine();
-        this.coverageTracker = new CoverageTracker();
-
         // Initialize auth state engine
         this.authManager = new AuthStateManager(scanId, targetUrl);
+
+        // Initialize domain coordinator (owns harvester, hypothesis engine, coverage tracker)
+        this.domainCoordinator = new OrchestratorDomainCoordinator({
+            targetUrl,
+            burp,
+            authManager: this.authManager,
+            log: (channel, message) => this.log(channel, message),
+            onEndpointDiscovered: (_path, _method, source) => {
+                if (source === 'harvest-refresh') {
+                    void this.scanSurface.refreshEndpointInventory('harvest', false);
+                }
+            },
+            onCheckpoint: (reason) => this.persistRuntimeCheckpoint(reason),
+            onHypothesisConfirmed: (finding) => this.saveFinding(finding),
+        });
+
         this.browserSession = new OrchestratorBrowserSession({
             userId: config.userId,
             targetUrl,
@@ -460,7 +461,7 @@ export class OrchestratorAgent {
             burp,
             authManager: this.authManager,
             browserSession: this.browserSession,
-            coverageTracker: this.coverageTracker,
+            coverageTracker: this.domainCoordinator.coverageTracker,
             log: (channel, message) => this.log(channel, message),
         });
         this.requestExecutor = new OrchestratorRequestExecutor({
@@ -501,7 +502,7 @@ export class OrchestratorAgent {
         });
         this.toolRegistry = new OrchestratorToolRegistry({
             handlers: {
-                send_http_request: (toolCall) => this.executeSendHttpRequest(toolCall),
+                send_http_request: (toolCall) => this.requestExecutor.execute(toolCall),
                 get_proxy_history: async (toolCall) => ({
                     items: normalizeProxyHistoryItems(
                         await this.burp.callTool('get_proxy_history', { ...toolCall.args, excludePenPard: true }),
@@ -530,10 +531,10 @@ export class OrchestratorAgent {
                 browser_evaluate_js: (toolCall) => this.browserTools.evaluateJs(toolCall),
                 browser_screenshot: () => this.browserTools.screenshot(),
                 browser_correlate_burp: () => this.browserTools.correlateBurp(),
-                harvest_traffic: () => this.executeHarvestTraffic(),
-                get_hypotheses: (toolCall) => this.executeGetHypotheses(toolCall),
-                get_coverage: () => this.executeGetCoverage(),
-                repeater_test: (toolCall) => this.executeRepeaterTest(toolCall),
+                harvest_traffic: () => this.domainCoordinator.executeHarvestTraffic(),
+                get_hypotheses: (toolCall) => this.domainCoordinator.executeGetHypotheses(toolCall),
+                get_coverage: () => this.domainCoordinator.executeGetCoverage(),
+                repeater_test: (toolCall) => this.domainCoordinator.executeRepeaterTest(toolCall),
                 none: async () => ({ status: 'No tool call (step complete)' }),
             },
         });
@@ -630,7 +631,7 @@ export class OrchestratorAgent {
         this.isRunning = false;
         await this.persistRuntimeCheckpoint('run-finalizing');
         try {
-            await this.cleanupBrowserSession();
+            await this.browserSession.cleanup();
         } finally {
             this.saveLogs();
         }
@@ -898,7 +899,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         this.log('system', 'Stop command received. Terminating agent...');
         this.scanStatus.stopped('Scan stopped by user');
         // Cleanup browser session
-        void this.cleanupBrowserSession();
+        void this.browserSession.cleanup();
     }
 
     public pause() {
@@ -937,9 +938,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
     }
 
     public getRuntimeCheckpointSnapshot(reason: string): ScanRuntimeCheckpoint {
-        const harvestSummary = this.harvester.getCheckpointSummary();
-        const hypothesisSummary = this.hypothesisEngine.getCheckpointSummary();
-        const coverageSummary = this.coverageTracker.getSummary();
+        const domainCheckpoint = this.domainCoordinator.getCheckpointSummary();
 
         return {
             version: 1,
@@ -964,13 +963,9 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
                     tools: [...step.tools],
                 })),
             } : null,
-            harvested: harvestSummary,
-            hypotheses: {
-                total: hypothesisSummary.total,
-                counts: hypothesisSummary.counts,
-                activeHypotheses: hypothesisSummary.activeHypotheses,
-            },
-            coverage: coverageSummary,
+            harvested: domainCheckpoint.harvested,
+            hypotheses: domainCheckpoint.hypotheses,
+            coverage: domainCheckpoint.coverage,
             endpointInventory: this.scanSurface.getEndpointInventory() ? {
                 summary: this.scanSurface.getEndpointInventory()!.summary,
                 authSurfaceCount: this.scanSurface.getEndpointInventory()!.authRelevantCount,
@@ -1186,169 +1181,6 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         });
     }
 
-    private async runAuthFirstStartup(authStartup: AuthStartupConfig): Promise<void> {
-        this.log('system', '🔍 Starting browser-first auth discovery before normal planning...');
-        const service = new WebAuthStartupService(
-            this.scanId,
-            this.config.userId || 1,
-            this.targetUrl,
-            this.burp,
-            this.authManager,
-            (kind, message) => this.log(kind === 'debug' ? 'debug' : kind, message),
-        );
-        const { browserSessionId, inventory } = await service.run(authStartup);
-        this.browserSession.setSessionId(browserSessionId);
-        this.startupAuthInventory = inventory;
-
-        try {
-            saveScanAuthInventory(this.scanId, JSON.stringify(inventory));
-        } catch (error: any) {
-            this.log('error', `Failed to persist auth startup inventory: ${error.message}`);
-        }
-
-        inventory.authRoutes.forEach((route) => {
-            if (typeof route !== 'string' || !route.trim()) return;
-            try {
-                const absolute = route.startsWith('http') ? route : new URL(route, this.targetUrl).toString();
-                this.discoveredEndpoints.add(absolute);
-                this.coverageTracker.addRoute(new URL(absolute).pathname, 'GET', 'browser-navigation');
-            } catch {
-                this.discoveredEndpoints.add(route);
-            }
-        });
-
-        inventory.traffic.forEach((entry) => {
-            if (!entry?.url) return;
-            this.discoveredEndpoints.add(entry.url);
-            try {
-                const parsed = new URL(entry.url);
-                this.coverageTracker.addRoute(parsed.pathname, entry.method || 'GET', entry.source === 'browser' ? 'browser-navigation' : 'burp');
-            } catch {
-                /* ignore malformed URLs */
-            }
-        });
-
-        this.log('system', `✓ Auth startup inventory captured: ${inventory.summary}`);
-        await this.refreshEndpointInventory('startup', true);
-    }
-
-    private async refreshEndpointInventory(trigger: string, allowAiClassification: boolean = false): Promise<void> {
-        const browserSessionId = this.browserSession.getSessionId();
-        if (!browserSessionId) return;
-
-        try {
-            const service = new EndpointIntelligenceService(
-                this.scanId,
-                this.targetUrl,
-                this.burp,
-                (level, message) => this.log(level === 'error' ? 'error' : level === 'system' ? 'system' : 'debug', message),
-            );
-            const inventory = await service.buildInventory({
-                browserSessionId,
-                authInventory: this.startupAuthInventory,
-                allowAiClassification,
-            });
-            this.endpointInventory = inventory;
-            saveScanEndpointInventory(this.scanId, JSON.stringify(inventory));
-            this.log('system', `✓ Endpoint intelligence refreshed (${trigger}): ${inventory.summary}`);
-        } catch (error: any) {
-            this.log('error', `Endpoint intelligence refresh failed (${trigger}): ${error.message}`);
-        }
-    }
-
-    private buildStartupAuthPromptBlock(): string {
-        if (!this.startupAuthInventory) return '';
-        return `\n\n═══════════════════════════════════════════════════════════════
-  WEB AUTH STARTUP INVENTORY (captured before planning)
-═══════════════════════════════════════════════════════════════
-
-${this.buildStartupAuthSummary(this.startupAuthInventory)}
-
-Rules for subsequent work:
-- Browser-driven auth discovery already ran before the first plan.
-- Use this inventory as evidence, not as a guess.
-- Reuse captured cookies, tokens, CSRF values, and identity state instead of rebuilding auth assumptions.
-- Keep round 1 auth-surface-first unless operator instructions explicitly narrow scope elsewhere.
-`;
-    }
-
-    private buildEndpointInventoryPromptBlock(): string {
-        if (!this.endpointInventory) return '';
-        return `\n\n═══════════════════════════════════════════════════════════════
-  ENDPOINT INTELLIGENCE (browser + JS + Burp)
-═══════════════════════════════════════════════════════════════
-
-${this.buildEndpointInventorySummary(this.endpointInventory)}
-
-Rules for subsequent work:
-- Treat these endpoints and classifications as structured evidence gathered from rendered DOM, loaded JavaScript, browser execution, and Burp traffic.
-- Prioritize auth-relevant endpoints early, especially login/register/reset/session-bootstrap/auth-refresh/admin routes.
-- Do not waste time on socket polling, HMR, or other noise already filtered from this inventory.
-`;
-    }
-
-    private buildEndpointInventorySummary(inventory: EndpointInventorySnapshot): string {
-        const endpointLines = inventory.records.slice(0, 20).map((record) => {
-            const method = record.methods.join(', ') || 'GET';
-            const observed = `${record.observedInBurp ? 'burp' : 'no-burp'} / ${record.exercisedInBrowser ? 'browser' : 'not-browser'}`;
-            return `- [${record.classification}] ${method} ${record.path} source=${record.primarySource} confidence=${record.confidence} observed=${observed} inferredOnly=${record.inferredOnly ? 'yes' : 'no'}`;
-        }).join('\n') || '- none';
-
-        const authLines = inventory.records
-            .filter((record) => record.likelyAuthRelevant)
-            .slice(0, 12)
-            .map((record) => `- ${record.path} (${record.classification})`)
-            .join('\n') || '- none';
-
-        return [
-            `Summary: ${inventory.summary}`,
-            `JS artifacts: ${inventory.jsArtifacts.count} captured, ${inventory.jsArtifacts.totalBytes} bytes analyzed`,
-            `Auth-relevant endpoints:\n${authLines}`,
-            `Top records:\n${endpointLines}`,
-        ].join('\n');
-    }
-
-    private buildStartupAuthSummary(inventory: AuthStartupInventory): string {
-        const formLines = inventory.forms.slice(0, 8).map((form) => {
-            const visibleFields = form.fields
-                .slice(0, 8)
-                .map((field) => `${field.name || field.id || 'unnamed'}:${field.type}`)
-                .join(', ') || 'no fields';
-            const hidden = form.hiddenInputs
-                .slice(0, 5)
-                .map((field) => field.name || field.id || 'hidden')
-                .join(', ') || 'none';
-            return `- [${form.type}] ${form.method} ${form.action || '(same page)'} fields=${visibleFields} hidden=${hidden}`;
-        }).join('\n') || '- none';
-
-        const elementLines = inventory.domElements.slice(0, 10).map((element) =>
-            `- [${element.type}] ${element.tagName} text="${element.text}" selector=${element.selector || 'n/a'} href=${element.href || element.action || ''}`
-        ).join('\n') || '- none';
-
-        const credentialLines = inventory.discoveredCredentials.slice(0, 10).map((credential) =>
-            `- ${credential.identityId || 'unknown'} ${credential.label || credential.username || credential.email || 'credential'} created=${credential.created ? 'yes' : 'no'} success=${credential.success ? 'yes' : 'no'} role=${credential.role || 'unknown'} privilege=${credential.privilege || 'unknown'}`
-        ).join('\n') || '- none';
-
-        const blockerLines = inventory.blockers.slice(0, 8).map((blocker) => `- ${blocker}`).join('\n') || '- none';
-
-        return [
-            `Startup mode: ${inventory.mode}`,
-            `Summary: ${inventory.summary}`,
-            `Browser session: ${inventory.browserSessionId || 'not available'}`,
-            `Registration available: ${inventory.registrationAvailable ? 'yes' : 'no'}`,
-            `Password reset available: ${inventory.passwordResetAvailable ? 'yes' : 'no'}`,
-            `Activation gate observed: ${inventory.activationRequired ? 'yes' : 'no'}`,
-            `SSO providers: ${inventory.ssoProviders.join(', ') || 'none'}`,
-            `Transport: authorization=${inventory.transport.authorizationSchemes.join(', ') || 'none'} | cookies=${inventory.transport.cookieNames.join(', ') || 'none'} | localStorage=${inventory.transport.localStorageKeys.join(', ') || 'none'} | sessionStorage=${inventory.transport.sessionStorageKeys.join(', ') || 'none'} | indexedDB=${inventory.transport.indexedDbNames.join(', ') || 'none'} | csrfHeaders=${inventory.transport.csrfHeaders.join(', ') || 'none'} | csrfFields=${inventory.transport.csrfFormFields.join(', ') || 'none'} | csrfMeta=${inventory.transport.csrfMetaNames.join(', ') || 'none'} | csrfCookies=${inventory.transport.csrfCookieNames.join(', ') || 'none'}`,
-            `Auth routes:\n${inventory.authRoutes.slice(0, 20).map((route) => `- ${route}`).join('\n') || '- none'}`,
-            `Forms:\n${formLines}`,
-            `Auth controls:\n${elementLines}`,
-            `Credentials:\n${credentialLines}`,
-            `Traffic samples captured: ${inventory.traffic.length}`,
-            `Blockers:\n${blockerLines}`,
-        ].join('\n');
-    }
-
     private buildAuthStartupDirective(): string {
         return this.contextSignals.buildAuthStartupDirective(
             this.planRound,
@@ -1469,7 +1301,7 @@ Rules for subsequent work:
 
                             // Analyze for auto-detected vulns
                             if (result && !result.error && !result.skipped) {
-                                this.analyzeResponseForVulns(response.action, result);
+                                this.findingTracker.analyzeResponseForVulns(response.action, result);
                             }
 
                             const resultSummary = JSON.stringify(result).substring(0, 1500);
@@ -1508,7 +1340,9 @@ Rules for subsequent work:
 
             // ── HARVEST: Pull and classify Burp traffic after round ──
             try {
-                await this.runHarvestCycle();
+                await this.domainCoordinator.runHarvestCycle();
+                const harvestSummary = this.domainCoordinator.getHarvestConversationSummary();
+                this.conversationHistory.push({ role: 'user', content: harvestSummary });
             } catch (e: any) {
                 this.log('error', `Harvest cycle failed (non-fatal): ${e.message}`);
             }
@@ -1580,7 +1414,7 @@ Rules for subsequent work:
         this.log('system', `Rounds: ${this.planRound} | Endpoints: ${this.scanSurface.getDiscoveredEndpointCount()} | Findings: ${vulns.length}`);
 
         // Cleanup browser session when scan completes
-        await this.cleanupBrowserSession();
+        await this.browserSession.cleanup();
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1655,8 +1489,8 @@ Rules for subsequent work:
             roundResults,
             findings: this.findings,
             discoveredEndpoints: this.scanSurface.getDiscoveredEndpoints(),
-            hypothesisStatus: this.hypothesisEngine.getSummaryForPrompt(),
-            coverageStatus: this.coverageTracker.getSummaryForPrompt(),
+            hypothesisStatus: this.domainCoordinator.hypothesisEngine.getSummaryForPrompt(),
+            coverageStatus: this.domainCoordinator.coverageTracker.getSummaryForPrompt(),
             operatorInstructionsReminder: this.getOperatorInstructionsReminder(),
             planRound: this.planRound,
         });
@@ -1693,285 +1527,6 @@ Rules for subsequent work:
         return this.toolDispatcher.execute(toolCall);
     }
 
-    private async syncAuthFromBrowser(identityId: string = 'primary-user'): Promise<void> {
-        await this.browserSession.syncAuthFromBrowser(identityId);
-    }
-
-    private async seedBrowserFromAuthManager(identityId: string = 'primary-user'): Promise<void> {
-        await this.browserSession.seedBrowserFromAuthManager(identityId);
-    }
-
-    private async executeSendHttpRequest(toolCall: ToolCall): Promise<any> {
-        return this.requestExecutor.execute(toolCall);
-    }
-
-    //  RAW HTTP REQUEST PARSER
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * Parse a raw HTTP request string (from Burp "Send to PenPard") into structured components.
-     * Returns { method, url, headers, body } or null if parsing fails.
-     */
-
-    // ═══════════════════════════════════════════════════════════
-    //  RESPONSE PARSING
-    // ═══════════════════════════════════════════════════════════
-
-    private parseAgentResponse(text: string): LLMResponse | null {
-        return this.llmResponseParser.parseAgentResponse(text);
-    }
-
-    private extractJsonObject(text: string): any | null {
-        return this.llmResponseParser.extractJsonObject(text);
-    }
-
-    private stripMarkdownCodeFences(text: string): string {
-        const match = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/i);
-        return match ? match[1].trim() : text;
-    }
-
-    private parseJsonCandidate(candidate: string): any | null {
-        const trimmed = candidate.trim();
-        if (!trimmed) return null;
-
-        const attempts = [trimmed];
-        if (
-            (trimmed.startsWith('"') && trimmed.endsWith('"'))
-            || (trimmed.startsWith('\'') && trimmed.endsWith('\''))
-        ) {
-            attempts.push(trimmed.substring(1, trimmed.length - 1));
-        }
-
-        for (const attempt of attempts) {
-            try {
-                return this.unwrapJsonValue(JSON.parse(attempt));
-            } catch {
-                const repaired = attempt
-                    .replace(/,\s*([}\]])/g, '$1')
-                    .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
-                    .replace(/:\s*'([^']*?)'(?=\s*[,}])/g, ': "$1"');
-                if (repaired !== attempt) {
-                    try {
-                        return this.unwrapJsonValue(JSON.parse(repaired));
-                    } catch {
-                        // Ignore and keep searching.
-                    }
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private unwrapJsonValue(value: any, depth: number = 0): any {
-        if (depth > 5 || value === null || value === undefined) {
-            return value;
-        }
-
-        if (typeof value === 'string') {
-            const parsed = this.parseJsonCandidate(value);
-            return parsed !== null ? this.unwrapJsonValue(parsed, depth + 1) : value.trim();
-        }
-
-        if (Array.isArray(value)) {
-            return value.map((entry) => this.unwrapJsonValue(entry, depth + 1));
-        }
-
-        if (typeof value !== 'object') {
-            return value;
-        }
-
-        const obj = value as Record<string, any>;
-
-        if (Array.isArray(obj.choices) && obj.choices[0]?.message) {
-            return this.unwrapJsonValue(obj.choices[0].message, depth + 1);
-        }
-
-        if (obj.message) {
-            return this.unwrapJsonValue(obj.message, depth + 1);
-        }
-
-        if (Array.isArray(obj.tool_calls) && obj.tool_calls[0]?.function) {
-            return this.unwrapJsonValue(obj.tool_calls[0].function, depth + 1);
-        }
-
-        if (obj.name === 'AgentOutput' && obj.arguments !== undefined) {
-            return this.unwrapJsonValue(obj.arguments, depth + 1);
-        }
-
-        if (obj.type === 'function' && obj.function) {
-            return this.unwrapJsonValue(obj.function, depth + 1);
-        }
-
-        if (obj.function?.name && obj.function?.arguments !== undefined) {
-            const functionName = String(obj.function.name);
-            const args = this.unwrapJsonValue(obj.function.arguments, depth + 1);
-            if (this.toolRegistry.isKnown(functionName)) {
-                return { ...obj, action: { tool: functionName, args } };
-            }
-            if (functionName === 'AgentOutput') {
-                return this.unwrapJsonValue(args, depth + 1);
-            }
-        }
-
-        if (
-            typeof obj.content === 'string'
-            && !obj.action
-            && !obj.actions
-            && !obj.tool
-            && !obj.name
-        ) {
-            const parsedContent = this.extractJsonObject(obj.content);
-            if (parsedContent !== null) {
-                return this.unwrapJsonValue(parsedContent, depth + 1);
-            }
-        }
-
-        if (obj.name && obj.arguments !== undefined && this.toolRegistry.isKnown(String(obj.name))) {
-            return {
-                ...obj,
-                action: {
-                    tool: String(obj.name),
-                    args: this.unwrapJsonValue(obj.arguments, depth + 1),
-                },
-            };
-        }
-
-        if (obj.arguments !== undefined && !obj.action && !obj.actions) {
-            const parsedArgs = this.unwrapJsonValue(obj.arguments, depth + 1);
-            if (parsedArgs && typeof parsedArgs === 'object' && !Array.isArray(parsedArgs)) {
-                return { ...obj, ...parsedArgs };
-            }
-        }
-
-        return obj;
-    }
-
-    private normalizeResponse(obj: any): LLMResponse | null {
-        const resolved = this.unwrapJsonValue(obj);
-        if (!resolved) return null;
-
-        const result: LLMResponse = {
-            thought: '',
-        };
-
-        const addAction = (action: ToolCall | null) => {
-            if (!action) return;
-            if (!result.action) {
-                result.action = action;
-                return;
-            }
-            result.actions = result.actions || [result.action];
-            result.actions.push(action);
-            delete result.action;
-        };
-
-        if (Array.isArray(resolved)) {
-            for (const entry of resolved) {
-                addAction(this.toolRegistry.normalizeToolCall(entry, (value) => this.unwrapJsonValue(value)));
-            }
-            return result.action || result.actions?.length ? result : null;
-        }
-
-        if (typeof resolved !== 'object') {
-            return null;
-        }
-
-        const source = resolved as Record<string, any>;
-        const reflection = this.extractReflection(source);
-
-        result.thought = this.firstString(
-            source.thought,
-            source.thinking,
-            source.purpose,
-            source.reasoning,
-            source.analysis,
-            source.rationale,
-        ) || '';
-
-        if (reflection) {
-            result.reflection = reflection;
-        }
-
-        if (source.finding) result.finding = source.finding;
-        if (Array.isArray(source.findings)) result.findings = source.findings;
-        else if (source.findings && typeof source.findings === 'object') result.findings = [source.findings];
-
-        result.answer = this.firstString(source.answer, source.final_answer, source.summary, source.result);
-
-        if (source.action !== undefined) {
-            addAction(this.toolRegistry.normalizeToolCall(source.action, (value) => this.unwrapJsonValue(value), source));
-        }
-
-        if (Array.isArray(source.actions)) {
-            for (const action of source.actions) {
-                addAction(this.toolRegistry.normalizeToolCall(action, (value) => this.unwrapJsonValue(value), source));
-            }
-        }
-
-        if (!result.action && !result.actions?.length) {
-            addAction(this.toolRegistry.normalizeToolCall(source, (value) => this.unwrapJsonValue(value)));
-        }
-
-        if (result.actions?.length === 1) {
-            result.action = result.actions[0];
-            delete result.actions;
-        }
-
-        if (
-            result.thought
-            || result.reflection
-            || result.action
-            || result.actions?.length
-            || result.answer
-            || result.finding
-            || result.findings?.length
-        ) {
-            return result;
-        }
-
-        return null;
-    }
-
-    private extractReflection(obj: Record<string, any>): AgentReflection | undefined {
-        const reflectionSource = (obj.reflection && typeof obj.reflection === 'object')
-            ? obj.reflection as Record<string, any>
-            : obj;
-
-        const reflection: AgentReflection = {
-            evaluationPreviousGoal: this.firstString(
-                reflectionSource.evaluation_previous_goal,
-                reflectionSource.evaluationPreviousGoal,
-                reflectionSource.evaluation,
-                reflectionSource.previous_goal,
-            ),
-            memory: this.firstString(
-                reflectionSource.memory,
-                reflectionSource.remember,
-                reflectionSource.notes,
-            ),
-            nextGoal: this.firstString(
-                reflectionSource.next_goal,
-                reflectionSource.nextGoal,
-                reflectionSource.goal,
-                reflectionSource.plan,
-            ),
-        };
-
-        return reflection.evaluationPreviousGoal || reflection.memory || reflection.nextGoal
-            ? reflection
-            : undefined;
-    }
-
-    private firstString(...values: unknown[]): string | undefined {
-        for (const value of values) {
-            if (typeof value === 'string' && value.trim()) {
-                return value.trim();
-            }
-        }
-        return undefined;
-    }
-
     // ═══════════════════════════════════════════════════════════
     //  VULNERABILITY DETECTION & SAVING
     // ═══════════════════════════════════════════════════════════
@@ -1980,182 +1535,15 @@ Rules for subsequent work:
         this.findingTracker.saveFinding(finding);
     }
 
-    private analyzeResponseForVulns(action: ToolCall, response: any): void {
-        this.findingTracker.analyzeResponseForVulns(action, response);
-    }
-
-    //  BROWSER TOOLS — AI-driven browser testing
     // ═══════════════════════════════════════════════════════════
-
-    /**
-     * Ensure a browser session exists and is alive.
-     * If the session is dead or missing, attempt a relaunch.
-     */
-    private async ensureBrowserSession(): Promise<string> {
-        return this.browserSession.ensureSession();
-    }
-
-    /**
-     * Cleanup browser session. Safe to call multiple times.
-     */
-    private async cleanupBrowserSession(): Promise<void> {
-        await this.browserSession.cleanup();
-    }
+    //  BROWSER SESSION (public accessors for routes)
+    // ═══════════════════════════════════════════════════════════
 
     /**
      * Get the current browser session ID. Exposed for show/hide API.
      */
     public getBrowserSessionId(): string | null {
         return this.browserSession.getSessionId();
-    }
-
-    // ── Browser Tool Implementations ──
-
-    private async executeBrowserNavigate(toolCall: ToolCall): Promise<any> {
-        const sessionId = await this.ensureBrowserSession();
-        const url = toolCall.args?.url;
-        if (!url) return { error: 'Missing required arg: url' };
-
-        this.log('tool', `🌐 browser_navigate → ${url}`);
-        const result = await browserService.executeAction(sessionId, {
-            type: 'goto',
-            url,
-        });
-
-        // Track the discovered endpoint + update coverage
-        try {
-            const pathname = new URL(url).pathname;
-            this.discoveredEndpoints.add(pathname);
-            this.coverageTracker.markExercisedInBrowser(pathname, 'GET');
-            this.coverageTracker.inferWorkflowFromRoute(pathname);
-        } catch { /* malformed URL */ }
-
-        // Delta analysis after navigation
-        this.deltaFrontendAnalysis('navigation').catch(() => { /* non-fatal */ });
-        await this.syncAuthFromBrowser();
-
-        return result;
-    }
-
-    private async executeBrowserPageState(): Promise<any> {
-        const sessionId = await this.ensureBrowserSession();
-        this.log('tool', '🌐 browser_get_page_state');
-        const state = await browserService.getFullPageState(sessionId);
-
-        this.browserSession.syncAuthFromPageState(state, 'primary-user');
-
-        return {
-            ...state,
-            cookies: state.contextCookies || [],
-            localStorage: state.localStorageData || {},
-            sessionStorage: state.sessionStorageData || {},
-        };
-    }
-
-    private async executeBrowserFrontendAnalysis(): Promise<any> {
-        const sessionId = await this.ensureBrowserSession();
-        this.log('tool', '🌐 browser_get_frontend_analysis');
-        const analysis = await browserService.getFrontendAnalysis(sessionId);
-
-        // Feed discovered endpoints into the orchestrator's tracking
-        if (analysis.apiEndpoints?.length > 0) {
-            analysis.apiEndpoints.forEach((ep: string) => this.discoveredEndpoints.add(ep));
-        }
-        await this.refreshEndpointInventory('browser-tool', false);
-
-        return analysis;
-    }
-
-    private async executeBrowserFillSubmit(toolCall: ToolCall): Promise<any> {
-        const sessionId = await this.ensureBrowserSession();
-        const { fields, submit_selector } = toolCall.args || {};
-        if (!fields || !Array.isArray(fields)) {
-            return { error: 'Missing required arg: fields (array of {selector, value})' };
-        }
-
-        this.log('tool', `🌐 browser_fill_and_submit (${fields.length} fields)`);
-
-        // Fill each field sequentially
-        for (const field of fields) {
-            if (!field.selector || field.value === undefined) continue;
-            await browserService.executeAction(sessionId, {
-                type: 'fill',
-                selector: field.selector,
-                value: String(field.value),
-            });
-        }
-
-        // Submit if a selector is provided
-        if (submit_selector) {
-            await browserService.executeAction(sessionId, {
-                type: 'click',
-                selector: submit_selector,
-            });
-            // Wait for navigation after submit
-            try {
-                await browserService.executeAction(sessionId, {
-                    type: 'waitForNavigation',
-                    timeout: 5000,
-                });
-            } catch { /* navigation may not happen for AJAX forms */ }
-        }
-
-        // Return new page state after submission
-        const newState = await browserService.getPageState(sessionId);
-
-        // Delta analysis after form submission
-        this.deltaFrontendAnalysis('form-submission').catch(() => { /* non-fatal */ });
-        await this.syncAuthFromBrowser();
-
-        return {
-            submitted: true,
-            newUrl: newState?.url || 'unknown',
-            newTitle: newState?.title || '',
-            forms: newState?.forms?.length || 0,
-        };
-    }
-
-    private async executeBrowserEvaluateJs(toolCall: ToolCall): Promise<any> {
-        const sessionId = await this.ensureBrowserSession();
-        const script = toolCall.args?.script;
-        if (!script) return { error: 'Missing required arg: script' };
-
-        this.log('tool', `🌐 browser_evaluate_js (${script.substring(0, 80)}...)`);
-        const result = await browserService.executeAction(sessionId, {
-            type: 'evaluate',
-            script,
-        });
-        return result;
-    }
-
-    private async executeBrowserScreenshot(): Promise<any> {
-        const sessionId = await this.ensureBrowserSession();
-        this.log('tool', '🌐 browser_screenshot');
-
-        const result = await browserService.executeAction(sessionId, {
-            type: 'screenshot',
-        });
-
-        return {
-            captured: true,
-            mimeType: result?.mimeType || 'image/png',
-            sizeBytes: result?.base64?.length || 0,
-            note: 'Screenshot captured and stored. Can be used as finding evidence.',
-        };
-    }
-
-    private async executeBrowserCorrelateBurp(): Promise<any> {
-        const sessionId = await this.ensureBrowserSession();
-        this.log('tool', '🌐 browser_correlate_burp');
-        const correlation = await browserService.correlateBrowserWithBurp(sessionId);
-
-        // Track newly discovered untested endpoints
-        if (correlation?.frontendOnlyEndpoints?.length > 0) {
-            correlation.frontendOnlyEndpoints.forEach((ep: string) => this.discoveredEndpoints.add(ep));
-            this.log('system', `Browser⇔Burp correlation: ${correlation.frontendOnlyEndpoints.length} untested endpoints found`);
-        }
-
-        return correlation;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2215,11 +1603,6 @@ Rules for subsequent work:
         }
     }
 
-    private estimateCvss(severity: string): number {
-        const scores: Record<string, number> = { 'critical': 9.5, 'high': 8.0, 'medium': 5.5, 'low': 3.0, 'info': 0.0 };
-        return scores[severity?.toLowerCase()] || 5.0;
-    }
-
     private async delay(ms: number) {
         await new Promise(r => setTimeout(r, ms));
     }
@@ -2245,353 +1628,6 @@ Rules for subsequent work:
         this.logLedger.persistToFile(path.join(__dirname, '../../logs', `${this.scanId}.log`));
     }
 
-    //  PENTESTER LOOP v2: Harvest → Classify → Hypothesize → Validate
-    // ═══════════════════════════════════════════════════════════
-
-    private async deltaFrontendAnalysis(trigger: string): Promise<void> {
-        const browserSessionId = this.browserSession.getSessionId();
-        if (!browserSessionId) return;
-
-        this.log('system', `🔍 Delta frontend analysis (trigger: ${trigger})`);
-        try {
-            const isAlive = await browserService.isSessionAlive(browserSessionId);
-            if (!isAlive) return;
-
-            const newAnalysis = await browserService.getFrontendAnalysis(browserSessionId);
-            const newEndpoints = (newAnalysis.apiEndpoints || []).filter(
-                (ep: string) => !this.discoveredEndpoints.has(ep)
-            );
-
-            if (newEndpoints.length > 0) {
-                newEndpoints.forEach((ep: string) => {
-                    this.discoveredEndpoints.add(ep);
-                    this.coverageTracker.addRoute(ep, 'GET', 'frontend-js');
-                });
-                this.log('system', `✓ Delta analysis: ${newEndpoints.length} new endpoint(s) discovered`);
-                this.conversationHistory.push({
-                    role: 'user',
-                    content: `[SYSTEM] Frontend analysis update (after ${trigger}): New endpoints: ${newEndpoints.join(', ')}` 
-                });
-            }
-
-            // Track new frontend routes
-            if (newAnalysis.frontendRoutes?.length > 0) {
-                newAnalysis.frontendRoutes.forEach((r: string) => this.coverageTracker.addRoute(r, 'GET', 'frontend-js'));
-            }
-
-            if (newEndpoints.length > 0) {
-                await this.refreshEndpointInventory(`delta-${trigger}`, false);
-            }
-        } catch (e: any) {
-            this.log('error', `Delta frontend analysis failed (non-fatal): ${e.message}`);
-        }
-    }
-
-    /**
-     * Run a full harvest → classify → promote → hypothesize cycle.
-     * Called at harvest checkpoints in the main loop.
-     */
-    private async runHarvestCycle(): Promise<void> {
-        let targetHost = '';
-        try { targetHost = new URL(this.targetUrl).hostname; } catch { return; }
-
-        this.log('system', '═══ HARVEST CYCLE ═══');
-
-        // 1. Harvest new requests from Burp
-        const newRequests = await this.harvester.harvest(this.burp, targetHost);
-        if (newRequests.length === 0) {
-            this.log('system', '  No new requests harvested');
-            return;
-        }
-
-        this.log('system', `  Harvested ${newRequests.length} new request(s)`);
-
-        // 2. Update coverage from harvested requests
-        for (const req of newRequests) {
-            this.coverageTracker.addRoute(req.path, req.method, 'burp');
-            this.coverageTracker.inferWorkflowFromRoute(req.path);
-        }
-        await this.scanSurface.refreshEndpointInventory('harvest', false);
-
-        // 3. Promote top candidates
-        const promoted = this.harvester.getPromotionCandidates(5);
-        if (promoted.length > 0) {
-            this.log('system', `  Promoted ${promoted.length} request(s) for active testing:`);
-            for (const p of promoted) {
-                this.log('system', `    → ${p.reason}`);
-                this.coverageTracker.markPromoted(p.request.path, p.request.method);
-
-                // 4. Generate hypotheses for promoted requests
-                const hypotheses = this.hypothesisEngine.generateFromRequest(p.request);
-                for (const h of hypotheses) {
-                    this.log('system', `    ⚡ Hypothesis ${h.id}: ${h.type} on ${h.parameter || h.targetEndpoint} (confidence: ${h.confidence}%)`);
-                }
-            }
-        } else {
-            this.log('system', `  No requests scored high enough for promotion`);
-        }
-
-        // 5. Inject harvest summary into conversation
-        const harvesterSummary = this.harvester.getSummary();
-        const hypSummary = this.hypothesisEngine.getSummaryForPrompt();
-        const covSummary = this.coverageTracker.getSummaryForPrompt();
-
-        this.conversationHistory.push({
-            role: 'user',
-            content: `[SYSTEM] Harvest cycle complete:\n  Requests: ${harvesterSummary.total} total, ${harvesterSummary.promoted} promoted\n  ${hypSummary}\n  ${covSummary}`
-        });
-    }
-
-    // ── Pentester Loop Tool Implementations ──
-
-    private async executeHarvestTraffic(): Promise<any> {
-        this.log('tool', '📡 harvest_traffic');
-        let targetHost = '';
-        try { targetHost = new URL(this.targetUrl).hostname; } catch { /* skip */ }
-
-        const newRequests = await this.harvester.harvest(this.burp, targetHost);
-
-        // Update coverage
-        for (const req of newRequests) {
-            this.coverageTracker.addRoute(req.path, req.method, 'burp');
-            this.coverageTracker.inferWorkflowFromRoute(req.path);
-        }
-
-        // Auto-promote
-        const promoted = this.harvester.getPromotionCandidates(5);
-        for (const p of promoted) {
-            this.coverageTracker.markPromoted(p.request.path, p.request.method);
-            this.hypothesisEngine.generateFromRequest(p.request);
-        }
-
-        await this.persistRuntimeCheckpoint('harvest-traffic-tool');
-
-        return {
-            newRequests: newRequests.length,
-            promoted: promoted.map(p => ({
-                id: p.request.id,
-                method: p.request.method,
-                path: p.request.path,
-                score: p.request.interestScore,
-                classification: p.request.classification,
-                reason: p.reason,
-            })),
-            summary: this.harvester.getSummary(),
-        };
-    }
-
-    private async executeGetHypotheses(toolCall: ToolCall): Promise<any> {
-        const status = toolCall.args?.status || 'all';
-        this.log('tool', `📋 get_hypotheses (status: ${status})`);
-
-        const hypotheses = this.hypothesisEngine.getAll(status as any);
-        return {
-            count: hypotheses.length,
-            statusCounts: this.hypothesisEngine.getStatusCounts(),
-            hypotheses: hypotheses.map(h => ({
-                id: h.id,
-                type: h.type,
-                target: `${h.targetMethod} ${h.targetEndpoint}`,
-                parameter: h.parameter,
-                confidence: h.confidence,
-                status: h.status,
-                rationale: h.rationale.substring(0, 150),
-                nextAction: h.nextAction,
-                evidenceCount: h.evidence.length,
-            })),
-        };
-    }
-
-    private async executeGetCoverage(): Promise<any> {
-        this.log('tool', '📊 get_coverage');
-        return this.coverageTracker.getSummary();
-    }
-
-    private async executeRepeaterTest(toolCall: ToolCall): Promise<any> {
-        const { requestId, mutations } = toolCall.args || {};
-        if (!requestId) return { error: 'Missing required arg: requestId' };
-        if (!mutations || !Array.isArray(mutations)) return { error: 'Missing required arg: mutations (array)' };
-
-        const request = this.harvester.getById(requestId);
-        if (!request) return { error: `Request ${requestId} not found in harvest pool. Use harvest_traffic first.` };
-
-        this.log('tool', `🔬 repeater_test: ${request.method} ${request.path} (${mutations.length} mutation(s))`);
-
-        const results: any[] = [];
-        const defaultIdentityId = resolveAuthIdentityId(toolCall.args);
-        const defaultPreserveExplicitAuth = toolCall.args?.preserveExplicitAuth === true;
-
-        for (const mutation of mutations) {
-            try {
-                // Build mutated request
-                const mutatedUrl = this.applyUrlMutation(request.url, mutation.parameter, mutation.newValue);
-                const mutatedBody = this.applyBodyMutation(request.requestBody, mutation.parameter, mutation.newValue);
-                const mutatedHeaders = { ...request.requestHeaders };
-                const mutationIdentityId = typeof mutation.identityId === 'string' && mutation.identityId.trim()
-                    ? mutation.identityId.trim()
-                    : defaultIdentityId;
-
-                // Apply header mutations (for auth bypass tests)
-                if (mutation.parameter === 'Authorization') {
-                    if (mutation.newValue) mutatedHeaders['authorization'] = mutation.newValue;
-                    else delete mutatedHeaders['authorization'];
-                }
-                if (mutation.parameter === 'Cookie') {
-                    if (mutation.newValue) mutatedHeaders['cookie'] = mutation.newValue;
-                    else delete mutatedHeaders['cookie'];
-                }
-
-                const preserveExplicitAuth = defaultPreserveExplicitAuth ||
-                    mutation.parameter === 'Authorization' ||
-                    mutation.parameter === 'Cookie';
-
-                const preparedRequest = this.authManager.prepareRequest(
-                    mutatedHeaders,
-                    mutatedBody || '',
-                    mutatedUrl,
-                    request.method,
-                    mutationIdentityId,
-                    preserveExplicitAuth,
-                );
-
-                // Send through Burp
-                const response = await this.burp.callTool('send_http_request', {
-                    method: request.method,
-                    url: mutatedUrl,
-                    headers: preparedRequest.headers,
-                    body: preparedRequest.body || '',
-                });
-
-                // Build response snapshots for diffing
-                const originalSnapshot: ResponseSnapshot = {
-                    statusCode: request.statusCode,
-                    headers: request.responseHeaders,
-                    body: request.responseBody,
-                    mimeType: request.mimeType,
-                };
-
-                // Parse response from Burp MCP
-                const normalizedResponse = normalizeSendHttpResponse(response);
-                const mutatedSnapshot: ResponseSnapshot = {
-                    statusCode: normalizedResponse.statusCode,
-                    headers: normalizedResponse.headers as Record<string, string>,
-                    body: normalizedResponse.body.substring(0, 5000),
-                };
-
-                // Diff
-                const diff = diffResponses(originalSnapshot, mutatedSnapshot);
-
-                // Update hypothesis if linked
-                if (mutation.hypothesisId) {
-                    this.hypothesisEngine.updateFromDiff(mutation.hypothesisId, mutation.description, diff);
-                    this.harvester.linkHypothesis(requestId, mutation.hypothesisId);
-                    this.coverageTracker.markVulnTested(request.path, request.method, mutation.vulnType || 'unknown', mutation.hypothesisId);
-
-                    // If hypothesis confirmed, save as finding
-                    const hyp = this.hypothesisEngine.getById(mutation.hypothesisId);
-                    if (hyp && hyp.status === 'confirmed') {
-                        this.saveFinding({
-                            name: `${hyp.type} - ${hyp.targetEndpoint}${hyp.parameter ? ` (${hyp.parameter})` : ''}`,
-                            severity: this.hypothesisTypeToSeverity(hyp.type),
-                            description: hyp.rationale,
-                            evidence: hyp.evidence.map(e => `${e.action}: ${e.result}`).join('\n'),
-                            endpoint: request.url,
-                            method: request.method,
-                            cwe: this.hypothesisTypeToCWE(hyp.type),
-                        });
-                    }
-                }
-
-                results.push({
-                    mutation: mutation.description,
-                    parameter: mutation.parameter,
-                    originalValue: mutation.originalValue,
-                    newValue: mutation.newValue,
-                    diff: {
-                        significant: diff.significant,
-                        summary: diff.summary,
-                        statusChange: diff.statusCodeChanged ? `${diff.originalStatus} → ${diff.mutatedStatus}` : null,
-                        keywordSignals: diff.keywordSignals,
-                    },
-                });
-
-            } catch (e: any) {
-                results.push({
-                    mutation: mutation.description,
-                    error: e.message,
-                });
-            }
-        }
-
-        await this.persistRuntimeCheckpoint('repeater-test');
-        return { requestId, path: request.path, method: request.method, results };
-    }
-
-    // ── Helpers for Repeater mutations ──
-
-    private applyUrlMutation(url: string, param: string, newValue: string): string {
-        try {
-            const u = new URL(url);
-            if (u.searchParams.has(param)) {
-                u.searchParams.set(param, newValue);
-                return u.toString();
-            }
-            // Check path segments — replace numeric/UUID segments
-            const segments = u.pathname.split('/');
-            for (let i = 0; i < segments.length; i++) {
-                if (param === `path_segment_${i}` || segments[i] === param) {
-                    segments[i] = newValue;
-                }
-            }
-            u.pathname = segments.join('/');
-            return u.toString();
-        } catch {
-            return url;
-        }
-    }
-
-    private applyBodyMutation(body: string, param: string, newValue: string): string {
-        if (!body) return body;
-        try {
-            const obj = JSON.parse(body);
-            if (typeof obj === 'object' && obj !== null) {
-                obj[param] = newValue;
-                return JSON.stringify(obj);
-            }
-        } catch {
-            // Form-encoded
-            try {
-                const params = new URLSearchParams(body);
-                if (params.has(param)) {
-                    params.set(param, newValue);
-                    return params.toString();
-                }
-            } catch { /* return original */ }
-        }
-        return body;
-    }
-
-    private hypothesisTypeToSeverity(type: string): string {
-        const map: Record<string, string> = {
-            'idor': 'high', 'sqli': 'critical', 'xss-reflected': 'medium', 'xss-stored': 'high',
-            'auth-bypass': 'critical', 'csrf-bypass': 'medium', 'ssrf': 'high',
-            'privilege-escalation': 'critical', 'mass-assignment': 'high', 'path-traversal': 'high',
-            'info-disclosure': 'low', 'workflow-bypass': 'medium', 'graphql-overreach': 'medium',
-            'hidden-admin': 'high', 'tenant-crossover': 'critical', 'rate-limit-bypass': 'low',
-        };
-        return map[type] || 'medium';
-    }
-
-    private hypothesisTypeToCWE(type: string): string {
-        const map: Record<string, string> = {
-            'idor': 'CWE-639', 'sqli': 'CWE-89', 'xss-reflected': 'CWE-79', 'xss-stored': 'CWE-79',
-            'auth-bypass': 'CWE-287', 'csrf-bypass': 'CWE-352', 'ssrf': 'CWE-918',
-            'privilege-escalation': 'CWE-269', 'mass-assignment': 'CWE-915', 'path-traversal': 'CWE-22',
-            'info-disclosure': 'CWE-200', 'graphql-overreach': 'CWE-200', 'hidden-admin': 'CWE-862',
-        };
-        return map[type] || '';
-    }
-
     /**
      * Get v2 pentester loop state — exposed via getState for /live endpoint.
      */
@@ -2602,19 +1638,9 @@ Rules for subsequent work:
         coverageSummary: { routesSeen: number; exercised: number; promoted: number; untested: number; coveragePercentage: number };
         endpointInventory: EndpointInventorySnapshot | null;
     } {
-        const harvSummary = this.harvester.getSummary();
-        const covSummary = this.coverageTracker.getSummary();
+        const loopState = this.domainCoordinator.getPentesterLoopState();
         return {
-            harvestedRequestCount: harvSummary.total,
-            promotedRequestCount: harvSummary.promoted,
-            hypothesisCount: this.hypothesisEngine.getStatusCounts(),
-            coverageSummary: {
-                routesSeen: covSummary.routesSeen,
-                exercised: covSummary.routesExercisedInBrowser,
-                promoted: covSummary.requestsPromoted,
-                untested: covSummary.untestedRoutes.length,
-                coveragePercentage: covSummary.coveragePercentage,
-            },
+            ...loopState,
             endpointInventory: this.scanSurface.getEndpointInventory(),
         };
     }
