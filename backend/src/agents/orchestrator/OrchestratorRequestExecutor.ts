@@ -45,7 +45,7 @@ export class OrchestratorRequestExecutor {
         return this.lastExchange;
     }
 
-    public async execute(toolCall: ToolCall): Promise<any> {
+    public async execute(toolCall: ToolCall<'send_http_request'>): Promise<any> {
         const url = toolCall.args.url;
         const method = toolCall.args.method || 'GET';
         const identityId = resolveAuthIdentityId(toolCall.args);

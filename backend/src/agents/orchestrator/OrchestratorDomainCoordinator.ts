@@ -135,7 +135,7 @@ export class OrchestratorDomainCoordinator {
         };
     }
 
-    public async executeGetHypotheses(toolCall: ToolCall): Promise<any> {
+    public async executeGetHypotheses(toolCall: ToolCall<'get_hypotheses'>): Promise<any> {
         const status = toolCall.args?.status || 'all';
         this.options.log('tool', `📋 get_hypotheses (status: ${status})`);
 
@@ -162,7 +162,7 @@ export class OrchestratorDomainCoordinator {
         return this.coverageTracker.getSummary();
     }
 
-    public async executeRepeaterTest(toolCall: ToolCall): Promise<any> {
+    public async executeRepeaterTest(toolCall: ToolCall<'repeater_test'>): Promise<any> {
         const { requestId, mutations } = toolCall.args || {};
         if (!requestId) return { error: 'Missing required arg: requestId' };
         if (!mutations || !Array.isArray(mutations)) return { error: 'Missing required arg: mutations (array)' };

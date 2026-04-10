@@ -1,5 +1,6 @@
 import { browserService } from '../../services/BrowserService';
 import { AuthStateManager } from '../../services/auth';
+import { OrchestratorBrowserRuntime } from './OrchestratorBrowserRuntime';
 
 type LogFn = (channel: 'system' | 'error' | 'debug', message: string) => void;
 
@@ -8,6 +9,7 @@ interface OrchestratorBrowserSessionOptions {
     targetUrl: string;
     scanId: string;
     authManager: AuthStateManager;
+    browser?: OrchestratorBrowserRuntime;
     log?: LogFn;
 }
 
@@ -16,6 +18,10 @@ export class OrchestratorBrowserSession {
     private cleanupPromise: Promise<void> | null = null;
 
     constructor(private readonly options: OrchestratorBrowserSessionOptions) {}
+
+    private get browser(): OrchestratorBrowserRuntime {
+        return this.options.browser || browserService;
+    }
 
     public getSessionId(): string | null {
         return this.browserSessionId;
@@ -26,12 +32,12 @@ export class OrchestratorBrowserSession {
     }
 
     public async syncAuthFromBrowser(identityId: string = 'primary-user'): Promise<void> {
-        if (!this.browserSessionId || !browserService.isSessionAlive(this.browserSessionId)) {
+        if (!this.browserSessionId || !this.browser.isSessionAlive(this.browserSessionId)) {
             return;
         }
 
         try {
-            const pageState = await browserService.getFullPageState(this.browserSessionId);
+            const pageState = await this.browser.getFullPageState(this.browserSessionId);
             this.syncAuthFromPageState(pageState, identityId);
         } catch (error: any) {
             this.options.log?.('debug', `Browser auth sync failed (non-fatal): ${error.message}`);
@@ -48,14 +54,14 @@ export class OrchestratorBrowserSession {
     }
 
     public async seedBrowserFromAuthManager(identityId: string = 'primary-user'): Promise<void> {
-        if (!this.browserSessionId || !browserService.isSessionAlive(this.browserSessionId)) {
+        if (!this.browserSessionId || !this.browser.isSessionAlive(this.browserSessionId)) {
             return;
         }
 
         try {
             const cookies = this.options.authManager.exportForBrowser(identityId);
             if (cookies.length > 0) {
-                await browserService.syncCookiesToSession(this.browserSessionId, cookies);
+                await this.browser.syncCookiesToSession(this.browserSessionId, cookies);
             }
         } catch (error: any) {
             this.options.log?.('debug', `Browser auth seed failed (non-fatal): ${error.message}`);
@@ -63,12 +69,12 @@ export class OrchestratorBrowserSession {
     }
 
     public async ensureSession(): Promise<string> {
-        if (this.browserSessionId && browserService.isSessionAlive(this.browserSessionId)) {
+        if (this.browserSessionId && this.browser.isSessionAlive(this.browserSessionId)) {
             return this.browserSessionId;
         }
 
         if (this.browserSessionId) {
-            const visibility = browserService.getSessionVisibility(this.browserSessionId);
+            const visibility = this.browser.getSessionVisibility(this.browserSessionId);
             if (visibility && !visibility.isLive) {
                 this.options.log?.(
                     'system',
@@ -79,7 +85,7 @@ export class OrchestratorBrowserSession {
 
         this.options.log?.('system', 'Browser session not found. Re-launching headless browser...');
         try {
-            this.browserSessionId = await browserService.launchSession(this.options.userId || 1, {
+            this.browserSessionId = await this.browser.launchSession(this.options.userId || 1, {
                 targetUrl: this.options.targetUrl,
                 scanId: this.options.scanId,
                 headless: true,
@@ -108,7 +114,7 @@ export class OrchestratorBrowserSession {
         this.browserSessionId = null;
         this.cleanupPromise = (async () => {
             try {
-                await browserService.closeSession(sessionId);
+                await this.browser.closeSession(sessionId);
                 this.options.log?.('system', 'Browser session closed');
             } catch (error: any) {
                 this.options.log?.('error', `Browser session cleanup failed (non-fatal): ${error.message}`);

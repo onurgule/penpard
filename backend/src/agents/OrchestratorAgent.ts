@@ -18,6 +18,7 @@
 
 import { llmProvider } from '../services/LLMProviderService';
 import { llmQueue } from '../services/LLMQueue';
+import { browserService } from '../services/BrowserService';
 import { logger } from '../utils/logger';
 import path from 'path';
 import { mindsetService, MindsetTTP } from '../services/mindset-service';
@@ -27,7 +28,6 @@ import { AuthStateManager, AuthStartupConfig, AuthStartupInventory } from '../se
 import { EndpointInventorySnapshot } from '../services/EndpointIntelligenceService';
 import { ScanRuntimeCheckpoint } from '../services/runtime/ScanRuntimeCheckpointService';
 import {
-    DEFAULT_WEB_PROMPT,
     buildContinuationScopeMessage,
     buildOperatorInstructionMessages,
 } from '../prompts/orchestratorPrompts';
@@ -48,6 +48,7 @@ import { buildInitialRequestContext, type OrchestratorInitialRequestContext } fr
 import { OrchestratorSingleAgentHarness, HarnessAgentContract } from './orchestrator/OrchestratorSingleAgentHarness';
 import { OrchestratorScanState } from './orchestrator/OrchestratorScanState';
 import { OrchestratorPersistenceSeam } from './orchestrator/OrchestratorPersistenceSeam';
+import { OrchestratorSystemPromptBuilder } from './orchestrator/OrchestratorSystemPromptBuilder';
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
 import { OrchestratorToolRegistry } from './orchestrator/OrchestratorToolRegistry';
 import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
@@ -398,6 +399,7 @@ export class OrchestratorAgent {
     private readonly initialRequestContext: OrchestratorInitialRequestContext | null;
     private readonly domainCoordinator: OrchestratorDomainCoordinator;
     private readonly persistence: OrchestratorPersistenceSeam;
+    private readonly systemPromptBuilder: OrchestratorSystemPromptBuilder;
 
     private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
 
@@ -421,6 +423,7 @@ export class OrchestratorAgent {
 
         this.logLedger = new OrchestratorLogLedger({ scanId });
         this.persistence = new OrchestratorPersistenceSeam();
+        this.systemPromptBuilder = new OrchestratorSystemPromptBuilder(this.persistence);
         this.initialRequestContext = config.initialRequest?.trim()
             ? buildInitialRequestContext(config.initialRequest.trim())
             : null;
@@ -448,6 +451,7 @@ export class OrchestratorAgent {
             targetUrl,
             scanId,
             authManager: this.authManager,
+            browser: browserService,
             log: (channel, message) => this.log(channel, message),
         });
         this.scanSurface = new OrchestratorScanSurface({
@@ -488,6 +492,7 @@ export class OrchestratorAgent {
         this.browserTools = new OrchestratorBrowserTools({
             browserSession: this.browserSession,
             scanSurface: this.scanSurface,
+            browser: browserService,
             log: (channel, message) => this.log(channel, message),
             onFrontendDelta: (trigger, newEndpoints) => {
                 this.state.pushMessage({
@@ -503,20 +508,20 @@ export class OrchestratorAgent {
                 // Burp passthrough tools (owned by OrchestratorBurpToolHandlers)
                 ...burpHandlers,
                 // Request executor (owns auth-aware HTTP dispatch)
-                send_http_request: (toolCall) => this.requestExecutor.execute(toolCall),
+                send_http_request: (toolCall) => this.requestExecutor.execute(toolCall as ToolCall<'send_http_request'>),
                 // Browser tools (owned by OrchestratorBrowserTools)
-                browser_navigate: (toolCall) => this.browserTools.navigate(toolCall),
+                browser_navigate: (toolCall) => this.browserTools.navigate(toolCall as ToolCall<'browser_navigate'>),
                 browser_get_page_state: () => this.browserTools.getPageState(),
                 browser_get_frontend_analysis: () => this.browserTools.getFrontendAnalysis(),
-                browser_fill_and_submit: (toolCall) => this.browserTools.fillAndSubmit(toolCall),
-                browser_evaluate_js: (toolCall) => this.browserTools.evaluateJs(toolCall),
+                browser_fill_and_submit: (toolCall) => this.browserTools.fillAndSubmit(toolCall as ToolCall<'browser_fill_and_submit'>),
+                browser_evaluate_js: (toolCall) => this.browserTools.evaluateJs(toolCall as ToolCall<'browser_evaluate_js'>),
                 browser_screenshot: () => this.browserTools.screenshot(),
                 browser_correlate_burp: () => this.browserTools.correlateBurp(),
                 // Domain engines (owned by OrchestratorDomainCoordinator)
                 harvest_traffic: () => this.domainCoordinator.executeHarvestTraffic(),
-                get_hypotheses: (toolCall) => this.domainCoordinator.executeGetHypotheses(toolCall),
+                get_hypotheses: (toolCall) => this.domainCoordinator.executeGetHypotheses(toolCall as ToolCall<'get_hypotheses'>),
                 get_coverage: () => this.domainCoordinator.executeGetCoverage(),
-                repeater_test: (toolCall) => this.domainCoordinator.executeRepeaterTest(toolCall),
+                repeater_test: (toolCall) => this.domainCoordinator.executeRepeaterTest(toolCall as ToolCall<'repeater_test'>),
             },
         });
         this.llmResponseParser = new OrchestratorLlmResponseParser(
@@ -840,15 +845,11 @@ export class OrchestratorAgent {
         this.log('system', '✓ LLM: Connected');
 
         if (this.state.conversationHistory.length === 0) {
-            const promptTemplate = await this.loadPromptTemplate();
-            const accountsJson = JSON.stringify(this.buildAccountPromptContext(), null, 2);
-            let systemPrompt = promptTemplate
-                .replace('{TARGET_WEBSITE}', this.targetUrl)
-                .replace('{TARGET_WEBSITE_ACCOUNTS}', accountsJson);
-
-            if (this.initialRequestContext) {
-                systemPrompt += this.initialRequestContext.systemPromptAppendix;
-            }
+            const systemPrompt = await this.systemPromptBuilder.build({
+                targetUrl: this.targetUrl,
+                accounts: this.buildAccountPromptContext(),
+                initialRequestAppendix: this.initialRequestContext?.systemPromptAppendix,
+            });
 
             this.state.setSystemPromptContent(systemPrompt);
             this.state.pushMessage({ role: 'system', content: systemPrompt });
@@ -1171,29 +1172,33 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         const endpointInventoryBlock = this.scanSurface.buildEndpointInventoryPromptBlock();
 
         // Build system prompt
-        const promptTemplate = await this.loadPromptTemplate();
-        const accountsJson = JSON.stringify(this.buildAccountPromptContext(), null, 2);
-        let systemPrompt: string;
+        let systemPrompt = await this.systemPromptBuilder.build({
+            targetUrl: this.targetUrl,
+            accounts: this.buildAccountPromptContext(),
+            customSystemPrompt: this.config.customSystemPrompt,
+            sessionCookiesBlock,
+            startupAuthBlock,
+            endpointInventoryBlock,
+            sourceContextBlock,
+            initialRequestAppendix: this.initialRequestContext?.systemPromptAppendix,
+        });
+        const basePrompt = systemPrompt;
 
-        const basePrompt = promptTemplate
-            .replace('{TARGET_WEBSITE}', this.targetUrl)
-            .replace('{TARGET_WEBSITE_ACCOUNTS}', accountsJson);
-
-        if (this.config.customSystemPrompt) {
+        if (false && this.config.customSystemPrompt) {
             systemPrompt = `⚠️ THIS IS THE MOST IMPORTANT — OPERATOR SCAN INSTRUCTIONS (follow these above all else):\n${this.config.customSystemPrompt}\n\n---\n\n${basePrompt}`;
         } else {
             systemPrompt = basePrompt;
         }
-        systemPrompt += sessionCookiesBlock;
-        systemPrompt += startupAuthBlock;
-        systemPrompt += endpointInventoryBlock;
+        systemPrompt += '';
+        systemPrompt += '';
+        systemPrompt += '';
 
-        if (sourceContextBlock) {
+        if (false && sourceContextBlock) {
             systemPrompt += sourceContextBlock;
         }
 
-        if (this.initialRequestContext) {
-            systemPrompt += this.initialRequestContext.systemPromptAppendix;
+        if (false && this.initialRequestContext) {
+            systemPrompt += this.initialRequestContext?.systemPromptAppendix || '';
         }
 
         this.state.setSystemPromptContent(systemPrompt);
@@ -1422,29 +1427,6 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
             role: 'user',
             content: `⚠️ [OPERATOR COMMAND — HIGHEST PRIORITY] The human operator has issued the following directive. You MUST follow this immediately and override any current plan:\n\n${cmd}\n\nACKNOWLEDGE this command and adjust your next actions accordingly.`
         });
-    }
-
-    private async loadPromptTemplate(): Promise<string> {
-        // Priority 1: Check if user has selected a prompt from the Prompt Library
-        try {
-            const { promptLibrary } = await import('../services/PromptLibraryService');
-            const activePrompt = promptLibrary.getActivePromptTemplate();
-            if (activePrompt && activePrompt.template) {
-                logger.info(`Using Prompt Library prompt: ${activePrompt.id}`);
-                return activePrompt.template;
-            }
-        } catch (e) {
-            logger.warn('Could not load from Prompt Library, trying legacy prompts');
-        }
-
-        // Priority 2: Check legacy custom prompts (from Settings > Prompt Templates)
-        const legacyTemplate = this.persistence.loadLegacyPromptTemplate();
-        if (legacyTemplate) {
-            return legacyTemplate;
-        }
-
-        // Priority 3: Built-in default
-        return DEFAULT_WEB_PROMPT;
     }
 
     private async checkLLM(): Promise<boolean> {

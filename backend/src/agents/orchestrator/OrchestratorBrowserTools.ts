@@ -1,30 +1,23 @@
 import { browserService } from '../../services/BrowserService';
 import { OrchestratorBrowserSession } from './OrchestratorBrowserSession';
+import { OrchestratorBrowserRuntime } from './OrchestratorBrowserRuntime';
 import { OrchestratorScanSurface } from './OrchestratorScanSurface';
 import { ToolCall } from './types';
 
 type LogFn = (channel: 'tool' | 'system' | 'error', message: string) => void;
 
-interface BrowserRuntime {
-    executeAction(sessionId: string, action: any): Promise<any>;
-    getFullPageState(sessionId: string): Promise<any>;
-    getPageState(sessionId: string): Promise<any>;
-    getFrontendAnalysis(sessionId: string): Promise<any>;
-    correlateBrowserWithBurp(sessionId: string): Promise<any>;
-}
-
 interface OrchestratorBrowserToolsOptions {
     browserSession: OrchestratorBrowserSession;
     scanSurface: OrchestratorScanSurface;
     log?: LogFn;
-    browser?: BrowserRuntime;
+    browser?: OrchestratorBrowserRuntime;
     onFrontendDelta?: (trigger: string, newEndpoints: string[]) => void;
 }
 
 export class OrchestratorBrowserTools {
     constructor(private readonly options: OrchestratorBrowserToolsOptions) {}
 
-    public async navigate(toolCall: ToolCall): Promise<any> {
+    public async navigate(toolCall: ToolCall<'browser_navigate'>): Promise<any> {
         const sessionId = await this.options.browserSession.ensureSession();
         const url = toolCall.args?.url;
         if (!url) return { error: 'Missing required arg: url' };
@@ -66,7 +59,7 @@ export class OrchestratorBrowserTools {
         return analysis;
     }
 
-    public async fillAndSubmit(toolCall: ToolCall): Promise<any> {
+    public async fillAndSubmit(toolCall: ToolCall<'browser_fill_and_submit'>): Promise<any> {
         const sessionId = await this.options.browserSession.ensureSession();
         const { fields, submit_selector } = toolCall.args || {};
         if (!fields || !Array.isArray(fields)) {
@@ -112,7 +105,7 @@ export class OrchestratorBrowserTools {
         };
     }
 
-    public async evaluateJs(toolCall: ToolCall): Promise<any> {
+    public async evaluateJs(toolCall: ToolCall<'browser_evaluate_js'>): Promise<any> {
         const sessionId = await this.options.browserSession.ensureSession();
         const script = toolCall.args?.script;
         if (!script) return { error: 'Missing required arg: script' };
@@ -156,7 +149,7 @@ export class OrchestratorBrowserTools {
         }
     }
 
-    private get browser(): BrowserRuntime {
+    private get browser(): OrchestratorBrowserRuntime {
         return this.options.browser || browserService;
     }
 }

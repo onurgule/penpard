@@ -1,4 +1,4 @@
-import { ToolCall } from './types';
+import { KnownToolName, ToolCall } from './types';
 
 type ToolHandler = (toolCall: ToolCall) => Promise<any>;
 type JsonUnwrapper = (value: any) => any;
@@ -222,7 +222,7 @@ export class OrchestratorToolRegistry {
         const action = unwrapJsonValue(rawAction);
 
         if (typeof action === 'string') {
-            const tool = this.canonicalize(action);
+            const tool = this.canonicalize(action) as KnownToolName;
             if (!this.isKnown(tool)) return null;
             return {
                 tool,
@@ -237,7 +237,7 @@ export class OrchestratorToolRegistry {
         const actionObj = action as Record<string, any>;
         const explicitToolName = firstString(actionObj.tool, actionObj.name);
         if (explicitToolName) {
-            const tool = this.canonicalize(explicitToolName);
+            const tool = this.canonicalize(explicitToolName) as KnownToolName;
             if (!this.isKnown(tool)) return null;
             return {
                 tool,
@@ -253,7 +253,7 @@ export class OrchestratorToolRegistry {
         const entries = Object.entries(actionObj);
         if (entries.length === 1) {
             const [toolName, toolArgs] = entries[0];
-            const tool = this.canonicalize(toolName);
+            const tool = this.canonicalize(toolName) as KnownToolName;
             if (this.isKnown(tool)) {
                 return {
                     tool,
