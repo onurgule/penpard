@@ -4,47 +4,30 @@ import {
     getScan,
     getScanEndpointInventory,
     getScanLogs,
-    getVulnerabilitiesByScan,
     saveChatMessage,
     saveScanLogs,
     updateScanStatus,
 } from '../../db/init';
 import { browserService } from '../BrowserService';
-import { BurpMCPClient } from '../burp-mcp';
-import { defaultAuthStartupConfig, redactAuthStartupConfig } from '../web-auth-startup-config';
+import { redactAuthStartupConfig } from '../web-auth-startup-config';
 import { logger } from '../../utils/logger';
 import { scanRuntimeCheckpointService } from './ScanRuntimeCheckpointService';
 import { ScanRuntimeRegistry, scanRuntimeRegistry } from './ScanRuntimeRegistry';
-
-interface ScanRecord {
-    id: string;
-    target: string;
-    status: string;
-    user_id: number;
-    initial_request?: string | null;
-    [key: string]: any;
-}
-
-interface WebScanRuntimeConfig {
-    userId?: number;
-    rateLimit?: number;
-    maxIterations?: number;
-    maxPlanRounds?: number;
-    useNuclei?: boolean;
-    useFfuf?: boolean;
-    idorUsers?: any[];
-    parallelAgents?: number;
-    requestedParallelAgents?: number;
-    customSystemPrompt?: string;
-    sessionCookies?: string;
-    initialRequest?: string;
-    sourcePackagePath?: string;
-    sourceAnalysisMode?: string;
-    authStartup?: any;
-}
+import {
+    PreparedAgentRuntime,
+    PreparedPoolRuntime,
+    PreparedScanRuntime,
+    ScanRecord,
+    ScanRuntimeFactory,
+    WebScanRuntimeConfig,
+    scanRuntimeFactory,
+} from './ScanRuntimeFactory';
 
 export class ScanRuntimeService {
-    constructor(private readonly registry: ScanRuntimeRegistry = scanRuntimeRegistry) {}
+    constructor(
+        private readonly registry: ScanRuntimeRegistry = scanRuntimeRegistry,
+        private readonly runtimeFactory: ScanRuntimeFactory = scanRuntimeFactory,
+    ) {}
 
     public launchWebScan(scanId: string, targetUrl: string, config: WebScanRuntimeConfig = {}): void {
         void this.startWebScan(scanId, targetUrl, config).catch(() => {
@@ -85,38 +68,11 @@ export class ScanRuntimeService {
         updateScanStatus(scanId, 'initializing');
 
         try {
-            const burpMCP = new BurpMCPClient();
-            let mcpAvailable = false;
+            const runtime = await this.runtimeFactory.createWebRuntime(scanId, targetUrl, config);
+            logger.info('Using Burp MCP for scanning', { scanId, executionMode: runtime.executionMode });
 
-            try {
-                mcpAvailable = await burpMCP.isAvailable();
-            } catch {
-                logger.warn('Burp MCP connection check failed');
-            }
-
-            if (!mcpAvailable) {
-                const errorMsg = 'Burp Suite is not connected. Cannot start scan without Burp MCP. Please ensure Burp Suite is running with the PenPard extension loaded (port 9876).';
-                logger.error(errorMsg, { scanId });
-                updateScanStatus(scanId, 'failed', errorMsg);
-                return;
-            }
-
-            logger.info('Using Burp MCP for scanning', { scanId });
-
-            const requestedParallelAgents = Math.max(
-                1,
-                Number(config.requestedParallelAgents ?? config.parallelAgents) || 1,
-            );
-            if (requestedParallelAgents > 1) {
-                logger.warn('Parallel multi-agent web scan execution is intentionally dormant. Ignoring requested parallelAgents so auth-first startup, browser continuity, and finding evidence stay on the hardened single-agent path.', {
-                    scanId,
-                    requestedParallelAgents,
-                });
-            }
-
-            await this.runSingleAgentScan(scanId, targetUrl, burpMCP, config);
-
-            logger.info('Web scan completed', { scanId });
+            const finalPhase = await this.runPreparedRuntime(runtime);
+            logger.info('Web scan completed', { scanId, executionMode: runtime.executionMode, finalPhase });
         } catch (error: any) {
             logger.error('Web scan error', { scanId, error: error.message });
             updateScanStatus(scanId, 'failed', error.message);
@@ -196,56 +152,13 @@ export class ScanRuntimeService {
             throw new Error('Scan is already running. Use the command input instead.');
         }
 
-        const existingFindings = getVulnerabilitiesByScan(id);
-        const existingEndpoints: string[] = [];
+        const { runtime, continuation } = await this.runtimeFactory.createContinuationRuntime(scan, options);
 
-        for (const finding of existingFindings) {
-            if (finding.request) {
-                const urlMatch = finding.request.match(/(?:GET|POST|PUT|DELETE|PATCH)\s+(https?:\/\/[^\s]+)/i);
-                if (urlMatch) existingEndpoints.push(urlMatch[1]);
-            }
-        }
-
-        const burpMCP = new BurpMCPClient();
-        let mcpAvailable = false;
-        try {
-            mcpAvailable = await burpMCP.isAvailable();
-        } catch {
-            logger.warn('Burp MCP not available for continuation');
-        }
-
-        if (!mcpAvailable) {
-            throw new Error('Burp Suite is not connected. Please ensure Burp is running with the PenPard extension.');
-        }
-
-        const initialRequest = (scan.initial_request && String(scan.initial_request).trim()) ? String(scan.initial_request).trim() : undefined;
-        const agent = new OrchestratorAgent(id, scan.target, {
-            userId: scan.user_id,
-            rateLimit: 5,
-            useNuclei: false,
-            useFfuf: false,
-            idorUsers: [],
-            customSystemPrompt: options.instruction,
-            initialRequest,
-        }, burpMCP, {
-            checkpoint: (checkpoint) => scanRuntimeCheckpointService.saveCheckpoint(id, checkpoint),
-        });
-
-        this.registry.registerAgent(id, agent);
-
-        saveChatMessage(id, 'human', `[CONTINUE SCAN] ${options.instruction} (${options.iterations} rounds, planning: ${options.planningEnabled ? 'ON' : 'OFF'})`);
+        saveChatMessage(id, 'human', `[CONTINUE SCAN] ${continuation.instruction} (${continuation.iterations} rounds, planning: ${continuation.planningEnabled ? 'ON' : 'OFF'})`);
 
         void (async () => {
             try {
-                await agent.continueScan({
-                    instruction: options.instruction,
-                    iterations: Math.min(Math.max(Number(options.iterations), 1), 20),
-                    planningEnabled: !!options.planningEnabled,
-                    existingFindings,
-                    existingEndpoints: [...new Set(existingEndpoints)],
-                });
-
-                const finalPhase = this.resolveAgentFinalPhase(id, agent, 'completed');
+                const finalPhase = await this.runAgentRuntime(runtime, (agent) => agent.continueScan(continuation));
                 if (finalPhase === 'completed') {
                     updateScanStatus(id, 'completed');
                 }
@@ -253,13 +166,10 @@ export class ScanRuntimeService {
             } catch (error: any) {
                 logger.error('Scan continuation error', { scanId: id, error: error.message });
                 updateScanStatus(id, 'failed', error.message);
-            } finally {
-                this.finalizeAgentRuntime(id, agent);
-                burpMCP.disconnect();
             }
         })();
 
-        return { message: `Scan continuing with ${options.iterations} rounds. Instruction: "${options.instruction.slice(0, 100)}..."` };
+        return { message: `Scan continuing with ${continuation.iterations} rounds. Instruction: "${continuation.instruction.slice(0, 100)}..."` };
     }
 
     public getLiveStatus(scanId: string, scan: ScanRecord, since: number): any {
@@ -389,165 +299,50 @@ export class ScanRuntimeService {
     }
 
     public async startAssistedScan(scanId: string, suggestion: any): Promise<void> {
-        const burp = new BurpMCPClient();
-        const available = await burp.isAvailable();
-        if (!available) {
-            throw new Error('Burp MCP not available');
-        }
-
         updateScanStatus(scanId, 'scanning');
-
-        const focusPrompts: Record<string, string> = {
-            sqli: `FOCUSED SQL INJECTION SCAN: The user was manually testing SQL injection on the following endpoints.
-Your job is to quickly and efficiently test these endpoints with comprehensive SQLi payloads:
-- Time-based blind: ' AND SLEEP(5)--, ' WAITFOR DELAY '0:0:5'--
-- Boolean-based: ' AND '1'='1 vs ' AND '1'='2
-- Error-based: ' AND 1=CONVERT(int,@@version)--
-- UNION-based: ' UNION SELECT NULL,NULL--
-- Stacked queries: '; EXEC xp_cmdshell('whoami')--
-
-Endpoints to test:
-${suggestion.endpoints.join('\n')}
-
-Be fast, focused and thorough. Test each parameter systematically.`,
-
-            xss: `FOCUSED XSS SCAN: The user was manually testing Cross-Site Scripting.
-Test these endpoints with comprehensive XSS payloads:
-- Reflected: <script>alert(1)</script>, <img src=x onerror=alert(1)>
-- DOM-based: javascript:alert(1), " onmouseover="alert(1)
-- Stored: Check if payloads persist across requests
-- Filter bypass: <ScRiPt>alert(1)</ScRiPt>, <svg/onload=alert(1)>
-- Encoding bypass: &#60;script&#62;, %3Cscript%3E
-
-Endpoints to test:
-${suggestion.endpoints.join('\n')}`,
-
-            lfi: `FOCUSED LFI/PATH TRAVERSAL SCAN: The user was testing file inclusion.
-Test these endpoints:
-- Basic traversal: ../../etc/passwd, ....//....//etc/passwd
-- Null byte: ../../../etc/passwd%00
-- Double encoding: ..%252f..%252f..%252fetc/passwd
-- PHP wrappers: php://filter/convert.base64-encode/resource=index.php
-- Windows: ..\\..\\windows\\system32\\drivers\\etc\\hosts
-
-Endpoints to test:
-${suggestion.endpoints.join('\n')}`,
-
-            cmdi: `FOCUSED COMMAND INJECTION SCAN: The user was testing command injection.
-Test these endpoints:
-- Basic: ; ls, | cat /etc/passwd, \`id\`
-- Blind: ; sleep 5, | ping -c 5 127.0.0.1
-- Alternative: $( whoami ), \${IFS}cat\${IFS}/etc/passwd
-- Windows: & dir, | type C:\\windows\\win.ini
-
-Endpoints to test:
-${suggestion.endpoints.join('\n')}`,
-
-            ssrf: `FOCUSED SSRF SCAN: The user was testing Server-Side Request Forgery.
-Test these endpoints:
-- Internal: http://127.0.0.1, http://localhost, http://[::1]
-- Cloud metadata: http://169.254.169.254/latest/meta-data/
-- DNS rebinding: Use alternative IP representations
-- Protocol: file:///etc/passwd, gopher://, dict://
-
-Endpoints to test:
-${suggestion.endpoints.join('\n')}`,
-        };
-
-        const focusPrompt = focusPrompts[suggestion.type] || `Test the following endpoints for ${suggestion.type} vulnerabilities:\n${suggestion.endpoints.join('\n')}`;
-
-        const agent = new OrchestratorAgent(
-            scanId,
-            suggestion.targetHosts[0] || suggestion.endpoints[0]?.split(' ').pop() || 'target',
-            {
-                rateLimit: 5,
-                useNuclei: false,
-                useFfuf: false,
-                idorUsers: [],
-                parallelAgents: 1,
-                customSystemPrompt: focusPrompt,
-                maxIterations: 15,
-            },
-            burp,
-            { checkpoint: (checkpoint) => scanRuntimeCheckpointService.saveCheckpoint(scanId, checkpoint) },
-        );
-
-        this.registry.registerAgent(scanId, agent);
-
-        try {
-            await agent.start();
-        } finally {
-            const finalPhase = this.resolveAgentFinalPhase(scanId, agent, 'completed');
-            this.finalizeAgentRuntime(scanId, agent);
-            burp.disconnect();
-            if (finalPhase === 'completed') {
-                updateScanStatus(scanId, 'completed');
-            }
-        }
+        const runtime = await this.runtimeFactory.createAssistedScanRuntime(scanId, suggestion);
+        const finalPhase = await this.runPreparedRuntime(runtime);
+        logger.info('Assisted scan completed', { scanId, executionMode: runtime.executionMode, finalPhase });
     }
 
-    private async runPoolScan(
-        scanId: string,
-        targetUrl: string,
-        burpMCP: BurpMCPClient,
-        config: WebScanRuntimeConfig,
-        parallelAgents: number,
-    ): Promise<void> {
-        logger.info(`Using AgentPool with ${parallelAgents} parallel workers`, { scanId });
-
-        const poolConfig = {
-            crawlerCount: Math.max(1, Math.floor(parallelAgents * 0.2)),
-            scannerCount: Math.max(1, Math.floor(parallelAgents * 0.4)),
-            fuzzerCount: Math.max(1, Math.floor(parallelAgents * 0.25)),
-            analyzerCount: Math.max(1, Math.floor(parallelAgents * 0.15)),
-            maxIterationsPerWorker: 25,
-            rateLimit: config.rateLimit || 5,
-        };
-
-        const pool = new AgentPool(scanId, targetUrl, burpMCP, poolConfig);
-        this.registry.registerPool(scanId, pool);
-
-        try {
-            await pool.start();
-        } finally {
-            const finalPhase = this.resolveFinalPhase(scanId, 'completed');
-            this.finalizePoolRuntime(scanId, pool, finalPhase);
-            burpMCP.disconnect();
+    private async runPreparedRuntime(runtime: PreparedScanRuntime): Promise<string> {
+        if (runtime.kind === 'pool') {
+            return this.runPoolRuntime(runtime);
         }
+
+        return this.runAgentRuntime(runtime, (agent) => agent.start());
     }
 
-    private async runSingleAgentScan(
-        scanId: string,
-        targetUrl: string,
-        burpMCP: BurpMCPClient,
-        config: WebScanRuntimeConfig,
-    ): Promise<void> {
-        const agent = new OrchestratorAgent(scanId, targetUrl, {
-            userId: config.userId,
-            rateLimit: config.rateLimit || 5,
-            maxIterations: config.maxIterations,
-            maxPlanRounds: config.maxPlanRounds,
-            useNuclei: config.useNuclei || false,
-            useFfuf: config.useFfuf || false,
-            idorUsers: config.idorUsers || [],
-            sessionCookies: config.sessionCookies,
-            initialRequest: config.initialRequest,
-            sourcePackagePath: config.sourcePackagePath,
-            sourceAnalysisMode: config.sourceAnalysisMode,
-            authStartup: config.authStartup || defaultAuthStartupConfig(),
-            customSystemPrompt: config.customSystemPrompt,
-        }, burpMCP, {
-            checkpoint: (checkpoint) => scanRuntimeCheckpointService.saveCheckpoint(scanId, checkpoint),
-        });
+    private async runAgentRuntime(
+        runtime: PreparedAgentRuntime,
+        runner: (agent: OrchestratorAgent) => Promise<void>,
+    ): Promise<string> {
+        this.registry.registerAgent(runtime.scanId, runtime.agent);
 
-        this.registry.registerAgent(scanId, agent);
-
+        let finalPhase: string = runtime.agent.getState().phase;
         try {
-            await agent.start();
+            await runner(runtime.agent);
         } finally {
-            this.finalizeAgentRuntime(scanId, agent);
-            burpMCP.disconnect();
+            finalPhase = this.finalizeAgentRuntime(runtime.scanId, runtime.agent);
+            runtime.burp.disconnect();
         }
+
+        return finalPhase;
+    }
+
+    private async runPoolRuntime(runtime: PreparedPoolRuntime): Promise<string> {
+        this.registry.registerPool(runtime.scanId, runtime.pool);
+
+        let finalPhase = this.resolveFinalPhase(runtime.scanId, 'completed');
+        try {
+            await runtime.pool.start();
+            finalPhase = this.resolveFinalPhase(runtime.scanId, 'completed');
+        } finally {
+            finalPhase = this.finalizePoolRuntime(runtime.scanId, runtime.pool, finalPhase);
+            runtime.burp.disconnect();
+        }
+
+        return finalPhase;
     }
 
     private finalizeAgentRuntime(scanId: string, agent: OrchestratorAgent): string {

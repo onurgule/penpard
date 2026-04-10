@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const { ScanRuntimeService } = require('../src/services/runtime/ScanRuntimeService') as typeof import('../src/services/runtime/ScanRuntimeService');
-const { BurpMCPClient } = require('../src/services/burp-mcp') as typeof import('../src/services/burp-mcp');
 const { createScan, getScan, initDatabase } = require('../src/db/init') as typeof import('../src/db/init');
 const { scanRuntimeCheckpointService } = require('../src/services/runtime/ScanRuntimeCheckpointService') as typeof import('../src/services/runtime/ScanRuntimeCheckpointService');
 
@@ -99,32 +98,179 @@ test('stopScan records stopped scans as terminal rows even when runtime state wa
     assert.ok(scan.completed_at);
 });
 
-test('startWebScan keeps the active production path on the single orchestrator even when parallelAgents is requested', async () => {
-    const originalIsAvailable = BurpMCPClient.prototype.isAvailable;
-    const originalDisconnect = BurpMCPClient.prototype.disconnect;
-    let singleAgentCalls = 0;
+test('continueCompletedScan launches the composed continuation runtime and finalizes it on completion', async () => {
+    await initDatabase();
 
-    BurpMCPClient.prototype.isAvailable = async () => true;
-    BurpMCPClient.prototype.disconnect = () => {};
+    const scanId = `scan-runtime-continue-${Date.now()}`;
+    createScan({
+        id: scanId,
+        userId: 1,
+        type: 'web',
+        target: 'https://app.example.com',
+    });
 
-    const service = new ScanRuntimeService();
-    (service as any).runSingleAgentScan = async () => {
-        singleAgentCalls += 1;
+    const callOrder: string[] = [];
+    const agent = {
+        continueScan: async (options: any) => {
+            callOrder.push(`continue:${options.iterations}:${options.planningEnabled}`);
+        },
+        getState: () => ({ phase: 'completed' }),
+        flushLogsToDB: () => {
+            callOrder.push('flush');
+        },
     };
-    (service as any).runPoolScan = async () => {
-        throw new Error('runPoolScan should stay dormant for web scans');
+    const registry = {
+        hasActiveRuntime: () => false,
+        registerAgent: () => {
+            callOrder.push('register');
+        },
+        captureAgentLogs: (_scanId: string, _agent: any, phase?: string) => {
+            callOrder.push(`capture:${phase}`);
+            return { logs: [], phase };
+        },
+        unregister: () => {
+            callOrder.push('unregister');
+        },
+    };
+    const runtimeFactory = {
+        createContinuationRuntime: async () => ({
+            runtime: {
+                kind: 'agent',
+                scanId,
+                executionMode: 'single-agent',
+                agent,
+                burp: {
+                    disconnect: () => {
+                        callOrder.push('disconnect');
+                    },
+                },
+            },
+            continuation: {
+                instruction: 'Continue the authenticated API testing',
+                iterations: 3,
+                planningEnabled: true,
+                existingFindings: [],
+                existingEndpoints: [],
+            },
+        }),
     };
 
-    try {
-        await service.startWebScan('scan-runtime-single-path', 'https://app.example.com', {
-            parallelAgents: 4,
-        });
-    } finally {
-        BurpMCPClient.prototype.isAvailable = originalIsAvailable;
-        BurpMCPClient.prototype.disconnect = originalDisconnect;
-    }
+    const service = new ScanRuntimeService(registry as any, runtimeFactory as any);
+    (service as any).resolveAgentFinalPhase = () => 'completed';
+    const result = await service.continueCompletedScan({
+        id: scanId,
+        target: 'https://app.example.com',
+        status: 'completed',
+        user_id: 1,
+    } as any, {
+        instruction: 'Continue the authenticated API testing',
+        iterations: 3,
+        planningEnabled: true,
+    });
 
-    assert.equal(singleAgentCalls, 1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.match(result.message, /continuing/i);
+    assert.deepEqual(callOrder, [
+        'register',
+        'continue:3:true',
+        'capture:completed',
+        'flush',
+        'unregister',
+        'disconnect',
+    ]);
+});
+
+test('startWebScan launches the runtime composed by the factory before lifecycle finalization runs', async () => {
+    const callOrder: string[] = [];
+    const agent = {
+        start: async () => {
+            callOrder.push('start');
+        },
+        getState: () => ({ phase: 'completed' }),
+        flushLogsToDB: () => {
+            callOrder.push('flush');
+        },
+    };
+    const registry = {
+        registerAgent: () => {
+            callOrder.push('register');
+        },
+        captureAgentLogs: (_scanId: string, _agent: any, phase?: string) => {
+            callOrder.push(`capture:${phase}`);
+            return { logs: [], phase };
+        },
+        unregister: () => {
+            callOrder.push('unregister');
+        },
+    };
+    const runtimeFactory = {
+        createWebRuntime: async () => ({
+            kind: 'agent',
+            scanId: 'scan-runtime-single-path',
+            executionMode: 'single-agent',
+            agent,
+            burp: {
+                disconnect: () => {
+                    callOrder.push('disconnect');
+                },
+            },
+        }),
+    };
+
+    const service = new ScanRuntimeService(registry as any, runtimeFactory as any);
+    await service.startWebScan('scan-runtime-single-path', 'https://app.example.com', {
+        parallelAgents: 4,
+    });
+
+    assert.deepEqual(callOrder, ['register', 'start', 'capture:completed', 'flush', 'unregister', 'disconnect']);
+});
+
+test('startAssistedScan launches the assisted runtime from the factory on the single-agent lifecycle path', async () => {
+    const callOrder: string[] = [];
+    const agent = {
+        start: async () => {
+            callOrder.push('start');
+        },
+        getState: () => ({ phase: 'completed' }),
+        flushLogsToDB: () => {
+            callOrder.push('flush');
+        },
+    };
+    const registry = {
+        registerAgent: () => {
+            callOrder.push('register');
+        },
+        captureAgentLogs: (_scanId: string, _agent: any, phase?: string) => {
+            callOrder.push(`capture:${phase}`);
+            return { logs: [], phase };
+        },
+        unregister: () => {
+            callOrder.push('unregister');
+        },
+    };
+    const runtimeFactory = {
+        createAssistedScanRuntime: async (_scanId: string, _suggestion: any) => ({
+            kind: 'agent',
+            scanId: 'scan-runtime-assisted-path',
+            executionMode: 'single-agent',
+            agent,
+            burp: {
+                disconnect: () => {
+                    callOrder.push('disconnect');
+                },
+            },
+        }),
+    };
+
+    const service = new ScanRuntimeService(registry as any, runtimeFactory as any);
+    await service.startAssistedScan('scan-runtime-assisted-path', {
+        type: 'xss',
+        endpoints: ['GET https://app.example.com/search?q=test'],
+        targetHosts: ['https://app.example.com'],
+    });
+
+    assert.deepEqual(callOrder, ['register', 'start', 'capture:completed', 'flush', 'unregister', 'disconnect']);
 });
 
 test('getLiveStatus surfaces the persisted runtime checkpoint when no active runtime survives', async () => {

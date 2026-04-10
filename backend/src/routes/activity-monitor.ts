@@ -12,6 +12,7 @@ import { logger } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 import { createScan, updateScanStatus } from '../db/init';
 import { scanRuntimeService } from '../services/runtime/ScanRuntimeService';
+import { resolveFocusedScanTarget } from '../services/FocusedScanPresetCatalog';
 
 const router = Router();
 
@@ -83,7 +84,7 @@ router.post('/suggestions/:id/accept', authenticateToken, async (req: AuthReques
 
         // Create a quick scan targeting the detected endpoints
         const scanId = uuidv4();
-        const targetUrl = suggestion.endpoints[0]?.split(' ').pop() || suggestion.targetHosts[0] || 'unknown';
+        const targetUrl = resolveFocusedScanTarget(suggestion, 'unknown');
 
         createScan({
             id: scanId,

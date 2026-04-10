@@ -40,6 +40,7 @@ import { OrchestratorFallbackPlanner } from './orchestrator/OrchestratorFallback
 import { OrchestratorFindingTracker } from './orchestrator/OrchestratorFindingTracker';
 import { OrchestratorInstructionAnalyzer } from './orchestrator/OrchestratorInstructionAnalyzer';
 import { OrchestratorLogLedger } from './orchestrator/OrchestratorLogLedger';
+import { OrchestratorLogSink } from './orchestrator/OrchestratorLogSink';
 import { OrchestratorLlmResponseParser } from './orchestrator/OrchestratorLlmResponseParser';
 import { OrchestratorPlanner } from './orchestrator/OrchestratorPlanner';
 import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
@@ -400,6 +401,7 @@ export class OrchestratorAgent {
     private readonly domainCoordinator: OrchestratorDomainCoordinator;
     private readonly persistence: OrchestratorPersistenceSeam;
     private readonly systemPromptBuilder: OrchestratorSystemPromptBuilder;
+    private readonly logSink: OrchestratorLogSink;
 
     private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
 
@@ -421,7 +423,8 @@ export class OrchestratorAgent {
         const maxPlanRounds = requested > 0 ? requested : 0;
         this.state = new OrchestratorScanState({ maxIterations, maxPlanRounds });
 
-        this.logLedger = new OrchestratorLogLedger({ scanId });
+        this.logLedger = new OrchestratorLogLedger();
+        this.logSink = new OrchestratorLogSink({ scanId });
         this.persistence = new OrchestratorPersistenceSeam();
         this.systemPromptBuilder = new OrchestratorSystemPromptBuilder(this.persistence);
         this.initialRequestContext = config.initialRequest?.trim()
@@ -1453,7 +1456,8 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         await new Promise(r => setTimeout(r, ms));
     }
     private log(type: string, message: string) {
-        this.logLedger.append(type, message);
+        const entry = this.logLedger.append(type, message);
+        this.logSink.record(entry, this.logLedger);
     }
 
     /**
@@ -1462,16 +1466,16 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
      * Returns the number of logs flushed.
      */
     public flushLogsToDB(): number {
-        return this.logLedger.flushToDB();
+        return this.logSink.flushToDB(this.logLedger);
     }
 
     /** Number of logs that have NOT yet been persisted to the database. */
     public get unflushedLogCount(): number {
-        return this.logLedger.unflushedCount;
+        return this.logSink.getUnflushedCount(this.logLedger);
     }
 
     private saveLogs() {
-        this.logLedger.persistToFile(path.join(__dirname, '../../logs', `${this.scanId}.log`));
+        this.logSink.persistToFile(this.logLedger, path.join(__dirname, '../../logs', `${this.scanId}.log`));
     }
 
     /**

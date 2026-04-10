@@ -8,25 +8,23 @@ import {
     db,
     createScan,
     getScan,
-    updateScanStatus,
     setScanInitialRequest,
     deleteScans,
     getVulnerabilitiesByScan,
     getUserWhitelists,
-    saveChatMessage,
     getChatMessages,
     saveScanConfig,
 } from '../db/init';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
 import { logger, logApiUsage } from '../utils/logger';
 import { burpDispatchService } from '../services/BurpDispatchService';
-import { llmProvider } from '../services/LLMProviderService';
 import { mobileScanService } from '../services/MobileScanService';
 import { activityMonitor } from '../services/ActivityMonitorService';
 import { peekPendingRequest, takePendingRequest } from './penpard';
 import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
 import { extractRoutes } from '../services/source-analysis/utils/route-extractor';
-import { defaultAuthStartupConfig, redactAuthStartupConfig, resolveAuthStartupConfig, toLegacyIdorUsers } from '../services/web-auth-startup-config';
+import { ScanChatServiceError, scanChatService } from '../services/ScanChatService';
+import { scanLaunchConfigService } from '../services/runtime/ScanLaunchConfigService';
 import { scanRuntimeService } from '../services/runtime/ScanRuntimeService';
 import os from 'os';
 
@@ -233,6 +231,40 @@ function getOwnedScanOrRespond(scanId: string, userId: number, res: Response): a
     return scan;
 }
 
+async function resolveScanSourcePath(input: {
+    scanId: string;
+    sourceType?: unknown;
+    sourcePackagePath?: unknown;
+    sourceGitUrl?: unknown;
+    sourceGitToken?: unknown;
+    uploadFile?: Express.Multer.File;
+}): Promise<string | undefined> {
+    const sourceType = typeof input.sourceType === 'string' ? input.sourceType : undefined;
+    const sourcePackagePath = typeof input.sourcePackagePath === 'string' ? input.sourcePackagePath.trim() : undefined;
+    const sourceGitUrl = typeof input.sourceGitUrl === 'string' ? input.sourceGitUrl : undefined;
+    const sourceGitToken = typeof input.sourceGitToken === 'string' ? input.sourceGitToken : undefined;
+
+    if (sourceType === 'zip' && input.uploadFile) {
+        const destDir = path.join(uploadsDir, 'source-zips', input.scanId);
+        logger.info(`Extracting ZIP source to ${destDir}`);
+        const extractedPath = await extractZipArchive(input.uploadFile.path, destDir);
+        try { fs.unlinkSync(input.uploadFile.path); } catch {}
+        return extractedPath;
+    }
+
+    if (sourceType === 'git' && sourceGitUrl) {
+        const destDir = path.join(uploadsDir, 'source-repos', input.scanId);
+        logger.info(`Cloning Git source to ${destDir}`);
+        return cloneGitRepository(sourceGitUrl, sourceGitToken, destDir);
+    }
+
+    if ((!sourceType || sourceType === 'local') && sourcePackagePath) {
+        return sourcePackagePath;
+    }
+
+    return undefined;
+}
+
 // List user's scans
 router.get('/', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
@@ -275,45 +307,14 @@ router.get('/system/select-directory', authenticateToken, async (req: AuthReques
 
 router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: AuthRequest, res: Response) => {
     try {
-        let {
+        const {
             url,
-            rateLimit,
-            useNuclei,
-            useFfuf,
-            idorUsers,
-            parallelAgents,
-            scanInstructions,
-            sessionCookies,
-            iterations,
-            maxPlanRounds: reqMaxPlanRounds,
-            sourcePackagePath,
-            sourceAnalysisMode,
             sourceType,
+            sourcePackagePath,
             sourceGitUrl,
             sourceGitToken,
-            authStartupMode,
-            authCredentials,
-            allowAccountCreation,
-            preferSharedPassword,
         } = req.body;
         const user = req.user!;
-
-        if (typeof idorUsers === 'string') {
-            try { idorUsers = JSON.parse(idorUsers); } catch { idorUsers = []; }
-        }
-        useNuclei = useNuclei === 'true' || useNuclei === true;
-        useFfuf = useFfuf === 'true' || useFfuf === true;
-
-        // Nuclei and FFUF integrations are not yet implemented — warn if requested
-        if (useNuclei) {
-            logger.warn('nucleiEnabled was requested but Nuclei integration is not yet implemented — ignoring', { scanId: 'pre-creation' });
-            useNuclei = false;
-        }
-        if (useFfuf) {
-            logger.warn('ffufEnabled was requested but FFUF integration is not yet implemented — ignoring', { scanId: 'pre-creation' });
-            useFfuf = false;
-        }
-
         if (!url) {
             res.status(400).json({ error: true, message: 'URL is required' });
             return;
@@ -338,87 +339,42 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
             return;
         }
 
-        // Validate source analysis mode if provided
-        const validModes = ['version_aware', 'full_source_aware'];
-        const resolvedSourceMode = sourceAnalysisMode && validModes.includes(sourceAnalysisMode) ? sourceAnalysisMode : undefined;
-
-        // Create scan record
         const scanId = uuidv4();
         
         let finalSourcePath: string | undefined = undefined;
         try {
-            if (sourceType === 'zip' && req.file) {
-                const destDir = path.join(uploadsDir, 'source-zips', scanId);
-                logger.info(`Extracting ZIP source to ${destDir}`);
-                finalSourcePath = await extractZipArchive(req.file.path, destDir);
-                try { fs.unlinkSync(req.file.path); } catch { }
-            } else if (sourceType === 'git' && sourceGitUrl) {
-                const destDir = path.join(uploadsDir, 'source-repos', scanId);
-                logger.info(`Cloning Git source to ${destDir}`);
-                finalSourcePath = await cloneGitRepository(sourceGitUrl, sourceGitToken, destDir);
-            } else if ((!sourceType || sourceType === 'local') && sourcePackagePath) {
-                finalSourcePath = String(sourcePackagePath).trim();
-            }
+            finalSourcePath = await resolveScanSourcePath({
+                scanId,
+                sourceType,
+                sourcePackagePath,
+                sourceGitUrl,
+                sourceGitToken,
+                uploadFile: req.file || undefined,
+            });
         } catch (sourceErr: any) {
             logger.warn(`Failed to process source code input: ${sourceErr.message}`);
             res.status(400).json({ error: true, message: `Source code processing failed: ${sourceErr.message}` });
             return;
         }
 
+        const launchPlan = scanLaunchConfigService.prepareWebLaunch({
+            ...req.body,
+            userId: user.id,
+            sourcePackagePath: finalSourcePath,
+        });
+
         createScan({
             id: scanId,
             userId: user.id,
             type: 'web',
             target: targetUrl,
-            sourcePackagePath: finalSourcePath,
-            sourceAnalysisMode: resolvedSourceMode,
+            ...launchPlan.scanMetadata,
         });
 
         logApiUsage('/api/scans/web', user.id, { target: targetUrl });
+        saveScanConfig(scanId, JSON.stringify(launchPlan.persistedConfig));
 
-        const maxIterations = Number(iterations) || 50;
-        const maxPlanRounds = reqMaxPlanRounds === undefined || reqMaxPlanRounds === null || reqMaxPlanRounds === ''
-            ? 0
-            : Math.max(0, Math.min(99, Number(reqMaxPlanRounds)));
-        const authStartup = resolveAuthStartupConfig({
-            authStartupMode,
-            authCredentials,
-            allowAccountCreation,
-            preferSharedPassword,
-            idorUsers,
-        });
-        const legacyIdorUsers = authStartup.credentials.length > 0
-            ? toLegacyIdorUsers(authStartup)
-            : (Array.isArray(idorUsers) ? idorUsers : []);
-        const requestedParallelAgents = Math.max(1, Math.min(10, Number(parallelAgents) || 1));
-        const scanConfig = {
-            userId: user.id,
-            rateLimit: Number(rateLimit) || 5,
-            useNuclei: !!useNuclei,
-            useFfuf: !!useFfuf,
-            idorUsers: legacyIdorUsers,
-            parallelAgents: 1,
-            requestedParallelAgents,
-            maxIterations,
-            maxPlanRounds,
-            customSystemPrompt: scanInstructions || undefined,
-            sessionCookies: typeof sessionCookies === 'string' ? sessionCookies.trim() || undefined : undefined,
-            sourcePackagePath: finalSourcePath,
-            sourceAnalysisMode: resolvedSourceMode,
-            authStartup,
-        };
-        saveScanConfig(scanId, JSON.stringify({
-            ...scanConfig,
-            effectiveParallelAgents: 1,
-            executionMode: 'single-agent',
-            idorUsers: legacyIdorUsers.map((entry: any) => ({
-                ...entry,
-                password: entry?.password ? '[REDACTED]' : undefined,
-            })),
-            authStartup: redactAuthStartupConfig(authStartup),
-        }));
-
-        scanRuntimeService.launchWebScan(scanId, targetUrl, scanConfig);
+        scanRuntimeService.launchWebScan(scanId, targetUrl, launchPlan.runtimeConfig);
 
         res.json({
             scanId,
@@ -467,14 +423,12 @@ router.post('/mobile', authenticateToken, upload.single('apk'), async (req: Auth
 // Start scan from Burp "Send to PenPard" (pending request)
 router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (req: AuthRequest, res: Response) => {
     try {
-        let {
+        const {
             pendingId,
-            scanInstructions,
-            iterations,
-            rateLimit: reqRateLimit,
-            parallelAgents: reqParallelAgents,
-            maxPlanRounds: reqMaxPlanRounds,
-            sourceType, sourcePackagePath, sourceAnalysisMode, sourceGitUrl, sourceGitToken
+            sourceType,
+            sourcePackagePath,
+            sourceGitUrl,
+            sourceGitToken,
         } = req.body;
         const user = req.user!;
         if (!pendingId) {
@@ -501,71 +455,41 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
         if (!entry) {
             return res.status(409).json({ error: true, message: 'Pending request was already consumed by another action' });
         }
-        const validModes = ['version_aware', 'full_source_aware'];
-        const resolvedSourceMode = sourceAnalysisMode && validModes.includes(sourceAnalysisMode) ? sourceAnalysisMode : undefined;
-
         const scanId = uuidv4();
         
         let finalSourcePath: string | undefined = undefined;
         try {
-            if (sourceType === 'zip' && req.file) {
-                const destDir = path.join(uploadsDir, 'source-zips', scanId);
-                logger.info(`Extracting ZIP source to ${destDir}`);
-                finalSourcePath = await extractZipArchive(req.file.path, destDir);
-                try { fs.unlinkSync(req.file.path); } catch { }
-            } else if (sourceType === 'git' && sourceGitUrl) {
-                const destDir = path.join(uploadsDir, 'source-repos', scanId);
-                logger.info(`Cloning Git source to ${destDir}`);
-                finalSourcePath = await cloneGitRepository(sourceGitUrl, sourceGitToken, destDir);
-            } else if ((!sourceType || sourceType === 'local') && sourcePackagePath) {
-                finalSourcePath = String(sourcePackagePath).trim();
-            }
+            finalSourcePath = await resolveScanSourcePath({
+                scanId,
+                sourceType,
+                sourcePackagePath,
+                sourceGitUrl,
+                sourceGitToken,
+                uploadFile: req.file || undefined,
+            });
         } catch (sourceErr: any) {
             logger.warn(`Failed to process source code input: ${sourceErr.message}`);
             return res.status(400).json({ error: true, message: `Source code processing failed: ${sourceErr.message}` });
         }
+
+        const launchPlan = scanLaunchConfigService.prepareBurpLaunch({
+            ...req.body,
+            userId: user.id,
+            initialRequest: entry.rawRequest,
+            sourcePackagePath: finalSourcePath,
+        });
 
         createScan({
             id: scanId,
             userId: user.id,
             type: 'web',
             target: targetUrl,
-            sourcePackagePath: finalSourcePath,
-            sourceAnalysisMode: resolvedSourceMode,
+            ...launchPlan.scanMetadata,
         });
         setScanInitialRequest(scanId, entry.rawRequest);
         logApiUsage('/api/scans/from-burp', user.id, { target: targetUrl });
-        const rateLimit = Number(reqRateLimit) || 5;
-        const requestedParallelAgents = Math.max(1, Math.min(10, Number(reqParallelAgents) || 1));
-        const maxIterations = Number(iterations) || 50;
-        const maxPlanRounds = reqMaxPlanRounds === undefined || reqMaxPlanRounds === null || reqMaxPlanRounds === ''
-            ? 0
-            : Math.max(0, Math.min(99, Number(reqMaxPlanRounds)));
-        const authStartup = defaultAuthStartupConfig();
-        const scanConfig = {
-            userId: user.id,
-            rateLimit,
-            useNuclei: false,
-            useFfuf: false,
-            idorUsers: [] as any[],
-            parallelAgents: 1,
-            requestedParallelAgents,
-            maxIterations,
-            maxPlanRounds,
-            customSystemPrompt: scanInstructions || undefined,
-            sessionCookies: undefined as string | undefined,
-            initialRequest: entry.rawRequest,
-            sourcePackagePath: finalSourcePath,
-            sourceAnalysisMode: resolvedSourceMode,
-            authStartup,
-        };
-        saveScanConfig(scanId, JSON.stringify({
-            ...scanConfig,
-            effectiveParallelAgents: 1,
-            executionMode: 'single-agent',
-            authStartup: redactAuthStartupConfig(authStartup),
-        }));
-        scanRuntimeService.launchWebScan(scanId, targetUrl, scanConfig);
+        saveScanConfig(scanId, JSON.stringify(launchPlan.persistedConfig));
+        scanRuntimeService.launchWebScan(scanId, targetUrl, launchPlan.runtimeConfig);
         return res.json({
             scanId,
             message: 'Scan started from Burp request',
@@ -634,67 +558,19 @@ router.post('/:id/command', authenticateToken, async (req: AuthRequest, res: Res
 
         const scan = getOwnedScanOrRespond(id, user.id, res);
         if (!scan) return;
-        const agent = scanRuntimeService.getActiveAgent(id);
-
-        // Persist user command to DB
-        saveChatMessage(id, 'human', command);
-
-        if (agent) {
-            // Agent is active - send command to it
-            await agent.handleUserCommand(command);
-            res.json({ message: 'Command sent to agent' });
-        } else {
-            // No active agent - use LLM directly with scan context
-            // Get vulnerabilities for context
-            const vulnerabilities = getVulnerabilitiesByScan(id);
-
-            // Build context for LLM
-            const vulnContext = vulnerabilities.length > 0
-                ? vulnerabilities.map(v => `- [${v.severity?.toUpperCase()}] ${v.name}: ${v.description}`).join('\n')
-                : 'No vulnerabilities found.';
-
-            const systemPrompt = `You are PenPard, an AI security assistant. You have completed a security scan and are now answering follow-up questions.
-
-IMPORTANT: Detect the language of the user's question and ALWAYS respond in the SAME language. If the user writes in Turkish, respond in Turkish. If in English, respond in English.
-
-SCAN DETAILS:
-- Target: ${scan.target}
-- Type: ${scan.type}
-- Status: ${scan.status}
-- Created: ${scan.created_at}
-- Completed: ${scan.completed_at || 'Not completed'}
-
-FINDINGS (${vulnerabilities.length} total):
-${vulnContext}
-
-Answer the user's question based on this scan data. Be helpful, specific, and security-focused. Remember to respond in the user's language.`;
-
-            try {
-                const response = await llmProvider.generate({
-                    systemPrompt,
-                    userPrompt: command
-                });
-
-                // Persist assistant response to DB
-                saveChatMessage(id, 'assistant', response.text);
-
-                res.json({
-                    message: 'Response from LLM',
-                    response: response.text,
-                    scanStatus: scan.status,
-                    isLive: false
-                });
-            } catch (llmError: any) {
-                logger.error('LLM query failed', { scanId: id, error: llmError.message });
-                res.status(500).json({
-                    error: true,
-                    message: 'LLM query failed. Please check your LLM configuration.',
-                    details: llmError.message
-                });
-            }
-        }
+        const result = await scanChatService.handleCommand(scan, command);
+        res.json(result);
 
     } catch (error: any) {
+        if (error instanceof ScanChatServiceError) {
+            res.status(error.statusCode).json({
+                error: true,
+                message: error.message,
+                details: error.details,
+            });
+            return;
+        }
+
         logger.error('Command handling error', { error: error.message });
         res.status(500).json({ error: true, message: 'Failed to process command' });
     }
@@ -884,4 +760,6 @@ router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res
 });
 
 export default router;
+
+
 

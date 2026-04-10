@@ -1,19 +1,15 @@
-import fs from 'fs';
-import path from 'path';
-import { saveScanLogs } from '../../db/init';
-import { formatLogTimestamp, logger } from '../../utils/logger';
+import { formatLogTimestamp } from '../../utils/logger';
 
-type PersistLogsFn = (scanId: string, logs: string[]) => void;
 type TimestampFn = () => string;
-type LoggerFn = (message: string, meta: Record<string, any>) => void;
 
 export interface OrchestratorLogLedgerOptions {
-    scanId: string;
-    persistLogs?: PersistLogsFn;
     timestamp?: TimestampFn;
-    writeInfoLog?: LoggerFn;
-    flushIntervalMs?: number;
-    flushBatchSize?: number;
+}
+
+export interface OrchestratorLogEntry {
+    type: string;
+    message: string;
+    line: string;
 }
 
 const MOJIBAKE_REPAIRS: Array<[RegExp, string]> = [
@@ -68,29 +64,21 @@ export function normalizeVisibleLogMessage(message: string): string {
 
 export class OrchestratorLogLedger {
     private readonly logs: string[] = [];
-    private lastFlushedLogIndex = 0;
-    private lastFlushTime = Date.now();
-    private readonly flushIntervalMs: number;
-    private readonly flushBatchSize: number;
-    private readonly persistLogs: PersistLogsFn;
     private readonly timestamp: TimestampFn;
-    private readonly writeInfoLog: LoggerFn;
 
-    constructor(private readonly options: OrchestratorLogLedgerOptions) {
-        this.flushIntervalMs = options.flushIntervalMs ?? 60_000;
-        this.flushBatchSize = options.flushBatchSize ?? 50;
-        this.persistLogs = options.persistLogs ?? saveScanLogs;
+    constructor(options: OrchestratorLogLedgerOptions = {}) {
         this.timestamp = options.timestamp ?? formatLogTimestamp;
-        this.writeInfoLog = options.writeInfoLog ?? ((message, meta) => logger.info(message, meta));
     }
 
-    public append(type: string, message: string): string {
+    public append(type: string, message: string): OrchestratorLogEntry {
         const normalizedMessage = normalizeVisibleLogMessage(message);
         const line = `[${this.timestamp()}] [${type.toUpperCase()}] ${normalizedMessage}`;
         this.logs.push(line);
-        this.writeInfoLog(normalizedMessage, { scanId: this.options.scanId, type });
-        this.maybeFlush();
-        return line;
+        return {
+            type,
+            message: normalizedMessage,
+            line,
+        };
     }
 
     public getLogs(since: number = 0): string[] {
@@ -99,52 +87,5 @@ export class OrchestratorLogLedger {
 
     public get count(): number {
         return this.logs.length;
-    }
-
-    public get unflushedCount(): number {
-        return this.logs.length - this.lastFlushedLogIndex;
-    }
-
-    public flushToDB(): number {
-        const newLogs = this.logs.slice(this.lastFlushedLogIndex);
-        if (newLogs.length === 0) {
-            return 0;
-        }
-
-        try {
-            this.persistLogs(this.options.scanId, newLogs);
-            this.lastFlushedLogIndex = this.logs.length;
-            this.lastFlushTime = Date.now();
-            return newLogs.length;
-        } catch (error: any) {
-            logger.error('Failed to flush logs to DB', {
-                scanId: this.options.scanId,
-                error: error.message,
-            });
-            return 0;
-        }
-    }
-
-    public persistToFile(filePath: string): void {
-        try {
-            const logsDir = path.dirname(filePath);
-            if (!fs.existsSync(logsDir)) {
-                fs.mkdirSync(logsDir, { recursive: true });
-            }
-            fs.writeFileSync(filePath, this.logs.join('\n'), 'utf8');
-        } catch (error: any) {
-            logger.error('Failed to save logs', { error: error.message });
-        }
-
-        this.flushToDB();
-    }
-
-    private maybeFlush(): void {
-        const newLogCount = this.logs.length - this.lastFlushedLogIndex;
-        const timeSinceFlush = Date.now() - this.lastFlushTime;
-
-        if (newLogCount >= this.flushBatchSize || (newLogCount > 0 && timeSinceFlush >= this.flushIntervalMs)) {
-            this.flushToDB();
-        }
     }
 }
