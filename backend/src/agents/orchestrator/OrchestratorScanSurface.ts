@@ -79,6 +79,18 @@ export class OrchestratorScanSurface {
         }
     }
 
+    public recordRequestExecution(event: { url: string; method?: string; statusCode?: number }): void {
+        try {
+            const parsed = new URL(event.url);
+            const method = String(event.method || 'GET').toUpperCase();
+            this.addDiscoveredEndpoint(parsed.pathname);
+            this.options.coverageTracker.addRoute(parsed.pathname, method, 'burp');
+            this.options.coverageTracker.inferWorkflowFromRoute(parsed.pathname);
+        } catch {
+            /* ignore malformed request aftermath */
+        }
+    }
+
     public noteBrowserNavigation(url: string): void {
         try {
             const pathname = new URL(url).pathname;

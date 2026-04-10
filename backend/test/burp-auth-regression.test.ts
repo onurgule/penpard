@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'path';
 
-import { AuthStateManager } from '../src/services/auth';
+import { AuthStartupInventory, AuthStateManager } from '../src/services/auth';
 import { parseRawBurpRequest, serializeStructuredBurpRequest } from '../src/services/burp-request';
 
 process.env.DATABASE_PATH = process.env.DATABASE_PATH || path.join(process.cwd(), 'tmp', 'penpard-test.db');
@@ -60,7 +60,10 @@ class FakeBurp {
     }
 }
 
-function createAgent(config: Partial<ConstructorParameters<typeof OrchestratorAgent>[2]>, burp: FakeBurp): OrchestratorAgent {
+function createAgent(
+    config: Partial<ConstructorParameters<typeof OrchestratorAgent>[2]>,
+    burp: FakeBurp,
+): InstanceType<typeof OrchestratorAgent> {
     return new OrchestratorAgent(
         'scan-test',
         'https://app.example.com',
@@ -75,7 +78,11 @@ function createAgent(config: Partial<ConstructorParameters<typeof OrchestratorAg
     );
 }
 
-async function initializeAuth(agent: OrchestratorAgent, burp: FakeBurp, initialRequest?: string): Promise<void> {
+async function initializeAuth(
+    agent: InstanceType<typeof OrchestratorAgent>,
+    burp: FakeBurp,
+    initialRequest?: string,
+): Promise<void> {
     await agent.authManager.initialize({
         idorUsers: [],
         initialRequest,
@@ -251,7 +258,7 @@ test('warning is emitted when a Burp-originated request leaves without Authoriza
 test('round-one fallback plan stays auth-first for no-credential web startup', () => {
     const planner = new OrchestratorFallbackPlanner();
 
-    const startupAuthInventory = {
+    const startupAuthInventory: AuthStartupInventory = {
         mode: 'no_credentials',
         status: 'completed',
         browserSessionId: 'browser-1',

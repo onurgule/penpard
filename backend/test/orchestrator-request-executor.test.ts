@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { AuthStateManager } from '../src/services/auth';
 import { OrchestratorRequestExecutor } from '../src/agents/orchestrator/OrchestratorRequestExecutor';
+import { ToolCall } from '../src/agents/orchestrator/types';
 
 class FakeBurp {
     public readonly sent: Array<Record<string, any>> = [];
@@ -40,7 +41,7 @@ class FakeBurp {
 
 async function createExecutor(overrides?: {
     burp?: FakeBurp;
-    onEndpointDiscovered?: (url: string) => void;
+    onRequestAftermath?: (event: { url: string; method: string; statusCode: number }) => void;
     setRateLimitPauseUntil?: (until: Date | null) => void;
 }) {
     const burp = overrides?.burp || new FakeBurp();
@@ -56,18 +57,18 @@ async function createExecutor(overrides?: {
         maxSameRequest: 2,
         rateLimitPauseMs: 60_000,
         setRateLimitPauseUntil: overrides?.setRateLimitPauseUntil || (() => {}),
-        onEndpointDiscovered: overrides?.onEndpointDiscovered,
+        onRequestAftermath: overrides?.onRequestAftermath,
     });
 }
 
-test('request executor caches the third identical request and preserves the last Burp-backed exchange', async () => {
+test('request executor runs transport once per uncached request and records the aftermath separately from exchange evidence', async () => {
     const burp = new FakeBurp();
-    const discovered: string[] = [];
+    const aftermath: Array<{ url: string; method: string; statusCode: number }> = [];
     const executor = await createExecutor({
         burp,
-        onEndpointDiscovered: (url) => discovered.push(url),
+        onRequestAftermath: (event) => aftermath.push(event),
     });
-    const toolCall = {
+    const toolCall: ToolCall<'send_http_request'> = {
         tool: 'send_http_request',
         args: {
             method: 'GET',
@@ -85,10 +86,26 @@ test('request executor caches the third identical request and preserves the last
     assert.equal(second.cached, undefined);
     assert.equal(third.cached, true);
     assert.equal(burp.sent.length, 2);
-    assert.deepEqual(discovered, [
-        'https://app.example.com/api/me',
-        'https://app.example.com/api/me',
-    ]);
+    assert.equal(aftermath.length, 2);
+    assert.deepEqual(
+        aftermath.map((event) => ({
+            url: event.url,
+            method: event.method,
+            statusCode: event.statusCode,
+        })),
+        [
+            {
+                url: 'https://app.example.com/api/me',
+                method: 'GET',
+                statusCode: 200,
+            },
+            {
+                url: 'https://app.example.com/api/me',
+                method: 'GET',
+                statusCode: 200,
+            },
+        ],
+    );
     assert.equal(lastExchange?.action?.args.url, 'https://app.example.com/api/me');
     assert.match(String(lastExchange?.rawRequest || ''), /GET \/api\/me HTTP\/1\.1/);
 });

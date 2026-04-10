@@ -1,7 +1,13 @@
-import { AuthStateManager, IdentityRegistry } from '../../services/auth';
-import { getHeaderValue } from '../../services/burp-request';
+import { AuthStateManager, RequestAuthIntent } from '../../services/auth';
 import { normalizeProxyHistoryItems, normalizeSendHttpResponse } from '../../services/burp-tool-result';
-import { hasCustomAuthHeader, resolveAuthIdentityId, resolveRequestAuthIntent } from './OrchestratorToolPolicy';
+import { resolveAuthIdentityId, resolveRequestAuthIntent } from './OrchestratorToolPolicy';
+import {
+    ManagedAuthRequestInterceptor,
+    RequestExecutionContext,
+    RequestPreparationInterceptor,
+    RequestResponseInterceptor,
+    RequestTransportController,
+} from './OrchestratorRequestPipeline';
 import { RequestExecutionExchange, ToolCall } from './types';
 
 interface BurpToolClient {
@@ -21,6 +27,17 @@ interface NormalizedBurpHttpResult {
     responseBody: string;
 }
 
+interface RequestExecutionAftermath {
+    url: string;
+    method: string;
+    statusCode: number;
+    identityId: string;
+    requestIntent: RequestAuthIntent;
+    result: any;
+    rawRequest?: string;
+    rawResponse?: string;
+}
+
 export interface OrchestratorRequestExecutorOptions {
     scanId: string;
     burp: BurpToolClient;
@@ -31,47 +48,68 @@ export interface OrchestratorRequestExecutorOptions {
     maxSameRequest?: number;
     rateLimitPauseMs: number;
     setRateLimitPauseUntil: (until: Date | null) => void;
-    onEndpointDiscovered?: (url: string) => void;
+    onRequestAftermath?: (aftermath: RequestExecutionAftermath) => Promise<void> | void;
     onManagedAuthRefreshed?: (identityId: string) => Promise<void>;
 }
 
 export class OrchestratorRequestExecutor {
     private readonly requestHistory = new Map<string, RequestHistoryEntry>();
+    private readonly preparationInterceptors: RequestPreparationInterceptor[];
+    private readonly responseInterceptors: RequestResponseInterceptor[];
     private lastExchange: RequestExecutionExchange | null = null;
 
-    constructor(private readonly options: OrchestratorRequestExecutorOptions) {}
+    constructor(private readonly options: OrchestratorRequestExecutorOptions) {
+        const authInterceptor = new ManagedAuthRequestInterceptor({
+            authManager: this.options.authManager,
+            burp: this.options.burp,
+            log: this.options.log,
+            onManagedAuthRefreshed: this.options.onManagedAuthRefreshed,
+        });
+
+        this.preparationInterceptors = [authInterceptor];
+        this.responseInterceptors = [authInterceptor];
+    }
 
     public getLastExchange(): RequestExecutionExchange | null {
         return this.lastExchange;
     }
 
     public async execute(toolCall: ToolCall<'send_http_request'>): Promise<any> {
+        const context = this.buildExecutionContext(toolCall);
+        const blocked = this.enforceRequestGuardrails(context);
+        if (blocked) {
+            return blocked;
+        }
+
+        await this.runPreparationInterceptors(context);
+
+        const requestHistoryKey = this.buildRequestHistoryKey(
+            context.method,
+            context.url,
+            context.preparedRequest.body,
+            context.preparedRequest.headers,
+            context.identityId,
+        );
+        const cached = this.getCachedDuplicateResponse(requestHistoryKey, context);
+        if (cached) {
+            return cached;
+        }
+
+        await this.executeTransport(context, context.preparedRequest);
+        await this.runResponseInterceptors(context);
+        this.applyRuntimeFinalization(context);
+        await this.captureProxyEvidence(context);
+        this.recordRequestHistory(requestHistoryKey, context);
+        await this.runRequestAftermath(context);
+
+        return context.result;
+    }
+
+    private buildExecutionContext(toolCall: ToolCall<'send_http_request'>): RequestExecutionContext {
         const url = toolCall.args.url;
         const method = toolCall.args.method || 'GET';
         const identityId = resolveAuthIdentityId(toolCall.args);
         const preserveExplicitAuth = toolCall.args?.preserveExplicitAuth === true;
-
-        const decodedUrl = (() => {
-            try {
-                return decodeURIComponent(url);
-            } catch {
-                return url;
-            }
-        })();
-        const unionNullMatch = decodedUrl.match(/union\s+select\s+null(?:,\s*null)*/gi);
-        if (unionNullMatch) {
-            const nullCount = (unionNullMatch[0].match(/null/gi) || []).length;
-            if (nullCount >= 5) {
-                this.options.log('tool', `Blocked SQLMap-style payload (${nullCount} nulls). Use send_to_scanner.`);
-                const baseUrl = url.split('?')[0];
-                return {
-                    error: `SQLMap-style fuzzing blocked. Use send_to_scanner with ${baseUrl} instead.`,
-                    blocked: true,
-                    suggestion: { tool: 'send_to_scanner', args: { url: baseUrl } },
-                };
-            }
-        }
-
         const originalBody = this.normalizeRequestBody(toolCall.args.body ?? toolCall.args.data ?? '');
         const originalHeaders = toolCall.args.headers as Record<string, string> | undefined;
         const requestIntent = resolveRequestAuthIntent({
@@ -79,260 +117,170 @@ export class OrchestratorRequestExecutor {
             identityId,
             inferIntent: () => this.options.authManager.inferRequestIntent(url, method),
         });
-        const existingAuthContext = this.options.authManager.inject(url, method, identityId, requestIntent);
-        const explicitAuthorization = getHeaderValue(originalHeaders, 'authorization');
-        const explicitCookie = getHeaderValue(originalHeaders, 'cookie');
-        const explicitCustomAuth = hasCustomAuthHeader(originalHeaders);
 
-        if (
-            !preserveExplicitAuth &&
-            identityId !== IdentityRegistry.ANONYMOUS_ID &&
-            (
-                (!!explicitAuthorization && !existingAuthContext.authorizationHeader) ||
-                (!!explicitCookie && !existingAuthContext.cookies) ||
-                (explicitCustomAuth && Object.keys(existingAuthContext.customHeaders).length === 0)
-            )
-        ) {
-            this.options.authManager.captureFromStructuredRequest({
-                requestHeaders: originalHeaders || {},
-                url,
-                body: originalBody,
-            }, identityId);
-        }
-
-        let preparedRequest = this.options.authManager.prepareRequest(
+        return {
+            toolCall,
+            url,
+            method,
+            identityId,
+            preserveExplicitAuth,
+            requestIntent,
             originalHeaders,
             originalBody,
-            url,
-            method,
-            identityId,
-            preserveExplicitAuth,
-            requestIntent,
+            isBurpOriginatedRequest: !!this.options.initialRequest?.trim(),
+            preparedRequest: {
+                headers: { ...(originalHeaders || {}) },
+                body: originalBody,
+            },
+            requestDiagnostics: null,
+            requestArgs: {},
+            result: null,
+            statusCode: 0,
+            responseHeaders: {},
+            responseBody: '',
+        };
+    }
+
+    private enforceRequestGuardrails(context: RequestExecutionContext): any | null {
+        const decodedUrl = (() => {
+            try {
+                return decodeURIComponent(context.url);
+            } catch {
+                return context.url;
+            }
+        })();
+        const unionNullMatch = decodedUrl.match(/union\s+select\s+null(?:,\s*null)*/gi);
+        if (!unionNullMatch) {
+            return null;
+        }
+
+        const nullCount = (unionNullMatch[0].match(/null/gi) || []).length;
+        if (nullCount < 5) {
+            return null;
+        }
+
+        this.options.log('tool', `Blocked SQLMap-style payload (${nullCount} nulls). Use send_to_scanner.`);
+        const baseUrl = context.url.split('?')[0];
+        return {
+            error: `SQLMap-style fuzzing blocked. Use send_to_scanner with ${baseUrl} instead.`,
+            blocked: true,
+            suggestion: { tool: 'send_to_scanner', args: { url: baseUrl } },
+        };
+    }
+
+    private async runPreparationInterceptors(context: RequestExecutionContext): Promise<void> {
+        for (const interceptor of this.preparationInterceptors) {
+            await interceptor.beforeTransport(context);
+        }
+    }
+
+    private getCachedDuplicateResponse(requestHistoryKey: string, context: RequestExecutionContext): any | null {
+        const existing = this.requestHistory.get(requestHistoryKey);
+        if (!existing || existing.count < (this.options.maxSameRequest ?? 2)) {
+            return null;
+        }
+
+        this.options.log(
+            'tool',
+            `Skipping exact duplicate request (${existing.count}x): ${context.method} ${context.url.substring(0, 80)}`,
         );
-        let requestDiagnostics = this.options.authManager.assessPreparedRequest({
-            originalHeaders,
-            preparedHeaders: preparedRequest.headers,
-            url,
-            method,
-            identityId,
-            preserveExplicitAuth,
-            intent: requestIntent,
-        });
-        const isBurpOriginatedRequest = !!this.options.initialRequest?.trim();
-        if (isBurpOriginatedRequest && requestDiagnostics.warning) {
-            this.options.log('system', `Auth Warning: ${requestDiagnostics.warning}`);
-        }
-        if (requestDiagnostics.authSuppressedForIntent) {
-            this.options.log('system', `Auth Guardrail: suppressing stored auth for ${requestIntent} on ${method} ${url}`);
-        }
+        return {
+            ...existing.lastResponse,
+            cached: true,
+            message: `Cached response. This exact request was sent ${existing.count} times already. Try different parameters or payloads.`,
+        };
+    }
 
-        const requestKey = this.buildRequestHistoryKey(
-            method,
-            url,
-            preparedRequest.body,
-            preparedRequest.headers,
-            identityId,
-        );
+    private async executeTransport(
+        context: RequestExecutionContext,
+        preparedRequest: RequestExecutionContext['preparedRequest'],
+    ): Promise<void> {
+        const requestArgs = {
+            ...context.toolCall.args,
+            headers: preparedRequest.headers,
+            body: preparedRequest.body,
+            identityId: context.identityId,
+        } as Record<string, any>;
+        delete requestArgs.data;
 
-        const existing = this.requestHistory.get(requestKey);
-        if (existing && existing.count >= (this.options.maxSameRequest ?? 2)) {
-            this.options.log('tool', `Skipping exact duplicate request (${existing.count}x): ${method} ${url.substring(0, 80)}`);
-            return {
-                ...existing.lastResponse,
-                cached: true,
-                message: `Cached response. This exact request was sent ${existing.count} times already. Try different parameters or payloads.`,
-            };
-        }
+        context.preparedRequest = preparedRequest;
+        context.requestArgs = requestArgs;
 
-        let requestArgs: Record<string, any> = {};
-        const sendThroughBurp = async (headers: Record<string, string>, body: string) => {
-            const args = {
-                ...toolCall.args,
-                headers,
-                body,
-                identityId,
-            } as Record<string, any>;
-            delete args.data;
-
-            requestArgs = args;
-            return this.options.burp.callTool('send_http_request', {
-                ...args,
+        const normalizedResult = this.normalizeBurpHttpResult(
+            await this.options.burp.callTool('send_http_request', {
+                ...requestArgs,
                 use_proxy: true,
                 penpard_source: `Orchestrator/${this.options.scanId}`,
-            });
+            }),
+        );
+
+        this.applyResponseNormalization(context, normalizedResult);
+    }
+
+    private applyResponseNormalization(context: RequestExecutionContext, normalizedResult: NormalizedBurpHttpResult): void {
+        context.result = normalizedResult.result;
+        context.statusCode = normalizedResult.statusCode;
+        context.responseHeaders = normalizedResult.responseHeaders;
+        context.responseBody = normalizedResult.responseBody;
+    }
+
+    private async runResponseInterceptors(context: RequestExecutionContext): Promise<void> {
+        const transportController: RequestTransportController = {
+            reexecute: async (preparedRequest) => this.executeTransport(context, preparedRequest),
         };
 
-        let normalizedResult = this.normalizeBurpHttpResult(
-            await sendThroughBurp(preparedRequest.headers, preparedRequest.body),
-        );
-        let result = normalizedResult.result;
-        let { rawRequest, rawResponse } = await this.getLatestProxyEvidence(url);
-        let statusCode = normalizedResult.statusCode;
-        let responseHeaders = normalizedResult.responseHeaders;
-        let responseBody = normalizedResult.responseBody;
-        let authHealth = this.options.authManager.handleResponse(
-            statusCode,
-            responseHeaders,
-            responseBody,
-            url,
-            identityId,
-            requestIntent,
-        );
-        let retriedAfterAuthInjection = false;
+        for (const interceptor of this.responseInterceptors) {
+            await interceptor.afterResponse(context, transportController);
+        }
+    }
 
-        const shouldRetryWithManagedAuth =
-            statusCode === 401 &&
-            identityId !== IdentityRegistry.ANONYMOUS_ID &&
-            isBurpOriginatedRequest &&
-            requestDiagnostics.likelyRequiresAuth &&
-            requestDiagnostics.storedAuthAvailable &&
-            !requestDiagnostics.outgoingAuthorizationPresent &&
-            !requestDiagnostics.outgoingCookiePresent &&
-            !requestDiagnostics.outgoingCustomAuthPresent &&
-            !requestDiagnostics.explicitAuthorizationKeyPresent &&
-            !requestDiagnostics.explicitCookieKeyPresent &&
-            !requestDiagnostics.explicitCustomAuthKeyPresent;
-
-        if (shouldRetryWithManagedAuth) {
-            this.options.log('system', `Auth Recovery: ${method} ${url} received 401 without outgoing auth. Retrying once with stored auth material...`);
-
-            preparedRequest = this.options.authManager.prepareRequest(
-                originalHeaders,
-                originalBody,
-                url,
-                method,
-                identityId,
-                false,
-                requestIntent,
-            );
-            requestDiagnostics = this.options.authManager.assessPreparedRequest({
-                originalHeaders,
-                preparedHeaders: preparedRequest.headers,
-                url,
-                method,
-                identityId,
-                preserveExplicitAuth: false,
-                intent: requestIntent,
-            });
-
-            if (
-                requestDiagnostics.outgoingAuthorizationPresent ||
-                requestDiagnostics.outgoingCookiePresent ||
-                requestDiagnostics.outgoingCustomAuthPresent
-            ) {
-                normalizedResult = this.normalizeBurpHttpResult(
-                    await sendThroughBurp(preparedRequest.headers, preparedRequest.body),
-                );
-                result = normalizedResult.result;
-                statusCode = normalizedResult.statusCode;
-                responseHeaders = normalizedResult.responseHeaders;
-                responseBody = normalizedResult.responseBody;
-                authHealth = this.options.authManager.handleResponse(
-                    statusCode,
-                    responseHeaders,
-                    responseBody,
-                    url,
-                    identityId,
-                    requestIntent,
-                );
-                retriedAfterAuthInjection = true;
-                result = {
-                    ...result,
-                    retriedAfterAuthInjection: true,
-                };
-            } else {
-                this.options.log('system', `Auth Warning: Stored auth recovery was attempted for ${identityId}, but PenPard still could not prepare any auth headers for retry.`);
-            }
+    private applyRuntimeFinalization(context: RequestExecutionContext): void {
+        if (context.statusCode !== 429) {
+            return;
         }
 
-        if (
-            authHealth.needsRefresh &&
-            !authHealth.needsRelogin &&
-            (!preserveExplicitAuth || retriedAfterAuthInjection) &&
-            identityId !== IdentityRegistry.ANONYMOUS_ID
-        ) {
-            this.options.log('system', `Auth State Engine: Session for ${identityId} needs refresh - retrying once...`);
+        this.options.setRateLimitPauseUntil(new Date(Date.now() + this.options.rateLimitPauseMs));
+        this.options.log('tool', '429 Rate Limited! Pausing for 1 minute...');
+        context.result = {
+            ...context.result,
+            rateLimited: true,
+            message: 'Rate limited. Pausing 1 minute.',
+        };
+    }
 
-            try {
-                const refreshed = await this.options.authManager.refreshSession(identityId, this.options.burp);
-                if (refreshed) {
-                    await this.options.onManagedAuthRefreshed?.(identityId);
-
-                    const retryPreparedRequest = this.options.authManager.prepareRequest(
-                        originalHeaders,
-                        originalBody,
-                        url,
-                        method,
-                        identityId,
-                        false,
-                        requestIntent,
-                    );
-
-                    normalizedResult = this.normalizeBurpHttpResult(
-                        await sendThroughBurp(retryPreparedRequest.headers, retryPreparedRequest.body),
-                    );
-                    result = normalizedResult.result;
-                    statusCode = normalizedResult.statusCode;
-                    responseHeaders = normalizedResult.responseHeaders;
-                    responseBody = normalizedResult.responseBody;
-                    authHealth = this.options.authManager.handleResponse(
-                        statusCode,
-                        responseHeaders,
-                        responseBody,
-                        url,
-                        identityId,
-                        requestIntent,
-                    );
-
-                    result = {
-                        ...result,
-                        retriedAfterRefresh: true,
-                    };
-                }
-            } catch (error: any) {
-                this.options.log('error', `Auth refresh failed: ${error.message}`);
-            }
-        }
-
-        if (requestDiagnostics.warning) {
-            result = {
-                ...result,
-                authWarning: requestDiagnostics.warning,
-            };
-        }
-        if (authHealth.needsRelogin) {
-            this.options.log('system', `Auth State Engine: Session for ${identityId} is dead - re-login required`);
-        }
-        if (authHealth.isCSRFFailure) {
-            this.options.log('system', `Auth State Engine: CSRF validation failed for ${identityId} - token may need refresh`);
-        }
-
-        if (statusCode === 429) {
-            this.options.setRateLimitPauseUntil(new Date(Date.now() + this.options.rateLimitPauseMs));
-            this.options.log('tool', '429 Rate Limited! Pausing for 1 minute...');
-            result = { ...result, rateLimited: true, message: 'Rate limited. Pausing 1 minute.' };
-        }
-
-        ({ rawRequest, rawResponse } = await this.getLatestProxyEvidence(url));
-
-        this.requestHistory.set(requestKey, {
-            count: (existing?.count || 0) + 1,
-            lastResponse: result,
-            timestamp: new Date(),
-        });
-
+    private async captureProxyEvidence(context: RequestExecutionContext): Promise<void> {
+        const evidence = await this.getLatestProxyEvidence(context.url);
         this.lastExchange = {
             action: {
-                ...toolCall,
-                args: requestArgs,
+                ...context.toolCall,
+                args: context.requestArgs,
             },
-            result,
-            rawRequest,
-            rawResponse,
+            result: context.result,
+            rawRequest: evidence.rawRequest,
+            rawResponse: evidence.rawResponse,
         };
+    }
 
-        this.options.onEndpointDiscovered?.(url);
-        return result;
+    private recordRequestHistory(requestHistoryKey: string, context: RequestExecutionContext): void {
+        const existing = this.requestHistory.get(requestHistoryKey);
+        this.requestHistory.set(requestHistoryKey, {
+            count: (existing?.count || 0) + 1,
+            lastResponse: context.result,
+            timestamp: new Date(),
+        });
+    }
+
+    private async runRequestAftermath(context: RequestExecutionContext): Promise<void> {
+        await this.options.onRequestAftermath?.({
+            url: context.url,
+            method: context.method,
+            statusCode: context.statusCode,
+            identityId: context.identityId,
+            requestIntent: context.requestIntent,
+            result: context.result,
+            rawRequest: this.lastExchange?.rawRequest,
+            rawResponse: this.lastExchange?.rawResponse,
+        });
     }
 
     private normalizeRequestBody(rawBody: any): string {

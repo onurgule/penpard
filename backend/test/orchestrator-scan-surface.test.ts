@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { AuthStartupInventory } from '../src/services/auth';
+import { EndpointInventorySnapshot } from '../src/services/EndpointIntelligenceService';
+
 const { CoverageTracker } = require('../src/services/CoverageTracker') as typeof import('../src/services/CoverageTracker');
 const { OrchestratorBrowserTools } = require('../src/agents/orchestrator/OrchestratorBrowserTools') as typeof import('../src/agents/orchestrator/OrchestratorBrowserTools');
 const { OrchestratorScanSurface } = require('../src/agents/orchestrator/OrchestratorScanSurface') as typeof import('../src/agents/orchestrator/OrchestratorScanSurface');
 
-function createStartupInventory() {
+function createStartupInventory(): AuthStartupInventory {
     return {
         mode: 'no_credentials',
         status: 'completed',
@@ -48,7 +51,7 @@ function createStartupInventory() {
     };
 }
 
-function createEndpointInventory(summary: string = '2 endpoint(s) captured') {
+function createEndpointInventory(summary: string = '2 endpoint(s) captured'): EndpointInventorySnapshot {
     return {
         scanId: 'scan-1',
         targetUrl: 'https://app.example.com',
@@ -173,6 +176,32 @@ test('scan surface owns auth startup capture and endpoint inventory refresh', as
     assert.ok(coverageSummary.routesSeen >= 2);
 });
 
+test('request execution aftermath is routed through scan surface instead of the executor mutating scan state directly', () => {
+    const coverageTracker = new CoverageTracker();
+
+    const surface = new OrchestratorScanSurface({
+        scanId: 'scan-1',
+        targetUrl: 'https://app.example.com',
+        burp: {} as any,
+        authManager: {} as any,
+        browserSession: {
+            getSessionId: () => null,
+        } as any,
+        coverageTracker,
+    });
+
+    surface.recordRequestExecution({
+        url: 'https://app.example.com/api/orders/42?view=full',
+        method: 'POST',
+        statusCode: 200,
+    });
+
+    assert.deepEqual(surface.getDiscoveredEndpoints(), ['/api/orders/42']);
+
+    const coverageSummary = coverageTracker.getSummary();
+    assert.ok(coverageSummary.routesSeen >= 1);
+});
+
 test('browser tools route browser aftermath through scan surface instead of agent state', async () => {
     const calls: Record<string, any> = {
         navigated: [],
@@ -228,7 +257,7 @@ test('browser tools route browser aftermath through scan surface instead of agen
             correlateBrowserWithBurp: async () => ({
                 frontendOnlyEndpoints: ['/api/hidden'],
             }),
-        },
+        } as any,
         onFrontendDelta: (trigger: string, newEndpoints: string[]) => {
             calls.frontendDelta = { trigger, newEndpoints };
         },

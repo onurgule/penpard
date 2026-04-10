@@ -476,7 +476,11 @@ export class OrchestratorAgent {
             setRateLimitPauseUntil: (until) => {
                 this.state.setRateLimitPauseUntil(until);
             },
-            onEndpointDiscovered: (url) => this.scanSurface.noteRequestDiscoveredEndpoint(url),
+            onRequestAftermath: ({ url, method, statusCode }) => this.scanSurface.recordRequestExecution({
+                url,
+                method,
+                statusCode,
+            }),
             onManagedAuthRefreshed: (identityId) => this.browserSession.seedBrowserFromAuthManager(identityId),
         });
         this.findingTracker = new OrchestratorFindingTracker({
