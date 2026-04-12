@@ -33,6 +33,9 @@ import { MarkdownRenderer } from '@/components/MarkdownRenderer';
 import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
 import { buildEndpointDisplayRows, EndpointInventorySnapshot } from './endpoint-intel';
+import ScanCoverageGraphPanel from './ScanCoverageGraphPanel';
+import ScanCoverageGraphModal from './ScanCoverageGraphModal';
+import { useCoverageGraph } from './useCoverageGraph';
 
 interface LogEntry {
     timestamp: string;
@@ -123,6 +126,13 @@ export default function MissionControlClient() {
     const [promotedCount, setPromotedCount] = useState(0);
     const [endpointInventory, setEndpointInventory] = useState<EndpointInventorySnapshot | null>(null);
 
+    // Coverage Graph (extracted to custom hook)
+    const {
+        coverageGraph, showEndpointIntelligence, showCoverageGraphFullscreen, scanTargetUrl,
+        setCoverageGraph, setScanTargetUrl,
+        toggleEndpointIntelligence, openFullscreen, closeFullscreen,
+    } = useCoverageGraph();
+
     // Initial fetch
     // Modal State
     const [selectedVuln, setSelectedVuln] = useState<Vulnerability | null>(null);
@@ -182,8 +192,12 @@ export default function MissionControlClient() {
 
             setStatus(data.status);
             setVulns(data.vulnerabilities || []);
+            if (data.target) setScanTargetUrl(data.target);
             if (data.endpointInventory !== undefined) {
                 setEndpointInventory(data.endpointInventory || null);
+            }
+            if (data.coverageGraph !== undefined) {
+                setCoverageGraph(data.coverageGraph || null);
             }
 
             // Derive progress from status
@@ -245,6 +259,7 @@ export default function MissionControlClient() {
             if (data.harvestedRequestCount !== undefined) setHarvestedCount(data.harvestedRequestCount);
             if (data.promotedRequestCount !== undefined) setPromotedCount(data.promotedRequestCount);
             if (data.endpointInventory !== undefined) setEndpointInventory(data.endpointInventory || null);
+            if (data.coverageGraph !== undefined) setCoverageGraph(data.coverageGraph || null);
 
             // Append new logs (only if there are actually new ones)
             if (data.logs && data.logs.length > 0 && data.logsCount > logIndexRef.current) {
@@ -1041,28 +1056,22 @@ User Question: ${userQuestion}`;
 
                 {/* Right: Endpoint Intelligence + Findings */}
                 <div className="col-span-12 lg:col-span-3 flex flex-col gap-4 h-[calc(100vh-8rem)]">
-                    <div className="flex-[1.1] flex flex-col bg-white/5 rounded-xl border border-cyan-500/20 overflow-hidden min-h-0">
-                        <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0">
-                            <div>
-                                <h2 className="font-bold text-sm text-white flex items-center gap-2">
-                                    <Route className="w-4 h-4 text-cyan-400" />
-                                    Endpoint Intelligence
-                                </h2>
-                                <div className="text-[10px] text-slate-500 mt-1">
-                                    {endpointInventory?.summary || 'Waiting for JS, DOM, browser, and Burp endpoint intelligence...'}
-                                </div>
-                            </div>
-                            <span className="bg-cyan-500/15 text-cyan-300 px-2 py-0.5 rounded text-xs border border-cyan-500/20">
-                                {endpointInventory?.records?.length || 0} Endpoints
-                            </span>
-                        </div>
-                        <div className="p-3 border-b border-white/10 bg-black/10 text-[10px] text-slate-400 grid grid-cols-3 gap-2 flex-shrink-0">
-                            <div>Auth Relevant: <span className="text-white">{endpointInventory?.authRelevantCount || 0}</span></div>
-                            <div>Burp Seen: <span className="text-white">{endpointInventory?.observedInBurpCount || 0}</span></div>
-                            <div>JS Artifacts: <span className="text-white">{endpointInventory?.jsArtifacts?.count || 0}</span></div>
-                        </div>
-                        <div className="flex-1 overflow-y-auto p-3 space-y-3 scrollbar-thin scrollbar-thumb-slate-700 min-h-0">
-                            {endpointRows.length === 0 ? (
+                    <ScanCoverageGraphPanel
+                        coverageGraph={coverageGraph}
+                        endpointRows={endpointRows}
+                        endpointSummary={endpointInventory?.summary || 'Waiting for JS, DOM, browser, and Burp endpoint intelligence...'}
+                        endpointStats={{
+                            total: endpointInventory?.records?.length || 0,
+                            authRelevant: endpointInventory?.authRelevantCount || 0,
+                            burpSeen: endpointInventory?.observedInBurpCount || 0,
+                            jsArtifacts: endpointInventory?.jsArtifacts?.count || 0,
+                        }}
+                        showEndpointIntelligence={showEndpointIntelligence}
+                        onToggleEndpoints={toggleEndpointIntelligence}
+                        onOpenFullscreen={openFullscreen}
+                        targetUrl={scanTargetUrl}
+                        renderEndpointRows={() => (
+                            endpointRows.length === 0 ? (
                                 <div className="text-center py-10 opacity-50">
                                     <Route className="w-10 h-10 mx-auto mb-2 text-slate-600" />
                                     <div className="text-sm text-slate-500">No extracted endpoints yet.</div>
@@ -1095,9 +1104,9 @@ User Question: ${userQuestion}`;
                                         <div className="text-[11px] text-slate-400 leading-relaxed">{row.evidence}</div>
                                     </div>
                                 ))
-                            )}
-                        </div>
-                    </div>
+                            )
+                        )}
+                    />
 
                     <div className="flex-1 flex flex-col bg-white/5 rounded-xl border border-white/10 overflow-hidden min-h-0">
                         <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0">
@@ -1291,6 +1300,14 @@ User Question: ${userQuestion}`;
                     </motion.div>
                 </div>
             )}
+
+            {/* Coverage Graph Fullscreen Modal */}
+            <ScanCoverageGraphModal
+                isOpen={showCoverageGraphFullscreen}
+                onClose={closeFullscreen}
+                snapshot={coverageGraph}
+                targetUrl={scanTargetUrl}
+            />
 
             {/* Report Options Modal */}
             <ReportOptionsModal

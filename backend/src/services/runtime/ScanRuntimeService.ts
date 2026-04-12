@@ -1,9 +1,12 @@
 import { AgentPool } from '../../agents/AgentPool';
 import { OrchestratorAgent } from '../../agents/OrchestratorAgent';
 import {
+    db,
     getScan,
     getScanEndpointInventory,
     getScanLogs,
+    getVulnerabilitiesByScan,
+    getBrowserActions,
     saveChatMessage,
     saveScanLogs,
     updateScanStatus,
@@ -22,6 +25,8 @@ import {
     WebScanRuntimeConfig,
     scanRuntimeFactory,
 } from './ScanRuntimeFactory';
+import { projectCoverageGraph } from '../graph/ScanCoverageGraphProjector';
+import type { CoverageGraphSnapshot } from '../graph/ScanCoverageGraph.types';
 
 export class ScanRuntimeService {
     constructor(
@@ -50,6 +55,75 @@ export class ScanRuntimeService {
 
     public getRuntimeCheckpoint(scanId: string): any {
         return scanRuntimeCheckpointService.getCheckpoint(scanId);
+    }
+
+    /**
+     * Build a coverage graph snapshot from existing scan data.
+     * Pure derived read — no mutations, no side effects.
+     */
+    public getCoverageGraph(scanId: string): CoverageGraphSnapshot | null {
+        try {
+            const endpointInventory = this.getEndpointInventory(scanId);
+            if (!endpointInventory?.records?.length) return null;
+
+            const vulnerabilities = getVulnerabilitiesByScan(scanId);
+
+            // Get browser session info for this scan
+            let browserActions: any[] = [];
+            let currentUrl: string | null = null;
+
+            const runtime = this.registry.getRuntime(scanId);
+            if (runtime?.kind === 'agent') {
+                const sessionId = runtime.agent.getBrowserSessionId?.();
+                if (sessionId) {
+                    browserActions = getBrowserActions(sessionId);
+                    const visibility = browserService.getSessionVisibility(sessionId);
+                    currentUrl = (visibility as any)?.currentUrl || null;
+                }
+            }
+
+            // Fallback: try DB for browser session
+            if (browserActions.length === 0) {
+                try {
+                    const session = db.prepare(
+                        'SELECT id, current_url FROM browser_sessions WHERE scan_id = ? ORDER BY launched_at DESC LIMIT 1'
+                    ).get(scanId) as any;
+                    if (session?.id) {
+                        browserActions = getBrowserActions(session.id);
+                        if (!currentUrl) currentUrl = session.current_url || null;
+                    }
+                } catch { /* DB not ready or no session */ }
+            }
+
+            // Get coverage summary
+            let coverageSummary: { coveragePercentage: number } | null = null;
+            if (runtime?.kind === 'agent') {
+                const state = runtime.agent.getState();
+                coverageSummary = state.coverageSummary || null;
+            } else {
+                const checkpoint = scanRuntimeCheckpointService.getCheckpoint(scanId);
+                if (checkpoint?.coverage?.coveragePercentage != null) {
+                    coverageSummary = { coveragePercentage: checkpoint.coverage.coveragePercentage };
+                }
+            }
+
+            // Get target origin for third-party filtering
+            const scan = getScan(scanId) as any;
+            const targetOrigin = scan?.target || null;
+
+            return projectCoverageGraph({
+                scanId,
+                targetOrigin,
+                endpointInventory,
+                vulnerabilities,
+                browserActions,
+                currentUrl,
+                coverageSummary,
+            });
+        } catch (error: any) {
+            logger.warn('Coverage graph projection failed', { scanId, error: error.message });
+            return null;
+        }
     }
 
     public async startWebScan(scanId: string, targetUrl: string, config: WebScanRuntimeConfig = {}): Promise<void> {
@@ -184,6 +258,7 @@ export class ScanRuntimeService {
                 isPool: true,
                 executionMode: 'dormant-multi-agent',
                 phase: 'testing',
+                coverageGraph: null,
                 isRunning: state.isRunning,
                 isPaused: false,
                 logs,
@@ -224,6 +299,7 @@ export class ScanRuntimeService {
                 hypothesisCount: state.hypothesisCount || { new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 },
                 coverageSummary: state.coverageSummary || null,
                 endpointInventory: state.endpointInventory || null,
+                coverageGraph: this.getCoverageGraph(scanId),
             };
         }
 
@@ -265,6 +341,7 @@ export class ScanRuntimeService {
                 coveragePercentage: checkpoint.coverage.coveragePercentage,
             } : null,
             runtimeCheckpoint: checkpoint,
+            coverageGraph: this.getCoverageGraph(scanId),
         };
     }
 

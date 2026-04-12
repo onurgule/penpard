@@ -1,3 +1,4 @@
+// Coverage graph v2.3: localhost-aware filtering — 2026-04-11T18:55
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
