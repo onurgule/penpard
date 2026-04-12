@@ -57,6 +57,7 @@
 <p align="center">
   <a href="#-important-notes">Notes</a> •
   <a href="#-features">Features</a> •
+  <a href="#coverage-graph--live-attack-surface-visualization">Coverage Graph</a> •
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-architecture">Architecture</a> •
   <a href="#-how-it-works">How It Works</a> •
@@ -574,6 +575,27 @@ The real-time scan dashboard shows:
 - **Interactive chat** — Send commands to the agent mid-scan
 - **Pause/Resume controls** — Take over when you want to
 - **Progress tracking** — Phase-by-phase scan progress
+
+### Coverage Graph — Live Attack Surface Visualization
+
+PenPard builds a **real-time coverage graph** during every scan, giving you a visual map of the target's attack surface as the AI discovers and tests routes.
+
+<p align="center">
+  <img src="docs/screenshots/coverage-graph.png" alt="PenPard Coverage Graph — Real-time route visualization with vulnerability overlay" width="800" />
+  <br/>
+  <em>Coverage Graph — A live, interactive graph of every discovered route. Nodes are color-coded by status: cyan for actively tested, red/orange for vulnerable, gray for discovered-but-untested. Click any node to inspect its findings, request variants, and attack history.</em>
+</p>
+
+**What it does:**
+
+- **Route Discovery Visualization** — Every endpoint the AI discovers (via crawling, JS analysis, or Burp proxy traffic) appears as a node in the graph, folded by canonical route pattern
+- **Live Attack Coverage Overlay** — Nodes change color as the agent tests them: gray → cyan (active) → green (clean) or red (vulnerable). Watch coverage spread across the surface in real time
+- **Navigation Flow Edges** — Directed edges show how the AI navigated between routes, revealing the application's link structure and the agent's exploration path
+- **Node Inspection** — Click any node to see 7 detailed sections: Route Summary, Flow Context, Discovery Sources, Attempted Attacks, Confirmed Findings, Request Variants, and Evidence Preview
+- **Fullscreen Mode** — Expand the graph into a fullscreen modal with mouse-wheel zoom, click-drag pan, and a resizable 3-column investigation inspector
+- **Endpoint Intelligence Toggle** — Switch between graph view and a structured endpoint inventory list showing auth-relevant routes, Burp-seen endpoints, and JS-discovered artifacts
+
+The coverage graph is built from a pure-functional backend projection pipeline that normalizes raw URLs into canonical route patterns, folds parameter variants, matches vulnerabilities to routes, and computes risk scores — all recomputed on every poll cycle for live accuracy.
 
 ---
 

@@ -511,6 +511,7 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
         const vulnerabilities = getVulnerabilitiesByScan(id);
         const endpointInventory = scanRuntimeService.getEndpointInventory(id);
         const runtimeCheckpoint = scanRuntimeService.getRuntimeCheckpoint(id);
+        const coverageGraph = scanRuntimeService.getCoverageGraph(id);
 
         res.json({
             id: scan.id,
@@ -524,6 +525,7 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
             sourceAnalysisMode: scan.source_analysis_mode || null,
             endpointInventory,
             runtimeCheckpoint,
+            coverageGraph,
             vulnerabilities: vulnerabilities.map(v => ({
                 id: v.id,
                 name: v.name,
