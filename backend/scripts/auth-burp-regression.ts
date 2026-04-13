@@ -93,6 +93,8 @@ async function main(): Promise<void> {
         initialRequest,
     }, burp as any);
 
+    const executeSendHttpRequest = (toolCall: any) => (agent as any).requestExecutor.execute(toolCall);
+
     let failures = 0;
 
     printScenarioHeader('Scenario 1: Managed injection from Burp-seeded auth state');
@@ -103,7 +105,7 @@ async function main(): Promise<void> {
         body: '{"ok":true}',
     }]);
 
-    const baselineResult = await (agent as any).executeSendHttpRequest({
+    const baselineResult = await executeSendHttpRequest({
         tool: 'send_http_request',
         args: {
             method: 'GET',
@@ -137,7 +139,7 @@ async function main(): Promise<void> {
         },
     ]);
 
-    const recoveryResult = await (agent as any).executeSendHttpRequest({
+    const recoveryResult = await executeSendHttpRequest({
         tool: 'send_http_request',
         args: {
             method: 'GET',
