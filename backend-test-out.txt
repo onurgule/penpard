@@ -1,0 +1,38 @@
+2026-04-13 13:39:26 [[32MINFO[39M]: Initializing database... 
+📁 Database path: C:\Users\Gerede\AppData\Local\Temp\penpard-github-auth-Ig9do8\penpard.db
+2026-04-13 13:39:27 [[32MINFO[39M]: Created default operator user (999999 credits) 
+2026-04-13 13:39:27 [[32MINFO[39M]: Added scans.initial_request column 
+2026-04-13 13:39:27 [[32MINFO[39M]: Added scans.source_package_path column 
+2026-04-13 13:39:27 [[32MINFO[39M]: Added scans.source_analysis_mode column 
+2026-04-13 13:39:27 [[32MINFO[39M]: Added scans.source_analysis_result_json column 
+2026-04-13 13:39:27 [[32MINFO[39M]: Added browser_sessions.label column 
+2026-04-13 13:39:27 [[32MINFO[39M]: Database initialized successfully 
+2026-04-13 13:39:27 [[32MINFO[39M]: Initializing database... 
+📁 Database path: C:\Users\Gerede\AppData\Local\Temp\penpard-github-auth-Ig9do8\penpard.db
+2026-04-13 13:39:27 [[32MINFO[39M]: Database initialized successfully 
+2026-04-13 13:39:27 [[32MINFO[39M]: Initializing database... 
+📁 Database path: C:\Users\Gerede\AppData\Local\Temp\penpard-github-auth-Ig9do8\penpard.db
+2026-04-13 13:39:27 [[32MINFO[39M]: Database initialized successfully 
+2026-04-13 13:39:27 [[32MINFO[39M]: Initializing database... 
+📁 Database path: C:\Users\Gerede\AppData\Local\Temp\penpard-github-auth-Ig9do8\penpard.db
+2026-04-13 13:39:28 [[32MINFO[39M]: Database initialized successfully 
+2026-04-13 13:39:28 [[32MINFO[39M]: Initializing database... 
+📁 Database path: C:\Users\Gerede\AppData\Local\Temp\penpard-github-auth-Ig9do8\penpard.db
+2026-04-13 13:39:28 [[32MINFO[39M]: Database initialized successfully 
+2026-04-13 13:39:28 [[32MINFO[39M]: Initializing database... 
+📁 Database path: C:\Users\Gerede\AppData\Local\Temp\penpard-github-auth-Ig9do8\penpard.db
+2026-04-13 13:39:28 [[32MINFO[39M]: Database initialized successfully 
+✔ GitHub auth start route returns a browser authorization payload that points at the 127.0.0.1:5050 callback listener (629.5422ms)
+✔ completeAuthorizationCallback persists the GitHub user token and Copilot model cache on success (380.5379ms)
+✔ completeAuthorizationCallback marks the auth session failed when GitHub returns an OAuth error (302.4677ms)
+✔ completeAuthorizationCallback rejects invalid callback state values (283.775ms)
+✔ completeAuthorizationCallback surfaces token exchange failures and leaves the session failed (291.0202ms)
+✔ GitHub callback listener defaults to 127.0.0.1:5050 and serves callback responses on the configured path (289.0309ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2957.0457

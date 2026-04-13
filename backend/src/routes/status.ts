@@ -13,7 +13,7 @@ router.get('/', authenticateToken, async (req: AuthRequest, res: Response) => {
     // 1. LLM Status
     let llmStatus = { provider: 'None', model: 'None', configured: false };
     try {
-        const llmConfig = llmProvider.getActiveConfig();
+        const llmConfig = llmProvider.getActiveConfig(req.user?.id || 1);
         llmStatus = {
             provider: llmConfig.provider,
             model: llmConfig.model,

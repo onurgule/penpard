@@ -3,12 +3,14 @@ import { spawn, fork, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { pathToFileURL } from 'url';
+import { openExternalUrl } from './external-url';
 import { appUpdater } from './updater';
 
 // Keep a global reference of the window and backend process
 let mainWindow: BrowserWindow | null = null;
 let backendProcess: ChildProcess | null = null;
 let backendStartTime: number | null = null;
+let pendingDeepLinkRoute: string | null = null;
 
 // Configuration
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
@@ -33,6 +35,73 @@ if (!isDev) {
 }
 const BACKEND_PORT = 4000;
 const FRONTEND_PORT = 3000;
+
+function getAppUrlForRoute(route: string = '/'): string {
+    const normalizedRoute = route.startsWith('/') ? route : `/${route}`;
+    if (isDev) {
+        return `${getFrontendPath()}${normalizedRoute}`;
+    }
+    return `penpard://app${normalizedRoute}`;
+}
+
+function parsePenpardDeepLink(rawUrl: string): string | null {
+    try {
+        const url = new URL(rawUrl);
+        if (url.protocol !== 'penpard:' || url.host !== 'app') {
+            return null;
+        }
+
+        const route = `${url.pathname || '/'}${url.search || ''}${url.hash || ''}`;
+        return route.startsWith('/') ? route : `/${route}`;
+    } catch {
+        return null;
+    }
+}
+
+function navigateToRoute(route: string): void {
+    pendingDeepLinkRoute = route;
+
+    if (!mainWindow) {
+        return;
+    }
+
+    if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+    }
+    mainWindow.focus();
+
+    void mainWindow.loadURL(getAppUrlForRoute(route)).catch((error) => {
+        console.error('Failed to navigate to deep link route:', route, error);
+    });
+}
+
+function handlePenpardDeepLink(rawUrl: string): void {
+    const route = parsePenpardDeepLink(rawUrl);
+    if (!route) {
+        return;
+    }
+    navigateToRoute(route);
+}
+
+function extractDeepLinkFromArgs(args: string[]): string | null {
+    return args.find((arg) => arg.startsWith('penpard://')) || null;
+}
+
+function registerDefaultProtocolClient(): void {
+    if ((process as NodeJS.Process & { defaultApp?: boolean }).defaultApp) {
+        app.setAsDefaultProtocolClient('penpard', process.execPath, [path.resolve(process.argv[1])]);
+        return;
+    }
+    app.setAsDefaultProtocolClient('penpard');
+}
+
+const initialDeepLink = extractDeepLinkFromArgs(process.argv);
+if (initialDeepLink) {
+    const initialRoute = parsePenpardDeepLink(initialDeepLink);
+    if (initialRoute) {
+        pendingDeepLinkRoute = initialRoute;
+    }
+}
 
 // Get the correct paths based on whether we're in dev or production
 function getBackendPath(): string {
@@ -183,6 +252,7 @@ function stopBackend(): void {
 
 // Create the main application window
 async function createWindow(): Promise<void> {
+    const initialRoute = pendingDeepLinkRoute || '/';
     mainWindow = new BrowserWindow({
         width: 1400,
         height: 900,
@@ -218,10 +288,10 @@ async function createWindow(): Promise<void> {
 
     // Load the frontend
     if (isDev) {
-        mainWindow.loadURL(`http://localhost:${FRONTEND_PORT}`);
+        mainWindow.loadURL(getAppUrlForRoute(initialRoute));
         mainWindow.webContents.openDevTools();
     } else {
-        const frontendUrl = getFrontendPath();
+        const frontendUrl = getAppUrlForRoute(initialRoute);
         console.log(`Loading frontend from: ${frontendUrl}`);
         mainWindow.loadURL(frontendUrl).catch(err => {
             console.error('Failed to load frontend:', err);
@@ -230,7 +300,11 @@ async function createWindow(): Promise<void> {
 
     // Handle external links
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-        shell.openExternal(url);
+        void openExternalUrl(url, (target) => shell.openExternal(target)).then((result) => {
+            if (!result.success) {
+                console.error('[External URL] Failed to open renderer link:', result.error);
+            }
+        });
         return { action: 'deny' };
     });
 
@@ -250,6 +324,11 @@ ipcMain.handle('get-app-version', () => {
 
 ipcMain.handle('get-data-path', () => {
     return getDataPath();
+});
+
+// Open an external browser URL for OAuth and documentation flows.
+ipcMain.handle('open-external-url', async (_event, url: string) => {
+    return openExternalUrl(url, (target) => shell.openExternal(target));
 });
 
 // Window control handlers
@@ -572,6 +651,8 @@ app.whenReady().then(async () => {
         console.log('Starting PenPard...');
         console.log(`Running in ${isDev ? 'development' : 'production'} mode`);
 
+        registerDefaultProtocolClient();
+
         if (!isDev) {
             registerPenpardProtocol();
         }
@@ -612,6 +693,11 @@ app.on('activate', () => {
     }
 });
 
+app.on('open-url', (event, url) => {
+    event.preventDefault();
+    handlePenpardDeepLink(url);
+});
+
 app.on('before-quit', () => {
     stopBackend();
 });
@@ -621,7 +707,12 @@ const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
     app.quit();
 } else {
-    app.on('second-instance', () => {
+    app.on('second-instance', (_event, commandLine) => {
+        const deepLink = extractDeepLinkFromArgs(commandLine);
+        if (deepLink) {
+            handlePenpardDeepLink(deepLink);
+            return;
+        }
         if (mainWindow) {
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.focus();

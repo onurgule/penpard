@@ -391,6 +391,51 @@ export async function initDatabase(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_browser_sessions_status ON browser_sessions(status);
     CREATE INDEX IF NOT EXISTS idx_browser_sessions_scan ON browser_sessions(scan_id);
     CREATE INDEX IF NOT EXISTS idx_browser_actions_session ON browser_actions(session_id);
+
+    -- User integrations (OAuth tokens for external services like GitHub)
+    CREATE TABLE IF NOT EXISTS user_integrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL DEFAULT 1,
+      provider TEXT NOT NULL,
+      access_token_encrypted TEXT,
+      token_iv TEXT,
+      refresh_token_encrypted TEXT,
+      refresh_token_iv TEXT,
+      token_scope TEXT,
+      external_username TEXT,
+      external_avatar_url TEXT,
+      connected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      expires_at DATETIME,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      metadata_json TEXT DEFAULT '{}',
+      UNIQUE(user_id, provider),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_integrations_user ON user_integrations(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_integrations_provider ON user_integrations(provider);
+
+    -- Short-lived OAuth authorization sessions for browser callbacks
+    CREATE TABLE IF NOT EXISTS integration_auth_sessions (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      provider TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed', 'expired')),
+      state TEXT NOT NULL UNIQUE,
+      code_verifier TEXT NOT NULL,
+      redirect_uri TEXT NOT NULL,
+      app_redirect_url TEXT,
+      authorization_url TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      expires_at DATETIME NOT NULL,
+      completed_at DATETIME,
+      error_message TEXT,
+      result_json TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_integration_auth_sessions_user ON integration_auth_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_integration_auth_sessions_provider_status ON integration_auth_sessions(provider, status);
   `);
 
   // Seed lock_key_hash if not exists (default key: "penpard")
@@ -474,6 +519,16 @@ if (!scanCols.some((c) => c.name === 'runtime_checkpoint_json')) {
   if (!browserCols.some((c) => c.name === 'last_error')) {
     db.exec('ALTER TABLE browser_sessions ADD COLUMN last_error TEXT');
     logger.info('Added browser_sessions.last_error column');
+  }
+
+  const integrationCols = db.prepare('PRAGMA table_info(user_integrations)').all() as { name: string }[];
+  if (!integrationCols.some((c) => c.name === 'refresh_token_encrypted')) {
+    db.exec('ALTER TABLE user_integrations ADD COLUMN refresh_token_encrypted TEXT');
+    logger.info('Added user_integrations.refresh_token_encrypted column');
+  }
+  if (!integrationCols.some((c) => c.name === 'refresh_token_iv')) {
+    db.exec('ALTER TABLE user_integrations ADD COLUMN refresh_token_iv TEXT');
+    logger.info('Added user_integrations.refresh_token_iv column');
   }
 
   logger.info('Database initialized successfully');
@@ -961,7 +1016,7 @@ const REQUIRED_TABLES = [
   'scan_chat_messages', 'report_analyses', 'analysis_findings', 'analysis_logs',
   'mindset_ttps', 'mindset_profile', 'ttp_test_playbooks',
   'presence_scan_runs', 'presence_scan_targets', 'presence_scan_logs', 'presence_scan_run_ttps',
-  'browser_sessions', 'browser_actions',
+  'browser_sessions', 'browser_actions', 'user_integrations', 'integration_auth_sessions',
 ];
 
 /**

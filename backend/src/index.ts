@@ -20,6 +20,8 @@ import penpardRoutes from './routes/penpard';
 import reportAnalysisRoutes from './routes/report-analysis';
 import presenceScanRoutes from './routes/presence-scan';
 import browserRoutes from './routes/browser';
+import githubIntegrationRoutes from './routes/github-integration';
+import { githubIntegration } from './services/GitHubIntegrationService';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -78,6 +80,7 @@ app.use('/api/penpard', penpardRoutes);
 app.use('/api/report-analysis', reportAnalysisRoutes);
 app.use('/api/presence-scan', presenceScanRoutes);
 app.use('/api/browser', browserRoutes);
+app.use('/api/integrations', githubIntegrationRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -116,6 +119,27 @@ async function start() {
         const orphanedCount = recoverOrphanedScans();
         if (orphanedCount > 0) {
             logger.warn(`Recovered ${orphanedCount} orphaned scan(s) — marked as 'interrupted'`);
+        }
+
+        const githubCleanup = githubIntegration.reconcilePersistedStateOnStartup();
+        if (
+            githubCleanup.expiredSessions > 0
+            || githubCleanup.purgedInactiveSecrets > 0
+            || githubCleanup.invalidatedConnections > 0
+            || githubCleanup.deactivatedProviderConfig
+            || githubCleanup.migratedLegacyProviderConfig
+            || githubCleanup.removedLegacyProviderConfig
+        ) {
+            logger.warn('GitHub persisted state normalized on startup', githubCleanup);
+        }
+
+        try {
+            await githubIntegration.ensureCallbackServerReady();
+            logger.info(`GitHub callback listener ready at ${githubIntegration.getCallbackUrl()}`);
+        } catch (error) {
+            logger.warn('GitHub callback listener is unavailable', {
+                error: error instanceof Error ? error.message : String(error),
+            });
         }
 
         app.listen(PORT, () => {

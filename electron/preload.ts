@@ -12,6 +12,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Get the data path for storing files
     getDataPath: () => ipcRenderer.invoke('get-data-path'),
 
+    // Open OAuth and documentation links in the user's default browser
+    openExternalUrl: (url: string) => ipcRenderer.invoke('open-external-url', url),
+
     // Platform info
     platform: process.platform,
 
@@ -77,6 +80,7 @@ declare global {
             getBackendUrl: () => Promise<string>;
             getAppVersion: () => Promise<string>;
             getDataPath: () => Promise<string>;
+            openExternalUrl: (url: string) => Promise<{ success: boolean; error?: string }>;
             platform: string;
             isElectron: boolean;
 

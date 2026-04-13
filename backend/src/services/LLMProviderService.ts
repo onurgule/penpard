@@ -5,6 +5,10 @@ import { OpenAI } from 'openai';
 import { Anthropic } from '@anthropic-ai/sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
+import { githubIntegration } from './GitHubIntegrationService';
+import { GITHUB_COPILOT_PROVIDER, LEGACY_GITHUB_MODELS_PROVIDER } from './github/config';
+
+const GITHUB_RUNTIME_USER_ID = 1;
 
 // Prepared statement for token usage logging (created lazily)
 let logTokenStmt: any = null;
@@ -22,7 +26,7 @@ function getLogTokenStmt() {
  * Interface for LLM Configuration DB Row
  */
 export interface LLMConfig {
-    provider: 'openai' | 'anthropic' | 'gemini' | 'deepseek' | 'ollama' | 'qwen';
+    provider: 'openai' | 'anthropic' | 'gemini' | 'deepseek' | 'ollama' | 'qwen' | 'github_copilot';
     api_key: string;
     model: string;
     is_active: number;
@@ -50,41 +54,87 @@ export interface GenerationResponse {
 }
 
 class LLMProviderService {
+    private normalizeGitHubProviderState(userId: number = GITHUB_RUNTIME_USER_ID): void {
+        const githubConfig = db.prepare('SELECT provider, is_active FROM llm_config WHERE provider = ?').get(GITHUB_COPILOT_PROVIDER) as Pick<LLMConfig, 'provider' | 'is_active'> | undefined;
+        if (!githubConfig?.is_active) {
+            return;
+        }
+
+        const status = githubIntegration.getConnectionStatus(userId);
+        if (status.connected) {
+            return;
+        }
+
+        db.prepare(`
+            UPDATE llm_config
+            SET is_active = 0,
+                is_online = 0,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE provider IN (?, ?)
+        `).run(GITHUB_COPILOT_PROVIDER, LEGACY_GITHUB_MODELS_PROVIDER);
+    }
 
     /**
      * Get the currently active LLM provider configuration.
      * There should only be one active provider ideally, or the UI selects one.
      * For now, we return the first active one or throw.
      */
-    public getActiveConfig(): LLMConfig {
-        const config = db.prepare('SELECT * FROM llm_config WHERE is_active = 1').get() as LLMConfig;
+    public getActiveConfig(userId: number = GITHUB_RUNTIME_USER_ID): LLMConfig {
+        this.normalizeGitHubProviderState(userId);
+        const config = db.prepare('SELECT * FROM llm_config WHERE is_active = 1 AND provider != ?').get(LEGACY_GITHUB_MODELS_PROVIDER) as LLMConfig;
         if (!config) {
             throw new Error('No active LLM provider configured.');
         }
         return config;
     }
 
-    public getAllConfigs(): LLMConfig[] {
-        return db.prepare('SELECT * FROM llm_config').all() as LLMConfig[];
+    public getAllConfigs(userId: number = GITHUB_RUNTIME_USER_ID): LLMConfig[] {
+        this.normalizeGitHubProviderState(userId);
+        return db.prepare('SELECT * FROM llm_config WHERE provider != ?').all(LEGACY_GITHUB_MODELS_PROVIDER) as LLMConfig[];
     }
 
-    public updateConfig(data: LLMConfig) {
-        const exists = db.prepare('SELECT 1 FROM llm_config WHERE provider = ?').get(data.provider);
-        if (exists) {
-            db.prepare(`
-                UPDATE llm_config 
-                SET api_key = ?, model = ?, is_active = ?, settings_json = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE provider = ?
-            `).run(data.api_key, data.model, data.is_active, data.settings_json, data.provider);
-        } else {
-            db.prepare(`
-                INSERT INTO llm_config (provider, api_key, model, is_active, settings_json)
-                VALUES (?, ?, ?, ?, ?)
-            `).run(data.provider, data.api_key, data.model, data.is_active, data.settings_json);
+    public updateConfig(data: LLMConfig, userId: number = GITHUB_RUNTIME_USER_ID) {
+        if (data.provider === GITHUB_COPILOT_PROVIDER && data.is_active) {
+            const status = githubIntegration.getConnectionStatus(userId);
+            if (!status.connected) {
+                throw new Error('GitHub is not connected. Connect GitHub before selecting GitHub Copilot.');
+            }
+            if (!status.providerReady) {
+                throw new Error(status.lastDiscoveryError || 'GitHub Copilot is connected, but no selectable Copilot models were discovered yet.');
+            }
+
+            const selectedModel = data.model || githubIntegration.getConnectionStatus(userId).selectedModel || '';
+            const selection = githubIntegration.isModelSelectable(userId, selectedModel);
+            if (!selection.selectable) {
+                throw new Error(selection.error || 'The selected GitHub Copilot model is not currently available.');
+            }
         }
+
+        const persistConfig = db.transaction((config: LLMConfig) => {
+            const exists = db.prepare('SELECT 1 FROM llm_config WHERE provider = ?').get(config.provider);
+            if (config.is_active) {
+                db.prepare('UPDATE llm_config SET is_active = 0 WHERE provider != ?').run(config.provider);
+            }
+
+            if (exists) {
+                db.prepare(`
+                    UPDATE llm_config 
+                    SET api_key = ?, model = ?, is_active = ?, settings_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE provider = ?
+                `).run(config.api_key, config.model, config.is_active, config.settings_json, config.provider);
+            } else {
+                db.prepare(`
+                    INSERT INTO llm_config (provider, api_key, model, is_active, settings_json)
+                    VALUES (?, ?, ?, ?, ?)
+                `).run(config.provider, config.api_key, config.model, config.is_active, config.settings_json);
+            }
+        });
+
+        persistConfig(data);
     }
 
-    public async checkConnection(provider: string): Promise<{ success: boolean; error?: string }> {
+    public async checkConnection(provider: string, userId: number = GITHUB_RUNTIME_USER_ID): Promise<{ success: boolean; error?: string }> {
+        this.normalizeGitHubProviderState(userId);
         const config = db.prepare('SELECT * FROM llm_config WHERE provider = ?').get(provider) as LLMConfig;
 
         if (!config) {
@@ -92,7 +142,18 @@ class LLMProviderService {
         }
 
         if (!config.api_key || config.api_key.trim() === '') {
-            return { success: false, error: `API key is empty for provider '${provider}'. Please enter a valid API key.` };
+            // github_copilot uses a token from user_integrations, not llm_config.api_key
+            if (config.provider === GITHUB_COPILOT_PROVIDER) {
+                const status = githubIntegration.getConnectionStatus(userId);
+                if (!status.connected) {
+                    return { success: false, error: 'GitHub is not connected. Click "Connect GitHub" in settings to link your account.' };
+                }
+                if (!status.providerReady) {
+                    return { success: false, error: status.lastDiscoveryError || 'GitHub Copilot is connected, but no selectable models are ready yet.' };
+                }
+            } else {
+                return { success: false, error: `API key is empty for provider '${provider}'. Please enter a valid API key.` };
+            }
         }
 
         try {
@@ -110,7 +171,7 @@ class LLMProviderService {
      * Primary generation method used by agents.
      */
     public async generate(request: GenerationRequest, context?: string): Promise<GenerationResponse> {
-        const config = this.getActiveConfig();
+        const config = this.getActiveConfig(GITHUB_RUNTIME_USER_ID);
         return this.generateText(config, request, context);
     }
 
@@ -120,7 +181,7 @@ class LLMProviderService {
      */
     public checkVisionSupport(): { supported: boolean; provider: string; model: string } {
         try {
-            const config = this.getActiveConfig();
+            const config = this.getActiveConfig(GITHUB_RUNTIME_USER_ID);
             const model = (config.model || '').toLowerCase();
             const provider = config.provider;
 
@@ -146,6 +207,15 @@ class LLMProviderService {
                 case 'ollama':
                     // Some Ollama models support vision (llava, bakllava, etc.)
                     supported = model.includes('llava') || model.includes('vision') || model.includes('moondream');
+                    break;
+                case GITHUB_COPILOT_PROVIDER:
+                    supported = githubIntegration.getCachedModel(GITHUB_RUNTIME_USER_ID, config.model)?.supportsVision
+                        || model.includes('vision')
+                        || model.includes('gpt-4')
+                        || model.includes('gpt-5')
+                        || model.includes('o1')
+                        || model.includes('o3')
+                        || model.includes('gemini');
                     break;
                 default:
                     supported = false;
@@ -201,6 +271,9 @@ class LLMProviderService {
                 break;
             case 'ollama':
                 result = await this.callOllama(config, req, temperature);
+                break;
+            case GITHUB_COPILOT_PROVIDER:
+                result = await this.callGitHubCopilot(config, req);
                 break;
             default:
                 throw new Error(`Unsupported provider: ${config.provider}`);
@@ -397,6 +470,14 @@ class LLMProviderService {
                 output_tokens: data.eval_count || 0,
             } : undefined
         };
+    }
+
+    private async callGitHubCopilot(config: LLMConfig, req: GenerationRequest) {
+        return githubIntegration.generateCopilotResponse(GITHUB_RUNTIME_USER_ID, config.model, {
+            systemPrompt: req.systemPrompt,
+            userPrompt: req.userPrompt,
+            images: req.images,
+        });
     }
 }
 

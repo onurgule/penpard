@@ -33,6 +33,7 @@ declare global {
             getBackendUrl: () => Promise<string>;
             getAppVersion: () => Promise<string>;
             getDataPath: () => Promise<string>;
+            openExternalUrl: (url: string) => Promise<{ success: boolean; error?: string }>;
             platform: string;
             isElectron: boolean;
 

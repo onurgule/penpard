@@ -2,7 +2,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { motion } from 'framer-motion';
 import Link from 'next/link';
 import {
@@ -23,14 +23,34 @@ import {
     BookOpen,
     Shield,
     Save,
+    Github,
+    ExternalLink,
+    CheckCircle2,
+    Loader2,
+    Unplug,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import toast from 'react-hot-toast';
 import axios from 'axios';
 import ReportTemplateEditor from '@/components/ReportTemplateEditor';
 import { API_URL } from '@/lib/api-config';
+import { idleGitHubAuthUiState, isGitHubProviderSelected, normalizeGitHubProviderSelection, startGitHubBrowserAuthFlow } from './github-auth-flow';
+import GitHubCopilotProviderCard from './GitHubCopilotProviderCard';
+import {
+    createGitHubAppConfigDraft,
+    isGitHubAppConfigDirty,
+    requiresGitHubAppClientSecret,
+    toGitHubAppConfigPayload,
+} from './github-oauth-config';
+import {
+    GITHUB_COPILOT_PROVIDER,
+    type GitHubAppConfigSummary,
+    type GitHubAuthSession,
+    type GitHubConnectionStatus,
+    type GitHubCopilotModel,
+} from './github-copilot-types';
 
-type LLMProvider = 'gemini' | 'deepseek' | 'openai' | 'anthropic' | 'ollama';
+type LLMProvider = 'gemini' | 'deepseek' | 'openai' | 'anthropic' | 'ollama' | typeof GITHUB_COPILOT_PROVIDER;
 
 interface LLMConfig {
     provider: LLMProvider;
@@ -52,6 +72,7 @@ interface McpServer {
 
 export default function SettingsPage() {
     const router = useRouter();
+    const searchParams = useSearchParams();
     const { token, isAuthenticated, changeKey } = useAuthStore();
 
     // LLM State
@@ -86,6 +107,29 @@ export default function SettingsPage() {
         is_enabled: 1
     });
 
+    // GitHub Integration State
+    const [githubStatus, setGithubStatus] = useState<GitHubConnectionStatus>({ connected: false, configured: true, providerReady: false });
+    const [githubAppConfig, setGithubAppConfig] = useState<GitHubAppConfigSummary>({
+        source: 'none',
+        clientId: '',
+        callbackUrl: createGitHubAppConfigDraft().callbackUrl,
+        hasClientSecret: false,
+        configured: false,
+    });
+    const [githubAppConfigDraft, setGithubAppConfigDraft] = useState(createGitHubAppConfigDraft());
+    const [githubSavingAppConfig, setGithubSavingAppConfig] = useState(false);
+    const [githubModels, setGithubModels] = useState<GitHubCopilotModel[]>([]);
+    const [githubModelsError, setGithubModelsError] = useState<string | null>(null);
+    const [githubAuthSessionId, setGithubAuthSessionId] = useState<string | null>(null);
+    const [githubAuthorizationUrl, setGithubAuthorizationUrl] = useState<string | null>(null);
+    const [githubAuthBusy, setGithubAuthBusy] = useState(false);
+    const [githubAuthMessage, setGithubAuthMessage] = useState<string | null>(null);
+    const [githubRefreshingModels, setGithubRefreshingModels] = useState(false);
+    const githubConfig = configs.find(c => c.provider === GITHUB_COPILOT_PROVIDER);
+    const githubProviderIsActive = isGitHubProviderSelected(configs, githubStatus.providerReady);
+    const githubAppConfigDirty = isGitHubAppConfigDirty(githubAppConfig, githubAppConfigDraft);
+    const githubAppConfigRequiresSecret = requiresGitHubAppClientSecret(githubAppConfig, githubAppConfigDraft);
+
     // Auth guard - redirect to login if not authenticated
     useEffect(() => {
         if (!isAuthenticated) {
@@ -95,19 +139,60 @@ export default function SettingsPage() {
 
     useEffect(() => {
         if (isAuthenticated && token) {
-            fetchSettings();
-            fetchMcpServers();
-            fetchBurpConfig();
+            void (async () => {
+                await Promise.all([
+                    fetchMcpServers(),
+                    fetchBurpConfig(),
+                    fetchGitHubAppConfig({ resetDraft: true }),
+                ]);
+                const status = await fetchGithubStatus();
+                await fetchSettings(status?.providerReady);
+            })();
             // Poll logs for demo
             const interval = setInterval(fetchMcpLogs, 3000);
             return () => clearInterval(interval);
         }
     }, [isAuthenticated, token]);
 
-    const fetchSettings = async () => {
+    useEffect(() => {
+        const sessionId = searchParams.get('githubAuthSession');
+        if (sessionId && isAuthenticated && token) {
+            setGithubAuthSessionId(sessionId);
+            fetchGithubAuthSession(sessionId);
+        }
+    }, [searchParams, isAuthenticated, token]);
+
+    useEffect(() => {
+        if (!githubAuthSessionId || !token) {
+            return;
+        }
+
+        const handleFocus = () => {
+            if (document.visibilityState === 'hidden') {
+                return;
+            }
+            void fetchGithubAuthSession(githubAuthSessionId, { silent: true });
+        };
+
+        window.addEventListener('focus', handleFocus);
+        document.addEventListener('visibilitychange', handleFocus);
+
+        return () => {
+            window.removeEventListener('focus', handleFocus);
+            document.removeEventListener('visibilitychange', handleFocus);
+        };
+    }, [githubAuthSessionId, token]);
+
+    useEffect(() => {
+        if (!githubStatus.providerReady) {
+            setConfigs(prev => normalizeGitHubProviderSelection(prev, false));
+        }
+    }, [githubStatus.providerReady]);
+
+    const fetchSettings = async (githubProviderReady = githubStatus.providerReady) => {
         try {
             const res = await axios.get(`${API_URL}/config/llm`, { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 });
-            setConfigs(res.data.configs || []);
+            setConfigs(normalizeGitHubProviderSelection(res.data.configs || [], githubProviderReady));
         } catch {
             // Backend may not be ready yet
         }
@@ -193,8 +278,8 @@ export default function SettingsPage() {
 
             // Refresh to get 'updated_at' etc
             fetchSettings();
-        } catch (e) {
-            toast.error('Failed to update settings');
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to update settings');
         }
     };
 
@@ -215,9 +300,9 @@ export default function SettingsPage() {
             const res = await axios.post(`${API_URL}/config/llm/test`, { provider }, { headers: { Authorization: `Bearer ${token}` } });
             setStatusMap(prev => ({ ...prev, [provider]: res.data.status }));
             toast.success('Connection Successful');
-        } catch (e) {
+        } catch (e: any) {
             setStatusMap(prev => ({ ...prev, [provider]: 'offline' }));
-            toast.error('Connection Failed: Check API Key');
+            toast.error(e.response?.data?.message || 'Connection failed');
         }
     };
 
@@ -276,6 +361,241 @@ export default function SettingsPage() {
         }
     };
 
+    // ── GitHub Integration Methods ──
+
+    const openGithubAuthorization = async (url: string) => {
+        if (typeof window !== 'undefined' && window.electronAPI?.openExternalUrl) {
+            const result = await window.electronAPI.openExternalUrl(url);
+            if (!result.success) {
+                throw new Error(result.error || 'Failed to open browser');
+            }
+            return;
+        }
+
+        const opened = window.open(url, '_blank', 'noopener,noreferrer');
+        if (!opened) {
+            window.location.href = url;
+        }
+    };
+
+    const fetchGitHubAppConfig = async (options?: { resetDraft?: boolean }) => {
+        try {
+            const res = await axios.get<GitHubAppConfigSummary>(`${API_URL}/integrations/github/config`, {
+                headers: { Authorization: `Bearer ${token}` },
+                timeout: 5000,
+            });
+            setGithubAppConfig(res.data);
+            if (options?.resetDraft) {
+                setGithubAppConfigDraft(createGitHubAppConfigDraft(res.data));
+            }
+            return res.data;
+        } catch {
+            return null;
+        }
+    };
+
+    const fetchGithubStatus = async () => {
+        try {
+            const res = await axios.get(`${API_URL}/integrations/github/status`, { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 });
+            setGithubStatus(res.data);
+            if (res.data.appConfig) {
+                setGithubAppConfig(res.data.appConfig);
+            }
+            setGithubModelsError(res.data.lastDiscoveryError || null);
+            if (res.data.connected) {
+                void fetchGithubModels(false);
+            } else {
+                setGithubModels([]);
+            }
+            setConfigs(prev => normalizeGitHubProviderSelection(prev, !!res.data.providerReady));
+            return res.data as GitHubConnectionStatus;
+        } catch {
+            // Backend may not be ready yet
+            return null;
+        }
+    };
+
+    const fetchGithubModels = async (refresh: boolean) => {
+        setGithubRefreshingModels(true);
+        try {
+            const res = await axios.get(`${API_URL}/integrations/github/models`, {
+                headers: { Authorization: `Bearer ${token}` },
+                params: { refresh: refresh ? 1 : 0 },
+                timeout: 15000,
+            });
+            setGithubModels(res.data.models || []);
+            setGithubModelsError(null);
+        } catch (e: any) {
+            setGithubModelsError(e.response?.data?.message || 'Failed to load GitHub Copilot models.');
+        } finally {
+            setGithubRefreshingModels(false);
+        }
+    };
+
+    const fetchGithubAuthSession = async (sessionId: string, options?: { silent?: boolean }) => {
+        try {
+            const res = await axios.get<GitHubAuthSession>(`${API_URL}/integrations/github/auth/session/${sessionId}`, {
+                headers: { Authorization: `Bearer ${token}` },
+                timeout: 5000,
+            });
+
+            setGithubAuthorizationUrl(res.data.authorizationUrl || null);
+
+            if (res.data.status === 'completed') {
+                setGithubAuthBusy(idleGitHubAuthUiState.busy);
+                setGithubAuthSessionId(idleGitHubAuthUiState.sessionId);
+                setGithubAuthorizationUrl(idleGitHubAuthUiState.authorizationUrl);
+                setGithubAuthMessage(idleGitHubAuthUiState.message);
+                const status = await fetchGithubStatus();
+                await fetchSettings(status?.providerReady);
+                await fetchGithubModels(true);
+                router.replace('/settings');
+                if (!options?.silent) {
+                    const discoveryError = res.data.result?.discoveryError;
+                    if (discoveryError) {
+                        toast.error(`GitHub connected, but model discovery failed: ${discoveryError}`);
+                    } else {
+                        toast.success(`Connected to GitHub as ${res.data.result?.username || githubStatus.username || 'your account'}`);
+                    }
+                }
+                return;
+            }
+
+            if (res.data.status === 'failed' || res.data.status === 'expired') {
+                setGithubAuthBusy(idleGitHubAuthUiState.busy);
+                setGithubAuthSessionId(idleGitHubAuthUiState.sessionId);
+                setGithubAuthorizationUrl(idleGitHubAuthUiState.authorizationUrl);
+                setGithubAuthMessage(res.data.errorMessage || 'GitHub authorization did not complete.');
+                const status = await fetchGithubStatus();
+                await fetchSettings(status?.providerReady);
+                router.replace('/settings');
+                if (!options?.silent) {
+                    toast.error(res.data.errorMessage || 'GitHub authorization failed.');
+                }
+                return;
+            }
+
+            setGithubAuthBusy(true);
+            setGithubAuthSessionId(res.data.id);
+            setGithubAuthMessage('Approve PenPard in your browser, then return here.');
+        } catch (e: any) {
+            if (!options?.silent) {
+                toast.error(e.response?.data?.message || 'Failed to check GitHub authorization status.');
+            }
+        }
+    };
+
+    const startGithubBrowserAuth = async () => {
+        setGithubAuthBusy(true);
+        setGithubAuthMessage('Opening GitHub in your browser...');
+        try {
+            const runtime = typeof window !== 'undefined' && window.electronAPI ? 'electron' : 'web';
+            const outcome = await startGitHubBrowserAuthFlow({
+                requestStartAuthorization: async () => {
+                    const res = await axios.post(`${API_URL}/integrations/github/auth/start`, {
+                        runtime,
+                        origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+                    }, { headers: { Authorization: `Bearer ${token}` } });
+                    return res.data;
+                },
+                openAuthorizationUrl: openGithubAuthorization,
+                cancelPendingAuthorization: async (sessionId, reason) => {
+                    await axios.post(`${API_URL}/integrations/github/auth/session/${sessionId}/cancel`, { reason }, {
+                        headers: { Authorization: `Bearer ${token}` },
+                        timeout: 5000,
+                    });
+                },
+            });
+
+            setGithubAuthBusy(outcome.state.busy);
+            setGithubAuthSessionId(outcome.state.sessionId);
+            setGithubAuthorizationUrl(outcome.state.authorizationUrl);
+            setGithubAuthMessage(outcome.state.message);
+
+            if (outcome.errorMessage) {
+                const status = await fetchGithubStatus();
+                await fetchSettings(status?.providerReady);
+                toast.error(outcome.errorMessage);
+                return;
+            }
+
+            toast.success('Continue in your browser to finish connecting GitHub');
+        } catch (e: any) {
+            setGithubAuthBusy(idleGitHubAuthUiState.busy);
+            setGithubAuthSessionId(idleGitHubAuthUiState.sessionId);
+            setGithubAuthorizationUrl(idleGitHubAuthUiState.authorizationUrl);
+            setGithubAuthMessage(idleGitHubAuthUiState.message);
+            const status = await fetchGithubStatus();
+            await fetchSettings(status?.providerReady);
+            toast.error(e.response?.data?.message || e.message || 'Failed to start GitHub authentication');
+        }
+    };
+
+    const saveGitHubAppConfig = async () => {
+        setGithubSavingAppConfig(true);
+        try {
+            const payload = toGitHubAppConfigPayload(githubAppConfigDraft);
+            const res = await axios.post<GitHubAppConfigSummary>(`${API_URL}/integrations/github/config`, payload, {
+                headers: { Authorization: `Bearer ${token}` },
+                timeout: 10000,
+            });
+            setGithubAppConfig(res.data);
+            setGithubAppConfigDraft(createGitHubAppConfigDraft(res.data));
+            const status = await fetchGithubStatus();
+            await fetchSettings(status?.providerReady);
+            if (res.data.requiresCallbackRegistrationConfirmation) {
+                toast.success('GitHub App configuration saved. Update the GitHub App callback URLs, then confirm the change here before connecting.');
+            } else {
+                toast.success('GitHub App configuration saved');
+            }
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to save GitHub App configuration');
+        } finally {
+            setGithubSavingAppConfig(false);
+        }
+    };
+
+    const confirmGitHubCallbackRegistration = async () => {
+        setGithubSavingAppConfig(true);
+        try {
+            const res = await axios.post<GitHubAppConfigSummary>(`${API_URL}/integrations/github/config`, {
+                clientId: githubAppConfig.clientId,
+                clientSecret: '',
+                callbackUrl: githubAppConfig.callbackUrl,
+                confirmCallbackRegistration: true,
+            }, {
+                headers: { Authorization: `Bearer ${token}` },
+                timeout: 10000,
+            });
+            setGithubAppConfig(res.data);
+            setGithubAppConfigDraft(createGitHubAppConfigDraft(res.data));
+            const status = await fetchGithubStatus();
+            await fetchSettings(status?.providerReady);
+            toast.success('GitHub App callback URL confirmed');
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to confirm the GitHub App callback URL');
+        } finally {
+            setGithubSavingAppConfig(false);
+        }
+    };
+
+    const disconnectGithub = async () => {
+        try {
+            await axios.post(`${API_URL}/integrations/github/disconnect`, {}, { headers: { Authorization: `Bearer ${token}` } });
+            setGithubModels([]);
+            setGithubModelsError(null);
+            setGithubAuthBusy(idleGitHubAuthUiState.busy);
+            setGithubAuthSessionId(idleGitHubAuthUiState.sessionId);
+            setGithubAuthorizationUrl(idleGitHubAuthUiState.authorizationUrl);
+            setGithubAuthMessage(idleGitHubAuthUiState.message);
+            const status = await fetchGithubStatus();
+            await fetchSettings(status?.providerReady);
+            toast.success('GitHub disconnected');
+        } catch {
+            toast.error('Failed to disconnect GitHub');
+        }
+    };
+
     if (!isAuthenticated) return null;
 
     return (
@@ -329,6 +649,50 @@ export default function SettingsPage() {
                     </div>
 
                     <div className="space-y-4">
+                        <motion.div layout>
+                            <GitHubCopilotProviderCard
+                                status={githubStatus}
+                                appConfig={githubAppConfig}
+                                appConfigDraft={githubAppConfigDraft}
+                                appConfigDirty={githubAppConfigDirty}
+                                appConfigSaving={githubSavingAppConfig}
+                                appConfigRequiresSecret={githubAppConfigRequiresSecret}
+                                models={githubModels}
+                                modelsError={githubModelsError}
+                                authBusy={githubAuthBusy}
+                                authMessage={githubAuthMessage}
+                                authSessionId={githubAuthSessionId}
+                                authorizationUrl={githubAuthorizationUrl}
+                                refreshingModels={githubRefreshingModels}
+                                providerActive={githubProviderIsActive}
+                                selectedModel={githubConfig?.model || ''}
+                                testStatus={statusMap[GITHUB_COPILOT_PROVIDER]}
+                                onToggleProvider={() => updateConfig(GITHUB_COPILOT_PROVIDER, {
+                                    is_active: githubProviderIsActive ? 0 : 1,
+                                })}
+                                onDisconnect={disconnectGithub}
+                                onConnect={startGithubBrowserAuth}
+                                onSaveAppConfig={saveGitHubAppConfig}
+                                onConfirmCallbackRegistration={confirmGitHubCallbackRegistration}
+                                onChangeAppConfig={(field, value) => setGithubAppConfigDraft((prev) => ({ ...prev, [field]: value }))}
+                                onUseSuggestedCallbackUrl={(value) => setGithubAppConfigDraft((prev) => ({ ...prev, callbackUrl: value }))}
+                                onSelectModel={(modelId) => {
+                                    handleLocalConfigChange(GITHUB_COPILOT_PROVIDER, 'model', modelId);
+                                    updateConfig(GITHUB_COPILOT_PROVIDER, { model: modelId });
+                                }}
+                                onRefreshModels={() => fetchGithubModels(true)}
+                                onTestConnection={() => testConnection(GITHUB_COPILOT_PROVIDER)}
+                                onOpenBrowserAgain={() => githubAuthorizationUrl ? openGithubAuthorization(githubAuthorizationUrl) : startGithubBrowserAuth()}
+                                onRefreshAuthSession={() => githubAuthSessionId ? fetchGithubAuthSession(githubAuthSessionId) : Promise.resolve()}
+                            />
+                        </motion.div>
+
+                        {/* Separator */}
+                        <div className="flex items-center gap-3 py-1">
+                            <div className="h-px flex-1 bg-slate-800"></div>
+                            <span className="text-[10px] text-slate-600 uppercase font-bold tracking-widest">API Key Providers</span>
+                            <div className="h-px flex-1 bg-slate-800"></div>
+                        </div>
                         {['openai', 'gemini', 'anthropic', 'deepseek', 'ollama'].map(p => {
                             const provider = p as LLMProvider;
                             const config = configs.find(c => c.provider === provider) || { provider, api_key: '', is_active: 0, model: 'default' };

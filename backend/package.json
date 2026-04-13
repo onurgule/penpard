@@ -17,6 +17,7 @@
     },
     "dependencies": {
         "@anthropic-ai/sdk": "^0.71.2",
+        "@github/copilot-sdk": "^0.2.2",
         "@google/generative-ai": "^0.24.1",
         "adm-zip": "^0.5.16",
         "axios": "^1.6.0",
