@@ -7,6 +7,7 @@ import { GitHubCopilotSdkService, type CopilotPromptRequest, type CopilotPromptR
 import { GitHubIntegrationStore, StoredGitHubIntegration } from './github/GitHubIntegrationStore';
 import { GitHubOAuthService } from './github/GitHubOAuthService';
 import { GitHubAppConfigSummary, GitHubAuthSessionSummary, GitHubConnectionStatus, GitHubCopilotModel } from './github/types';
+import type { ProviderExecutionOptions } from './llm/LlmRuntimeTypes';
 
 const GITHUB_STATUS_VALIDATION_TTL_MS = 5 * 60 * 1000;
 
@@ -505,7 +506,12 @@ export class GitHubIntegrationService {
         return { selectable: true };
     }
 
-    async generateCopilotResponse(userId: number, modelId: string, request: CopilotPromptRequest): Promise<CopilotPromptResponse> {
+    async generateCopilotResponse(
+        userId: number,
+        modelId: string,
+        request: CopilotPromptRequest,
+        executionOptions: ProviderExecutionOptions = {},
+    ): Promise<CopilotPromptResponse> {
         let selection = this.isModelSelectable(userId, modelId);
         if (!selection.selectable) {
             await this.listModels(userId, true);
@@ -516,7 +522,7 @@ export class GitHubIntegrationService {
             throw new Error(selection.error);
         }
 
-        return this.withAccessToken(userId, async (token) => this.copilot.generate(token, modelId, request));
+        return this.withAccessToken(userId, async (token) => this.copilot.generate(token, modelId, request, executionOptions));
     }
 
     async getRuntimeAccessToken(userId: number): Promise<string> {

@@ -1,4 +1,4 @@
-import { llmQueue } from '../LLMQueue';
+import { llmRuntime } from '../llm/LlmRuntime';
 import { llmProvider } from '../LLMProviderService';
 import { logger } from '../../utils/logger';
 import { applyNarrativePatch } from './reporting-model';
@@ -7,7 +7,9 @@ import type { CanonicalReportModel, ReportLlmStatus } from './types';
 
 interface EnrichmentOptions {
     scanId: string;
+    userId?: number;
     reportExportId: string;
+    signal?: AbortSignal;
 }
 
 interface EnrichmentResult {
@@ -19,7 +21,7 @@ interface EnrichmentResult {
 export class ReportEnrichmentService {
     public async enrichReport(baseReport: CanonicalReportModel, options: EnrichmentOptions): Promise<EnrichmentResult> {
         try {
-            llmProvider.getActiveConfig();
+            llmProvider.getActiveConfig(options.userId);
         } catch (error: any) {
             logger.warn('Skipping report enrichment because no active LLM is configured', {
                 scanId: options.scanId,
@@ -63,7 +65,7 @@ export class ReportEnrichmentService {
             })),
         };
 
-        const response = await llmQueue.enqueue({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You improve penetration test report narratives. Return ONLY valid JSON that matches the requested schema. Do not wrap the JSON in markdown.',
             userPrompt: [
                 'Improve the following report narratives while staying evidence-bound and professional.',
@@ -80,8 +82,18 @@ export class ReportEnrichmentService {
             temperature: 0,
         }, {
             scanId: options.scanId,
+            userId: options.userId,
             reportExportId: options.reportExportId,
+            callSite: 'report_enrichment',
             context: 'report-export-enrichment',
+            maxAttempts: 1,
+            retryBudgetMs: null,
+            firstEventTimeoutMs: null,
+            attemptTimeoutMs: null,
+            providerIdleTimeoutMs: null,
+            queueWaitTimeoutMs: null,
+            queueExecutionTimeoutMs: null,
+            signal: options.signal,
         });
 
         try {

@@ -230,6 +230,11 @@ test('completeAuthorizationCallback persists the GitHub user token and Copilot m
 
     assert.equal(result.session?.status, 'completed');
     assert.match(result.html, /GitHub connected/);
+    assert.ok(!result.html.includes('ghu_connected'));
+    assert.ok(!result.html.includes('ghr_refresh'));
+    assert.ok(!result.html.includes('github-app-test-secret'));
+    assert.ok(!JSON.stringify(result.session || {}).includes('ghu_connected'));
+    assert.ok(!JSON.stringify(result.session || {}).includes('ghr_refresh'));
     assert.equal(persistedIntegration.external_username, 'octocat');
     assert.equal(persistedIntegration.external_avatar_url, 'https://avatars.example/octocat.png');
     assert.equal(persistedIntegration.is_active, 1);

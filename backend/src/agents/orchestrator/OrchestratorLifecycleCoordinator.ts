@@ -1,4 +1,4 @@
-import { llmQueue } from '../../services/LLMQueue';
+import { llmRuntime } from '../../services/llm/LlmRuntime';
 import { EndpointInventorySnapshot } from '../../services/EndpointIntelligenceService';
 import { ScanRuntimeCheckpoint } from '../../services/runtime/ScanRuntimeCheckpointService';
 import { OrchestratorBrowserSession } from './OrchestratorBrowserSession';
@@ -19,6 +19,7 @@ type CheckpointHook = (checkpoint: ScanRuntimeCheckpoint) => void | Promise<void
 type SaveLogsFn = () => void;
 
 interface ReportingSummaryInput {
+    scanId: string;
     targetUrl: string;
     planRound: number;
     endpointsTested: number;
@@ -162,6 +163,7 @@ export class OrchestratorLifecycleCoordinator {
         if (vulnerabilities.length > 0) {
             try {
                 const summary = await (this.options.summarizeReport || defaultSummarizeReport)({
+                    scanId: this.options.scanId,
                     targetUrl: this.options.targetUrl,
                     planRound: this.options.state.planRound,
                     endpointsTested: this.options.scanSurface().getDiscoveredEndpointCount(),
@@ -206,9 +208,13 @@ async function defaultSummarizeReport(input: ReportingSummaryInput): Promise<str
         .map((vulnerability) => `[${vulnerability.severity.toUpperCase()}] ${vulnerability.name}`)
         .join('\n');
 
-    const summary = await llmQueue.enqueue({
+    const summary = await llmRuntime.generate({
         systemPrompt: 'You are a security report writer. Provide a concise executive summary of the penetration test findings. Include: total vulns by severity, most critical issues, and key recommendations.',
         userPrompt: `Target: ${input.targetUrl}\nPlanning rounds completed: ${input.planRound}\nEndpoints tested: ${input.endpointsTested}\n\nFindings:\n${vulnList}`,
+    }, {
+        scanId: input.scanId,
+        callSite: 'executive_summary',
+        context: 'orchestrator-executive-summary',
     });
 
     return summary.text;

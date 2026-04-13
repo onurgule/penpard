@@ -1,5 +1,7 @@
 import { CopilotClient, approveAll, type ModelInfo } from '@github/copilot-sdk';
 import { logger } from '../../utils/logger';
+import type { ProviderAttemptDiagnostics, ProviderExecutionOptions } from '../llm/LlmRuntimeTypes';
+import { LlmExecutionError } from '../llm/LlmRuntimeTypes';
 import type { GitHubCopilotModel } from './types';
 
 export interface CopilotPromptImage {
@@ -19,6 +21,19 @@ export interface CopilotPromptResponse {
         input_tokens: number;
         output_tokens: number;
     };
+    diagnostics?: Partial<ProviderAttemptDiagnostics>;
+}
+
+export interface CopilotSessionLike {
+    send(options: {
+        prompt: string;
+        attachments?: Array<{ type: 'blob'; data: string; mimeType: string; displayName?: string }>;
+    }): Promise<unknown>;
+    disconnect(): Promise<void>;
+    on?(eventName: string, listener: (payload?: any) => void): void;
+    off?(eventName: string, listener: (payload?: any) => void): void;
+    addListener?(eventName: string, listener: (payload?: any) => void): void;
+    removeListener?(eventName: string, listener: (payload?: any) => void): void;
 }
 
 export interface GitHubCopilotClientLike {
@@ -39,17 +54,9 @@ export interface GitHubCopilotClientLike {
         availableTools?: string[];
         infiniteSessions?: { enabled: boolean };
         systemMessage?: { mode: 'replace'; content: string };
+        streaming?: boolean;
         onPermissionRequest: typeof approveAll;
-    }): Promise<{
-        sendAndWait(
-            options: {
-                prompt: string;
-                attachments?: Array<{ type: 'blob'; data: string; mimeType: string; displayName?: string }>;
-            },
-            timeout?: number,
-        ): Promise<{ data: { content: string } } | undefined>;
-        disconnect(): Promise<void>;
-    }>;
+    }): Promise<CopilotSessionLike>;
 }
 
 export class GitHubCopilotAuthError extends Error {
@@ -68,6 +75,89 @@ function normalizeAuthError(message: string): GitHubCopilotAuthError {
     return new GitHubCopilotAuthError(message || 'GitHub Copilot authentication failed.');
 }
 
+function normalizeString(value: unknown): string {
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (value === undefined || value === null) {
+        return '';
+    }
+    return String(value);
+}
+
+function extractTextContent(payload: any): string {
+    if (!payload) {
+        return '';
+    }
+
+    if (typeof payload === 'string') {
+        return payload;
+    }
+
+    if (Array.isArray(payload)) {
+        return payload.map((item) => extractTextContent(item)).join('');
+    }
+
+    if (typeof payload.content === 'string') {
+        return payload.content;
+    }
+
+    if (Array.isArray(payload.content)) {
+        return payload.content.map((item: any) => extractTextContent(item)).join('');
+    }
+
+    if (typeof payload.text === 'string') {
+        return payload.text;
+    }
+
+    if (typeof payload.delta === 'string') {
+        return payload.delta;
+    }
+
+    if (payload.data) {
+        return extractTextContent(payload.data);
+    }
+
+    if (Array.isArray(payload.parts)) {
+        return payload.parts.map((item: any) => extractTextContent(item)).join('');
+    }
+
+    return '';
+}
+
+function subscribe(
+    session: CopilotSessionLike,
+    eventName: string,
+    listener: (payload?: any) => void,
+): () => void {
+    if (typeof session.on === 'function') {
+        session.on(eventName, listener);
+        return () => session.off?.(eventName, listener);
+    }
+
+    if (typeof session.addListener === 'function') {
+        session.addListener(eventName, listener);
+        return () => session.removeListener?.(eventName, listener);
+    }
+
+    return () => {};
+}
+
+function buildSdkSessionError(message: string, sendCompleted: boolean): LlmExecutionError {
+    const lower = message.toLowerCase();
+    const sessionLikeFailure = !sendCompleted
+        || lower.includes('session')
+        || lower.includes('disconnect')
+        || lower.includes('idle');
+
+    return new LlmExecutionError({
+        failureCategory: sessionLikeFailure ? 'sdk_session_timeout' : 'transient_provider_error',
+        message,
+        rawError: message,
+        retryable: true,
+    });
+}
+
 export class GitHubCopilotSdkService {
     constructor(
         private readonly createClient: CopilotClientFactory = (accessToken) => new CopilotClient({
@@ -79,6 +169,10 @@ export class GitHubCopilotSdkService {
     ) {}
 
     private normalizeSdkError(error: unknown): Error {
+        if (error instanceof LlmExecutionError) {
+            return error;
+        }
+
         const message = error instanceof Error ? error.message : String(error || 'GitHub Copilot SDK request failed.');
         const lowerMessage = message.toLowerCase();
 
@@ -163,7 +257,7 @@ export class GitHubCopilotSdkService {
         accessToken: string,
         model: string,
         request: CopilotPromptRequest,
-        timeoutMs = 60_000,
+        executionOptions: ProviderExecutionOptions = {},
     ): Promise<CopilotPromptResponse> {
         return this.withClient(accessToken, async (client) => {
             const session = await client.createSession({
@@ -173,6 +267,7 @@ export class GitHubCopilotSdkService {
                 enableConfigDiscovery: false,
                 availableTools: [],
                 infiniteSessions: { enabled: false },
+                streaming: true,
                 systemMessage: {
                     mode: 'replace',
                     content: request.systemPrompt,
@@ -180,25 +275,191 @@ export class GitHubCopilotSdkService {
                 onPermissionRequest: approveAll,
             });
 
-            try {
-                const response = await session.sendAndWait({
-                    prompt: request.userPrompt,
-                    attachments: request.images?.map((image, index) => ({
-                        type: 'blob' as const,
-                        data: image.data,
-                        mimeType: image.mimeType,
-                        displayName: `image-${index + 1}`,
-                    })),
-                }, timeoutMs);
+            const firstEventTimeoutMs = executionOptions.firstEventTimeoutMs !== undefined
+                ? executionOptions.firstEventTimeoutMs
+                : 20_000;
+            const attemptTimeoutMs = executionOptions.attemptTimeoutMs !== undefined
+                ? executionOptions.attemptTimeoutMs
+                : 60_000;
+            const diagnostics: ProviderAttemptDiagnostics = {
+                streamingStarted: false,
+                anyEventReceived: false,
+                assistantMessageReceived: false,
+                idleReceived: false,
+                firstEventAtMs: null,
+                idleAtMs: null,
+                finalContentLength: 0,
+                warningCategory: null,
+                rawProviderError: null,
+            };
 
-                const text = response?.data.content?.trim() || '';
-                if (!text) {
-                    throw new Error('GitHub Copilot SDK returned an empty response.');
+            const startedAtMs = Date.now();
+            let sendCompleted = false;
+            let settled = false;
+            let deltaText = '';
+            let finalMessage = '';
+            let firstEventTimer: NodeJS.Timeout | undefined;
+            let attemptTimer: NodeJS.Timeout | undefined;
+            let abortCleanup = () => {};
+            const unsubs: Array<() => void> = [];
+
+            const cleanup = async () => {
+                if (firstEventTimer) {
+                    clearTimeout(firstEventTimer);
                 }
-
-                return { text };
-            } finally {
+                if (attemptTimer) {
+                    clearTimeout(attemptTimer);
+                }
+                abortCleanup();
+                for (const unsub of unsubs) {
+                    unsub();
+                }
                 await session.disconnect();
+            };
+
+            try {
+                const result = await new Promise<CopilotPromptResponse>((resolve, reject) => {
+                    const settle = (callback: () => void) => {
+                        if (settled) {
+                            return;
+                        }
+                        settled = true;
+                        callback();
+                    };
+
+                    const recordAssistantEvent = () => {
+                        diagnostics.anyEventReceived = true;
+                        if (diagnostics.firstEventAtMs === null) {
+                            diagnostics.firstEventAtMs = Date.now() - startedAtMs;
+                            if (firstEventTimer) {
+                                clearTimeout(firstEventTimer);
+                            }
+                        }
+                    };
+
+                    const settleSuccess = (warningCategory?: ProviderAttemptDiagnostics['warningCategory']) => {
+                        const text = (finalMessage || deltaText).trim();
+                        if (!text) {
+                            settle(() => reject(new LlmExecutionError({
+                                failureCategory: 'malformed_provider_result',
+                                message: 'GitHub Copilot SDK returned an empty response.',
+                            })));
+                            return;
+                        }
+
+                        diagnostics.finalContentLength = text.length;
+                        diagnostics.warningCategory = warningCategory ?? null;
+                        settle(() => resolve({
+                            text,
+                            diagnostics,
+                        }));
+                    };
+
+                    const settleError = (error: unknown) => {
+                        diagnostics.rawProviderError = normalizeString(error instanceof Error ? error.message : error);
+                        settle(() => reject(error));
+                    };
+
+                    if (firstEventTimeoutMs && firstEventTimeoutMs > 0) {
+                        firstEventTimer = setTimeout(() => {
+                            settleError(new LlmExecutionError({
+                                failureCategory: 'provider_first_event_timeout',
+                                message: `No GitHub Copilot event received within ${firstEventTimeoutMs}ms.`,
+                                budgetMs: firstEventTimeoutMs,
+                                retryable: true,
+                            }));
+                        }, firstEventTimeoutMs);
+                    }
+
+                    if (attemptTimeoutMs && attemptTimeoutMs > 0) {
+                        attemptTimer = setTimeout(() => {
+                            if (finalMessage.trim()) {
+                                settleSuccess('provider_idle_timeout');
+                                return;
+                            }
+
+                            settleError(new LlmExecutionError({
+                                failureCategory: 'provider_call_timeout',
+                                message: `GitHub Copilot provider call exceeded ${attemptTimeoutMs}ms.`,
+                                budgetMs: attemptTimeoutMs,
+                                retryable: true,
+                            }));
+                        }, attemptTimeoutMs);
+                    }
+
+                    if (executionOptions.signal) {
+                        const abortHandler = () => {
+                            settleError(new LlmExecutionError({
+                                failureCategory: 'canceled_due_to_scan_state',
+                                message: 'GitHub Copilot session aborted.',
+                                rawError: normalizeString(executionOptions.signal?.reason),
+                            }));
+                        };
+
+                        if (executionOptions.signal.aborted) {
+                            abortHandler();
+                            return;
+                        }
+
+                        executionOptions.signal.addEventListener('abort', abortHandler, { once: true });
+                        abortCleanup = () => executionOptions.signal?.removeEventListener('abort', abortHandler);
+                    }
+
+                    unsubs.push(
+                        subscribe(session, 'assistant.message_delta', (payload) => {
+                            recordAssistantEvent();
+                            diagnostics.streamingStarted = true;
+                            const text = extractTextContent(payload);
+                            if (text) {
+                                deltaText += text;
+                            }
+                        }),
+                    );
+                    unsubs.push(
+                        subscribe(session, 'assistant.message', (payload) => {
+                            recordAssistantEvent();
+                            diagnostics.assistantMessageReceived = true;
+                            const text = extractTextContent(payload);
+                            if (text) {
+                                finalMessage = text;
+                            }
+                        }),
+                    );
+                    unsubs.push(
+                        subscribe(session, 'session.idle', () => {
+                            diagnostics.idleReceived = true;
+                            diagnostics.idleAtMs = Date.now() - startedAtMs;
+                            settleSuccess();
+                        }),
+                    );
+                    unsubs.push(
+                        subscribe(session, 'session.error', (payload) => {
+                            const message = extractTextContent(payload) || normalizeString(payload) || 'GitHub Copilot session error.';
+                            settleError(buildSdkSessionError(message, sendCompleted));
+                        }),
+                    );
+
+                    void session.send({
+                        prompt: request.userPrompt,
+                        attachments: request.images?.map((image, index) => ({
+                            type: 'blob' as const,
+                            data: image.data,
+                            mimeType: image.mimeType,
+                            displayName: `image-${index + 1}`,
+                        })),
+                    }).then(() => {
+                        sendCompleted = true;
+                    }).catch((error) => {
+                        settleError(buildSdkSessionError(
+                            error instanceof Error ? error.message : String(error || 'GitHub Copilot send failed.'),
+                            sendCompleted,
+                        ));
+                    });
+                });
+
+                return result;
+            } finally {
+                await cleanup();
             }
         });
     }

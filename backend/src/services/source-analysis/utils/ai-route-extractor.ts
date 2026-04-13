@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { EndpointSummary } from '../SourceAnalysisMode';
-import { llmProvider } from '../../LLMProviderService';
+import { llmRuntime } from '../../llm/LlmRuntime';
 import { logger } from '../../../utils/logger';
 
 const SOURCE_EXTENSIONS = new Set([
@@ -99,7 +99,7 @@ IMPORTANT:
 - If you find no additional dynamic routes, return an empty array [].
 - Return ONLY valid JSON — no markdown fences, no explanation, just the JSON array.`;
 
-export async function extractRoutesWithAI(sourcePath: string, existingRoutes: EndpointSummary[]): Promise<EndpointSummary[]> {
+export async function extractRoutesWithAI(sourcePath: string, existingRoutes: EndpointSummary[], userId?: number): Promise<EndpointSummary[]> {
     const routeFiles = collectRouteFiles(sourcePath);
 
     if (routeFiles.length === 0) {
@@ -121,10 +121,14 @@ export async function extractRoutesWithAI(sourcePath: string, existingRoutes: En
     logger.info(`AI Route Extractor: Sending ${routeFiles.length} files (~${Math.round(fileContents.length / 4)} tokens) to LLM`);
 
     try {
-        const response = await llmProvider.generate({
+        const response = await llmRuntime.generate({
             systemPrompt: SYSTEM_PROMPT,
             userPrompt,
-        }, 'ai-route-extraction');
+        }, {
+            userId,
+            callSite: 'source_analysis',
+            context: 'ai-route-extraction',
+        });
 
         // Parse JSON response
         let parsed: any[];
@@ -132,7 +136,10 @@ export async function extractRoutesWithAI(sourcePath: string, existingRoutes: En
             const cleaned = response.text.trim().replace(/^```json?\s*/i, '').replace(/```\s*$/i, '').trim();
             parsed = JSON.parse(cleaned);
         } catch {
-            logger.warn('AI Route Extractor: Failed to parse LLM response as JSON', { raw: response.text.slice(0, 500) });
+            logger.warn('AI Route Extractor: Failed to parse LLM response as JSON', {
+                responseLength: response.text.length,
+                routeFileCount: routeFiles.length,
+            });
             return [];
         }
 

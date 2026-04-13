@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { ModuleSummary, FunctionSummary, SecurityFlow } from '../SourceAnalysisMode';
-import { llmProvider } from '../../LLMProviderService';
+import { llmRuntime } from '../../llm/LlmRuntime';
 import { logger } from '../../../utils/logger';
 
 const SOURCE_EXTENSIONS = new Set([
@@ -91,7 +91,7 @@ function chunkText(text: string, maxChars: number): string[] {
     return chunks;
 }
 
-export async function summarizeModules(files: FileInfo[], sourcePath: string): Promise<ModuleSummary[]> {
+export async function summarizeModules(files: FileInfo[], sourcePath: string, userId?: number): Promise<ModuleSummary[]> {
     const dirMap = new Map<string, FileInfo[]>();
     for (const f of files) {
         const dir = path.dirname(f.relativePath);
@@ -121,10 +121,14 @@ export async function summarizeModules(files: FileInfo[], sourcePath: string): P
         if (!sampleContent.trim()) continue;
 
         try {
-            const response = await llmProvider.generate({
+            const response = await llmRuntime.generate({
                 systemPrompt: 'You are a code analysis assistant. Be extremely concise. Answer in 1-2 sentences only.',
                 userPrompt: `What is the purpose of this module/directory "${dir}"?\n\nFiles: ${fileList}\n\nCode samples:\n${sampleContent.slice(0, 4000)}\n\nRespond with ONLY a 1-2 sentence description of the module purpose.`,
-            }, 'source-analysis-module-summary');
+            }, {
+                userId,
+                callSite: 'source_analysis',
+                context: 'source-analysis-module-summary',
+            });
 
             modules.push({
                 name: dir || 'root',
@@ -140,7 +144,7 @@ export async function summarizeModules(files: FileInfo[], sourcePath: string): P
     return modules;
 }
 
-export async function summarizeFunctions(files: FileInfo[]): Promise<FunctionSummary[]> {
+export async function summarizeFunctions(files: FileInfo[], userId?: number): Promise<FunctionSummary[]> {
     const functions: FunctionSummary[] = [];
     const highPriorityFiles = files.filter(f => f.priority >= 6).slice(0, 25);
 
@@ -151,7 +155,7 @@ export async function summarizeFunctions(files: FileInfo[]): Promise<FunctionSum
             const firstChunks = chunks.slice(0, 2);
             const codeSnippet = firstChunks.join('\n...\n');
 
-            const response = await llmProvider.generate({
+            const response = await llmRuntime.generate({
                 systemPrompt: 'You are a code analysis assistant. Output ONLY valid JSON, no markdown.',
                 userPrompt: `Extract the important functions/methods from this file. For each, give name, purpose (1 sentence), and whether it is security-relevant (handles auth, user input, DB queries, file operations, or crypto).
 
@@ -163,7 +167,11 @@ ${codeSnippet.slice(0, 5000)}
 
 Return JSON array: [{"name":"funcName","purpose":"...","securityRelevant":true/false}]
 Limit to the 8 most important functions. Return ONLY the JSON array.`,
-            }, 'source-analysis-function-summary');
+            }, {
+                userId,
+                callSite: 'source_analysis',
+                context: 'source-analysis-function-summary',
+            });
 
             try {
                 const text = response.text.trim();
@@ -192,6 +200,7 @@ export async function analyzeSecurityFlows(
     files: FileInfo[],
     modules: ModuleSummary[],
     functions: FunctionSummary[],
+    userId?: number,
 ): Promise<SecurityFlow[]> {
     const securityFiles = files.filter(f => f.priority >= 7).slice(0, 10);
     let securityContext = '';
@@ -208,7 +217,7 @@ export async function analyzeSecurityFlows(
     const funcSummary = secFunctions.map(f => `${f.name} (${f.filePath}): ${f.purpose}`).join('\n');
 
     try {
-        const response = await llmProvider.generate({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You are a security code analyst. Output ONLY valid JSON, no markdown.',
             userPrompt: `Analyze the security-relevant flows in this application.
 
@@ -225,7 +234,11 @@ Identify security-relevant flows in these categories: authentication, authorizat
 
 Return JSON array: [{"category":"...","description":"...","components":["file1.ts","funcName"],"riskLevel":"high|medium|low"}]
 Return ONLY the JSON array. Max 12 flows.`,
-        }, 'source-analysis-security-flows');
+        }, {
+            userId,
+            callSite: 'source_analysis',
+            context: 'source-analysis-security-flows',
+        });
 
         const text = response.text.trim();
         const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -250,12 +263,13 @@ export async function generateApplicationSummary(
     modules: ModuleSummary[],
     framework: string,
     stack: string[],
+    userId?: number,
 ): Promise<string> {
     const moduleSummary = modules.map(m => `${m.name}: ${m.purpose}`).join('\n');
     const fileTree = files.slice(0, 40).map(f => f.relativePath).join('\n');
 
     try {
-        const response = await llmProvider.generate({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You are a code analysis assistant. Be concise but thorough.',
             userPrompt: `Summarize this application in 3-5 sentences.
 
@@ -269,7 +283,11 @@ Module summaries:
 ${moduleSummary.slice(0, 3000)}
 
 Describe: what the application does, its purpose, its architecture style, and any notable design patterns.`,
-        }, 'source-analysis-app-summary');
+        }, {
+            userId,
+            callSite: 'source_analysis',
+            context: 'source-analysis-app-summary',
+        });
 
         return response.text.trim().slice(0, 1000);
     } catch (e: any) {
@@ -282,13 +300,14 @@ export async function generateArchitectureSummary(
     modules: ModuleSummary[],
     functions: FunctionSummary[],
     framework: string,
+    userId?: number,
 ): Promise<string> {
     const moduleSummary = modules.map(m => `${m.name}: ${m.purpose}`).join('\n');
     const keyFunctions = functions.filter(f => f.securityRelevant).slice(0, 20);
     const funcList = keyFunctions.map(f => `${f.filePath}/${f.name}: ${f.purpose}`).join('\n');
 
     try {
-        const response = await llmProvider.generate({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You are a software architect analyst. Be concise.',
             userPrompt: `Describe the architecture of this ${framework} application in 3-5 sentences.
 
@@ -299,7 +318,11 @@ Key functions:
 ${funcList.slice(0, 2000)}
 
 Describe: layer separation, data flow patterns, component relationships, and architectural style.`,
-        }, 'source-analysis-arch-summary');
+        }, {
+            userId,
+            callSite: 'source_analysis',
+            context: 'source-analysis-arch-summary',
+        });
 
         return response.text.trim().slice(0, 1000);
     } catch (e: any) {

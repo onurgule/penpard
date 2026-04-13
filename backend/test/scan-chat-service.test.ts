@@ -45,15 +45,15 @@ test('scan chat service routes live commands to the active agent and only persis
 test('scan chat service answers completed-scan questions with scan-context LLM prompts and persists the reply', async () => {
     const persisted: Array<{ role: string; content: string }> = [];
     let capturedRequest: any = null;
-    let capturedContext: string | undefined;
+    let capturedMetadata: any = null;
 
     const service = new ScanChatService({
         runtimeService: {
             getActiveAgent: () => undefined,
         } as any,
-        generate: async (request, context) => {
+        generate: async (request, metadata) => {
             capturedRequest = request;
-            capturedContext = context;
+            capturedMetadata = metadata;
             return { text: 'There is one high-severity XSS finding.' };
         },
         persistChatMessage: (_scanId, role, content) => {
@@ -74,7 +74,7 @@ test('scan chat service answers completed-scan questions with scan-context LLM p
         scanStatus: 'completed',
         isLive: false,
     });
-    assert.equal(capturedContext, 'scan-post-chat');
+    assert.deepEqual(capturedMetadata, { scanId: 'scan-chat-service-test', context: 'scan-post-chat' });
     assert.match(String(capturedRequest?.systemPrompt || ''), /Target: https:\/\/app\.example\.com/);
     assert.match(String(capturedRequest?.systemPrompt || ''), /Cross-Site Scripting \(XSS\) - \/search \(q\)/);
     assert.equal(capturedRequest?.userPrompt, 'What did you find?');

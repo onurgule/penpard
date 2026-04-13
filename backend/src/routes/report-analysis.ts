@@ -28,7 +28,7 @@ import {
 } from '../db/init';
 import { reportParser } from '../services/report-parser';
 import { ReportLearningAgent } from '../agents/RedTeamReconstructionAgent';
-import { llmQueue } from '../services/LLMQueue';
+import { llmRuntime } from '../services/llm/LlmRuntime';
 import { llmProvider } from '../services/LLMProviderService';
 import { getCachedPlaybook, cachePlaybook } from '../db/init';
 
@@ -91,7 +91,7 @@ router.post('/upload', authenticateToken, upload.single('report'), async (req: A
                 updateAnalysisStatus(analysisId, 'parsing');
 
                 // Step 1: Parse report
-                const parsedReport = await reportParser.parseReport(file.path, analysisId);
+                const parsedReport = await reportParser.parseReport(file.path, analysisId, user.id);
 
                 // Save metadata
                 updateAnalysisMetadata(analysisId, JSON.stringify(parsedReport.report_metadata));
@@ -115,7 +115,7 @@ router.post('/upload', authenticateToken, upload.single('report'), async (req: A
 
                 // Step 2: Run learning agent (TTP derivation + mindset profile)
                 updateAnalysisStatus(analysisId, 'analyzing');
-                const agent = new ReportLearningAgent(analysisId);
+                const agent = new ReportLearningAgent(analysisId, user.id);
                 await agent.analyze(parsedReport);
 
             } catch (error: any) {
@@ -371,14 +371,18 @@ router.post('/ttps/:ttpId/test-playbook', authenticateToken, async (req: AuthReq
             .replace('{GENERALIZATION_NOTES}', ttp.generalization_notes || 'None')
             .replace('{TARGET_CONTEXT}', targetContextBlock);
 
-        const response = await llmQueue.enqueue({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You are an offensive security testing guide. Output ONLY valid markdown. No extra prose.',
             userPrompt,
+        }, {
+            userId: req.user?.id,
+            callSite: 'red_team_ttp_derivation',
+            context: 'report-analysis-test-playbook',
         });
 
         // Get model info for cache
         let modelName = 'unknown';
-        try { modelName = llmProvider.getActiveConfig().model; } catch { /* ignore */ }
+        try { modelName = llmProvider.getActiveConfig(req.user?.id || 1).model; } catch { /* ignore */ }
         const totalTokens = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
 
         // Cache the result

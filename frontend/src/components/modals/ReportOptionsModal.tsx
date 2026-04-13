@@ -110,18 +110,27 @@ export default function ReportOptionsModal({ isOpen, onClose, scanId }: ReportOp
     }
 
     async function handleCreateOrReuseExport() {
+        await createExport(false);
+    }
+
+    async function handleRegenerate() {
+        await createExport(true);
+    }
+
+    async function createExport(forceRegenerate: boolean) {
         setSubmitting(true);
         try {
             const response = await axios.post(`${API_URL}/reports/${scanId}/exports`, {
                 format,
                 enrichmentMode,
+                forceRegenerate,
             }, {
                 headers: { Authorization: `Bearer ${token}` },
             });
             mergeJob(response.data.export);
-            toast.success('Export job created');
+            toast.success(forceRegenerate ? 'Report regeneration started' : 'Export job created');
         } catch (error: any) {
-            toast.error(error.response?.data?.message || 'Failed to create export job');
+            toast.error(error.response?.data?.message || (forceRegenerate ? 'Failed to regenerate export' : 'Failed to create export job'));
         } finally {
             setSubmitting(false);
         }
@@ -476,23 +485,43 @@ export default function ReportOptionsModal({ isOpen, onClose, scanId }: ReportOp
                             </button>
 
                             {selectedJob?.status === 'completed' && selectedJob.artifactReady ? (
-                                <button
-                                    onClick={() => void handleDownload()}
-                                    disabled={primaryBusy}
-                                    className="px-6 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 bg-green-500 text-white hover:bg-green-600 shadow-lg shadow-green-500/25 disabled:opacity-50"
-                                >
-                                    {downloading ? (
-                                        <>
-                                            <Loader2 className="w-4 h-4 animate-spin" />
-                                            Downloading...
-                                        </>
-                                    ) : (
-                                        <>
-                                            <CheckCircle className="w-4 h-4" />
-                                            Download {selectedJob.format.toUpperCase()}
-                                        </>
-                                    )}
-                                </button>
+                                <>
+                                    <button
+                                        onClick={() => void handleRegenerate()}
+                                        disabled={primaryBusy}
+                                        className="px-4 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 bg-slate-700 text-white hover:bg-slate-600 transition-colors disabled:opacity-50"
+                                    >
+                                        {submitting ? (
+                                            <>
+                                                <Loader2 className="w-4 h-4 animate-spin" />
+                                                Regenerating...
+                                            </>
+                                        ) : (
+                                            <>
+                                                <RotateCcw className="w-4 h-4" />
+                                                Regenerate
+                                            </>
+                                        )}
+                                    </button>
+
+                                    <button
+                                        onClick={() => void handleDownload()}
+                                        disabled={primaryBusy}
+                                        className="px-6 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 bg-green-500 text-white hover:bg-green-600 shadow-lg shadow-green-500/25 disabled:opacity-50"
+                                    >
+                                        {downloading ? (
+                                            <>
+                                                <Loader2 className="w-4 h-4 animate-spin" />
+                                                Downloading...
+                                            </>
+                                        ) : (
+                                            <>
+                                                <CheckCircle className="w-4 h-4" />
+                                                Download {selectedJob.format.toUpperCase()}
+                                            </>
+                                        )}
+                                    </button>
+                                </>
                             ) : selectedJob?.status === 'failed' ? (
                                 <button
                                     onClick={() => void handleRetry()}

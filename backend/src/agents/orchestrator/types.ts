@@ -1,8 +1,11 @@
 export type SendHttpRequestArgs = Record<string, any> & {
-    url: string;
+    url?: string;
     method?: string;
     headers?: Record<string, string>;
     body?: unknown;
+    useInitialRequestBaseline?: boolean;
+    queryMutations?: Array<{ name?: string; value?: string | number | boolean | null }>;
+    bodyMutations?: Array<{ name?: string; value?: string | number | boolean | null }>;
 };
 
 export type UrlToolArgs = Record<string, any> & {

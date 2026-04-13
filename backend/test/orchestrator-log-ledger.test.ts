@@ -75,16 +75,34 @@ test('OrchestratorLogSink persists ledger entries without pushing IO into ledger
         '[2026-04-09T12:00:00] [SYSTEM] [ok] Burp MCP: Connected',
     ]);
     assert.deepEqual(persistedBatches[1], [
-        '[2026-04-09T12:00:00] [TOOL] [browser] browser_navigate -> https://example.com',
+        '[2026-04-09T12:00:00] [TOOL] [browser] browser_navigate -> [URL]',
     ]);
     assert.deepEqual(mirroredLogs.map((entry) => entry.message), [
         '[ok] Burp MCP: Connected',
-        '[browser] browser_navigate -> https://example.com',
+        '[browser] browser_navigate -> [URL]',
     ]);
 
     const fileContents = fs.readFileSync(logFile, 'utf8');
     assert.match(fileContents, /\[SYSTEM\] \[ok\] Burp MCP: Connected/);
-    assert.match(fileContents, /\[TOOL\] \[browser\] browser_navigate -> https:\/\/example\.com/);
+    assert.match(fileContents, /\[TOOL\] \[browser\] browser_navigate -> \[URL\]/);
 
     fs.unlinkSync(logFile);
+});
+
+test('OrchestratorLogLedger redacts secrets and network details before persistence', () => {
+    const ledger = new OrchestratorLogLedger({
+        timestamp: () => '2026-04-09T12:00:00',
+    });
+
+    const entry = ledger.append(
+        'agent',
+        'Authorization: Bearer live-secret Cookie: sid=abc Visiting https://10.0.0.5:8443/private',
+    );
+
+    assert.ok(!entry.line.includes('live-secret'));
+    assert.ok(!entry.line.includes('sid=abc'));
+    assert.ok(!entry.line.includes('10.0.0.5'));
+    assert.ok(!entry.line.includes('https://10.0.0.5:8443/private'));
+    assert.match(entry.line, /\[REDACTED\]/);
+    assert.match(entry.line, /\[URL\]/);
 });

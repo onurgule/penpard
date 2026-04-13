@@ -3,7 +3,7 @@ import path from 'path';
 import { createHash } from 'crypto';
 import { browserService, CapturedJsArtifact } from './BrowserService';
 import { BurpMCPClient } from './burp-mcp';
-import { llmProvider } from './LLMProviderService';
+import { llmRuntime } from './llm/LlmRuntime';
 import {
     AuthStartupInventory,
     AuthSurfaceType,
@@ -198,8 +198,10 @@ function authSurfaceToClassification(type: AuthSurfaceType): EndpointAuthClassif
 
 class JavaScriptDiggingWorker {
     constructor(
+        private readonly scanId: string,
         private readonly targetUrl: string,
         private readonly targetOrigin: string,
+        private readonly userId: number | undefined,
         private readonly log?: (level: 'system' | 'debug' | 'error', message: string) => void,
     ) {}
 
@@ -436,7 +438,7 @@ class JavaScriptDiggingWorker {
         }>,
     ): Promise<void> {
         try {
-            const response = await llmProvider.generate({
+            const response = await llmRuntime.generate({
                 systemPrompt: 'You are a JavaScript security analysis worker. Output ONLY valid JSON, no markdown.',
                 userPrompt: `Analyze the following endpoint candidates extracted from JavaScript that was actually loaded by a target application in a proxied browser session.
 
@@ -468,7 +470,12 @@ Return JSON exactly like:
     {"endpoint":"https://target/rest/user/logout","classification":"logout","confidence":0.62,"notes":["Nearby login/session code implies logout sibling route"]}
   ]
 }`,
-            }, 'endpoint-intelligence-js-worker');
+            }, {
+                scanId: this.scanId,
+                userId: this.userId,
+                callSite: 'js_digging_classification',
+                context: 'endpoint-intelligence-js-worker',
+            });
 
             const parsed = jsonBlock<{
                 records?: Array<{
@@ -539,6 +546,7 @@ export class EndpointIntelligenceService {
         private readonly scanId: string,
         private readonly targetUrl: string,
         private readonly burp: BurpMCPClient,
+        private readonly userId?: number,
         private readonly log?: (level: 'system' | 'debug' | 'error', message: string) => void,
     ) {}
 
@@ -555,7 +563,7 @@ export class EndpointIntelligenceService {
 
         if (options.browserSessionId) {
             jsArtifacts = await browserService.captureJavaScriptArtifacts(options.browserSessionId).catch(() => []);
-            const worker = new JavaScriptDiggingWorker(this.targetUrl, targetOrigin, this.log);
+            const worker = new JavaScriptDiggingWorker(this.scanId, this.targetUrl, targetOrigin, this.userId, this.log);
             jsDigResult = await worker.analyze(jsArtifacts, options.allowAiClassification === true);
             for (const candidate of jsDigResult.candidates) {
                 const sameHost = this.sameHost(candidate.endpoint, targetHost);

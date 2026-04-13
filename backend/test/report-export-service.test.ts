@@ -16,7 +16,7 @@ const { reportEnrichmentService } = require('../src/services/reporting/ReportEnr
 const { reportExportService } = require('../src/services/reporting/ReportExportService') as typeof import('../src/services/reporting/ReportExportService');
 const { REPORTS_DIR, ensureReportsDir } = require('../src/services/reporting/renderers/shared') as typeof import('../src/services/reporting/renderers/shared');
 const { llmProvider } = require('../src/services/LLMProviderService') as typeof import('../src/services/LLMProviderService');
-const { llmQueue } = require('../src/services/LLMQueue') as typeof import('../src/services/LLMQueue');
+const { llmRuntime } = require('../src/services/llm/LlmRuntime') as typeof import('../src/services/llm/LlmRuntime');
 
 async function createCompletedScanFixture(label: string) {
     await initDatabase();
@@ -56,6 +56,33 @@ async function createCompletedScanFixture(label: string) {
     return scanId;
 }
 
+async function createUnicodePdfFixture(label: string) {
+    await initDatabase();
+    ensureReportsDir();
+
+    const scanId = `report-export-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    createScan({
+        id: scanId,
+        userId: 1,
+        type: 'web',
+        target: `https://${label}.example.com`,
+    });
+
+    addVulnerability({
+        scanId,
+        name: 'Workflow Authorization Drift',
+        severity: 'medium',
+        description: 'Account flow allows user → admin transitions after a crafted redirect…',
+        remediation: 'Normalize role changes, reject unexpected state jumps, and replace “smart” fallbacks with explicit checks.',
+        request: 'POST /api/role HTTP/1.1\nHost: app.example.com\n\nstep=review→approve',
+        response: 'HTTP/1.1 200 OK\n\n{"result":"approved → elevated"}',
+        evidence: 'Observed state machine: guest → user → admin',
+    });
+
+    updateScanStatus(scanId, 'completed');
+    return scanId;
+}
+
 test('report snapshot generation creates a deterministic canonical model without LLM', async () => {
     const scanId = await createCompletedScanFixture('snapshot');
     const { snapshot, report } = reportSnapshotService.getOrCreateSnapshot(scanId);
@@ -75,21 +102,30 @@ test('report enrichment succeeds only after structured JSON passes schema valida
     const { report } = reportSnapshotService.getOrCreateSnapshot(scanId);
 
     const originalGetActiveConfig = llmProvider.getActiveConfig.bind(llmProvider);
-    const originalEnqueue = llmQueue.enqueue.bind(llmQueue);
+    const originalGenerate = llmRuntime.generate.bind(llmRuntime);
+    let capturedGetActiveConfigUserId: number | undefined;
+    let capturedGenerateUserId: number | undefined;
 
-    llmProvider.getActiveConfig = (() => ({ provider: 'openai', model: 'gpt-4.1' } as any)) as any;
-    llmQueue.enqueue = (async () => ({
+    llmProvider.getActiveConfig = ((userId?: number) => {
+        capturedGetActiveConfigUserId = userId;
+        return { provider: 'openai', model: 'gpt-4.1' } as any;
+    }) as any;
+    llmRuntime.generate = (async (_request: any, options: any) => {
+        capturedGenerateUserId = options?.userId;
+        return {
         text: JSON.stringify({
             executiveSummary: 'Validated executive summary from the LLM.',
             findings: [
                 { findingId: report.findings[0].id, description: 'Improved description.', impact: 'Improved impact.' },
             ],
         }),
-    })) as any;
+        };
+    }) as any;
 
     try {
         const result = await reportEnrichmentService.enrichReport(report, {
             scanId,
+            userId: 55,
             reportExportId: 'job-success',
         });
 
@@ -97,9 +133,11 @@ test('report enrichment succeeds only after structured JSON passes schema valida
         assert.equal(result.report.summary.executiveSummary, 'Validated executive summary from the LLM.');
         assert.equal(result.report.findings[0].description, 'Improved description.');
         assert.equal(result.report.narrativeMeta.llmEnriched, true);
+        assert.equal(capturedGetActiveConfigUserId, 55);
+        assert.equal(capturedGenerateUserId, 55);
     } finally {
         llmProvider.getActiveConfig = originalGetActiveConfig as any;
-        llmQueue.enqueue = originalEnqueue as any;
+        llmRuntime.generate = originalGenerate as any;
     }
 });
 
@@ -108,10 +146,10 @@ test('report enrichment marks malformed structured output as failed and keeps th
     const { report } = reportSnapshotService.getOrCreateSnapshot(scanId);
 
     const originalGetActiveConfig = llmProvider.getActiveConfig.bind(llmProvider);
-    const originalEnqueue = llmQueue.enqueue.bind(llmQueue);
+    const originalGenerate = llmRuntime.generate.bind(llmRuntime);
 
     llmProvider.getActiveConfig = (() => ({ provider: 'openai', model: 'gpt-4.1' } as any)) as any;
-    llmQueue.enqueue = (async () => ({ text: '{"executiveSummary": 42}' })) as any;
+    llmRuntime.generate = (async () => ({ text: '{"executiveSummary": 42}' })) as any;
 
     try {
         const result = await reportEnrichmentService.enrichReport(report, {
@@ -124,7 +162,7 @@ test('report enrichment marks malformed structured output as failed and keeps th
         assert.equal(result.report.narrativeMeta.llmFailed, true);
     } finally {
         llmProvider.getActiveConfig = originalGetActiveConfig as any;
-        llmQueue.enqueue = originalEnqueue as any;
+        llmRuntime.generate = originalGenerate as any;
     }
 });
 
@@ -209,4 +247,45 @@ test('artifact writes are atomic and leave no temporary export files behind', as
     const files = fs.readdirSync(REPORTS_DIR);
     const tempFiles = files.filter((fileName: string) => fileName.includes(job.id) && fileName.endsWith('.tmp'));
     assert.deepEqual(tempFiles, []);
+});
+
+test('pdf export sanitizes WinAnsi-incompatible unicode characters instead of failing', async () => {
+    const scanId = await createUnicodePdfFixture('unicode-pdf');
+    const job = await reportExportService.createOrReuseExport(scanId, 'pdf', 'deterministic');
+    const completed = await reportExportService.waitForCompletion(job.id, 60000);
+
+    assert.equal(completed.status, 'completed');
+    assert.ok(completed.artifact_path && fs.existsSync(completed.artifact_path));
+});
+
+test('canceling a long-running LLM enrichment aborts the in-flight report job without relying on a timeout', async () => {
+    const scanId = await createCompletedScanFixture('cancel-aborts-enrichment');
+    const originalEnrich = reportEnrichmentService.enrichReport.bind(reportEnrichmentService);
+
+    reportEnrichmentService.enrichReport = (async (report: any, options: any) => {
+        await new Promise((resolve, reject) => {
+            options.signal?.addEventListener('abort', () => {
+                reject(options.signal.reason || new Error('aborted'));
+            }, { once: true });
+        });
+
+        return {
+            report,
+            llmStatus: 'completed',
+            errorMessage: null,
+        };
+    }) as any;
+
+    try {
+        const job = await reportExportService.createOrReuseExport(scanId, 'pdf', 'llm');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const canceled = reportExportService.cancelExport(scanId, job.id);
+        assert.equal(canceled.status, 'canceled');
+
+        const terminal = await reportExportService.waitForCompletion(job.id, 60000);
+        assert.equal(terminal.status, 'canceled');
+        assert.equal(terminal.stage, 'canceled');
+    } finally {
+        reportEnrichmentService.enrichReport = originalEnrich as any;
+    }
 });

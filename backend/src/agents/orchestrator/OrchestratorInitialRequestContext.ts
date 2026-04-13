@@ -1,76 +1,62 @@
-import { ParsedBurpRequest, parseRawBurpRequest } from '../../services/burp-request';
 import { ConversationMessage } from './types';
+import {
+    buildInitialRequestLogSummary,
+    buildInitialRequestPromptSummary,
+    parseInitialRequestProfile,
+} from './OrchestratorInitialRequestProfile';
 
 export interface OrchestratorInitialRequestContext {
-    parsed: ParsedBurpRequest | null;
+    parsed: ReturnType<typeof parseInitialRequestProfile>;
     systemPromptAppendix: string;
     initialMessages: ConversationMessage[];
     continuationMessages: ConversationMessage[];
     logSummary: string;
 }
 
-function buildHeaderLines(parsed: ParsedBurpRequest): string {
-    return Object.entries(parsed.headers)
-        .filter(([name]) => !name.toLowerCase().startsWith('x-penpard'))
-        .map(([name, value]) => `    "${name}": "${value}"`)
-        .join(',\n');
-}
-
-function buildHeadersJson(parsed: ParsedBurpRequest): string {
-    return JSON.stringify(
-        Object.fromEntries(
-            Object.entries(parsed.headers).filter(([name]) => !name.toLowerCase().startsWith('x-penpard')),
-        ),
-        null,
-        2,
-    );
-}
-
 export function buildInitialRequestContext(rawRequest: string): OrchestratorInitialRequestContext {
-    const parsed = parseRawBurpRequest(rawRequest.trim());
+    const parsed = parseInitialRequestProfile(rawRequest.trim());
     if (!parsed) {
         return {
             parsed: null,
-            systemPromptAppendix: '',
+            systemPromptAppendix: `\n\n================================================================\n  SEND TO PENPARD - REQUEST FROM BURP (SANITIZED)\n================================================================\n\nA Burp-originated HTTP request is stored server-side for replay. The request could not be safely summarized, so PenPard will keep the raw request entirely on the backend.\n\nRules for Burp-derived replay:\n1. Treat the stored request as a backend-only baseline request.\n2. When replaying it, set useInitialRequestBaseline=true so PenPard reuses the stored request server-side.\n3. Pair baseline replay with preserveExplicitAuth=true so PenPard preserves the stored explicit auth material server-side.\n4. Do NOT ask for or reconstruct raw Cookie, Authorization, CSRF, API-key, or other secret header values.\n5. Only provide the modified URL/body/header pieces you intentionally want PenPard to change.\n`,
             initialMessages: [{
                 role: 'user',
-                content: `Request from Burp (Send to PenPard). Test this request. Raw:\n\n${rawRequest.trim()}`,
+                content: `A Burp-originated HTTP request is stored server-side for replay. The raw request was intentionally not copied into the conversation.\n\nStart with a baseline replay of the stored request using useInitialRequestBaseline=true and preserveExplicitAuth=true, then continue with targeted testing while keeping all raw auth material on the backend.`,
             }],
             continuationMessages: [{
                 role: 'user',
-                content: `Reminder: the original Burp request is still active. Raw request:\n\n${rawRequest.trim()}`,
+                content: `Reminder: the Burp-originated request is still stored server-side. Continue using useInitialRequestBaseline=true with preserveExplicitAuth=true for baseline replay and do not reconstruct raw auth headers or cookies in the conversation.`,
             }],
-            logSummary: 'Could not parse Burp request; raw request was injected instead',
+            logSummary: 'Burp request profile stored server-side without prompt serialization',
         };
     }
 
-    const headerLines = buildHeaderLines(parsed);
-    const headersJson = buildHeadersJson(parsed);
-    const headerCount = Object.keys(parsed.headers).length;
+    const promptSummary = buildInitialRequestPromptSummary(parsed);
+    const logSummary = buildInitialRequestLogSummary(parsed);
 
     return {
         parsed,
-        systemPromptAppendix: `\n\n================================================================\n  SEND TO PENPARD - REQUEST FROM BURP (CRITICAL)\n================================================================\n\nYou received a complete HTTP request from the user via Burp. STRICT RULES:\n\n1. Every send_http_request MUST include ALL headers listed below. Do NOT omit any. Do NOT add new headers. Copy them exactly.\n2. Set preserveExplicitAuth=true so PenPard preserves the explicit Cookie/Authorization headers exactly as supplied.\n3. Only PARAMETRIC testing: change parameter values in the URL query string or body. Do NOT touch headers unless the user explicitly asks.\n4. The request has cookies and auth tokens - these are essential for authenticated testing.\n\nBASE REQUEST:\n  Method: ${parsed.method}\n  URL: ${parsed.url}\n  Headers (INCLUDE ALL OF THESE IN EVERY REQUEST):\n${headerLines}\n  Body: ${parsed.body || '(none)'}\n\nWhen calling send_http_request, use:\n  { "method": "${parsed.method}", "url": "<url with modified params>", "headers": { ALL HEADERS ABOVE }, "body": "${parsed.body || ''}", "preserveExplicitAuth": true }\n`,
+        systemPromptAppendix: `\n\n================================================================\n  SEND TO PENPARD - REQUEST FROM BURP (SANITIZED)\n================================================================\n\nA Burp-originated HTTP request is stored server-side for replay.\n\n${promptSummary}\n\nStrict rules:\n1. For Burp-derived replay, set useInitialRequestBaseline=true so PenPard reuses the stored baseline request server-side.\n2. Pair baseline replay with preserveExplicitAuth=true so PenPard preserves the stored explicit auth material server-side.\n3. Do NOT include raw Cookie, Authorization, CSRF, API-key, or other secret header values in prompts or tool calls unless you intentionally need to override a specific header.\n4. Do NOT copy literal <preserved> placeholders into tool calls. Use useInitialRequestBaseline=true and mutations instead.\n5. You may omit unchanged headers and unchanged body content. PenPard will replay the stored baseline request server-side and merge only your explicit changes.\n6. Prefer parametric testing. Use queryMutations for URL parameters. For JSON or form bodies, use bodyMutations when you only need to change specific stored fields.\n7. Only change headers when the operator explicitly asks for header-focused testing.\n\nPreferred Burp-derived replay shapes:\n  { "method": "${parsed.method}", "useInitialRequestBaseline": true, "preserveExplicitAuth": true }\n  { "method": "${parsed.method}", "useInitialRequestBaseline": true, "preserveExplicitAuth": true, "queryMutations": [{ "name": "<param>", "value": "<mutated-value>" }], "bodyMutations": [{ "name": "<field>", "value": "<mutated-value>" }] }\n`,
         initialMessages: [
             {
                 role: 'user',
-                content: `CRITICAL - Request from Burp (Send to PenPard).\n\nPLANNING PHASE: Before testing, analyze this request:\n- Look at the cookies and auth tokens - note which ones are session tokens\n- Identify all parameters in the URL query string and body\n- Plan which parameters to test for which vulnerability types (SQLi, XSS, IDOR, etc.)\n\nRULES:\n1. Include ALL headers below in EVERY send_http_request call. Copy them exactly - do not omit Cookie, User-Agent, Authorization, or any other header. The user's session depends on these.\n2. Only modify PARAMETER VALUES (query string, body fields). Headers stay unchanged.\n3. If the user later says "test the Host header" or similar, only then may you modify that specific header.\n\nBASE REQUEST:\nMethod: ${parsed.method}\nURL: ${parsed.url}\nHeaders (JSON - pass this entire object in every send_http_request):\n${headersJson}\nBody: ${parsed.body || '(none)'}\n\nExample call:\n{\n  "tool": "send_http_request",\n  "args": {\n    "method": "${parsed.method}",\n    "url": "${parsed.url}",\n    "headers": ${headersJson},\n    "body": "${parsed.body || ''}",\n    "preserveExplicitAuth": true\n  }\n}\n\nStart by sending the original request as-is to get a baseline response, then begin parametric testing.`,
+                content: `CRITICAL - Request from Burp (Send to PenPard).\n\nA full baseline request is stored server-side and has been summarized safely below:\n${promptSummary}\n\nPlanning rules:\n1. Start with a baseline replay of the stored request using useInitialRequestBaseline=true and preserveExplicitAuth=true.\n2. Do NOT reconstruct or quote raw cookies, bearer tokens, CSRF values, or other secret header values.\n3. Modify parameter values, not unrelated internal state.\n4. Do NOT copy literal <preserved> placeholders into tool calls. Use queryMutations or bodyMutations while keeping useInitialRequestBaseline=true.\n5. If you need to change only stored JSON or form body fields, use bodyMutations so PenPard preserves the rest of the baseline body server-side.\n6. If the operator later asks to test a specific header, send only that explicit override instead of serializing the entire stored header set.\n\nExample calls:\n{\n  "tool": "send_http_request",\n  "args": {\n    "method": "${parsed.method}",\n    "useInitialRequestBaseline": true,\n    "preserveExplicitAuth": true\n  }\n}\n\n{\n  "tool": "send_http_request",\n  "args": {\n    "method": "${parsed.method}",\n    "useInitialRequestBaseline": true,\n    "preserveExplicitAuth": true,\n    "queryMutations": [{ "name": "<param>", "value": "<mutated-value>" }],\n    "bodyMutations": [{ "name": "<field>", "value": "<mutated-value>" }]\n  }\n}\n\nStart with the baseline replay, then continue with targeted parametric testing.`,
             },
             {
                 role: 'assistant',
-                content: `Understood. I will:\n1. Include ALL ${headerCount} headers in every request (Cookie, User-Agent, auth tokens, etc.)\n2. Set preserveExplicitAuth=true when replaying the Burp-derived request so PenPard preserves the supplied auth exactly\n3. Only modify parameter values for testing - headers stay exactly as provided\n4. Start with a baseline request, then test each parameter for vulnerabilities\n\nLet me begin by analyzing the request and planning my tests.`,
+                content: `Understood. I will:\n1. Replay the stored Burp request via PenPard with useInitialRequestBaseline=true and preserveExplicitAuth=true so raw auth material stays on the backend\n2. Use the sanitized request summary to choose target parameters without serializing secret headers or body values\n3. Prefer queryMutations and bodyMutations over reconstructing the entire stored request\n4. Start with a baseline replay, then test each relevant parameter for vulnerabilities\n\nLet me begin by analyzing the request summary and planning my tests.`,
             },
         ],
         continuationMessages: [
             {
                 role: 'user',
-                content: `REMINDER - The original request from Burp (Send to PenPard) is still active. You MUST include ALL these headers in every send_http_request and set preserveExplicitAuth=true.\n\nMethod: ${parsed.method}\nURL: ${parsed.url}\nHeaders (JSON - pass this entire object):\n${headersJson}\nBody: ${parsed.body || '(none)'}\n\nDo NOT send requests without these headers. The user's session cookies and auth tokens are required.`,
+                content: `REMINDER - The Burp-originated request is still stored server-side. Continue using useInitialRequestBaseline=true with preserveExplicitAuth=true for Burp-derived replay.\n\nSanitized request summary:\n${promptSummary}\n\nDo NOT reconstruct raw cookies, bearer tokens, or other secret header values in the conversation. Send only the URL/body/header changes you intentionally want PenPard to apply.`,
             },
             {
                 role: 'assistant',
-                content: `Understood. I will continue including all ${headerCount} headers (Cookie, auth tokens, User-Agent, etc.) in every request and I will set preserveExplicitAuth=true so PenPard does not replace them.`,
+                content: `Understood. I will continue replaying the stored Burp baseline through PenPard with useInitialRequestBaseline=true and preserveExplicitAuth=true, and I will avoid serializing raw auth material into the conversation.`,
             },
         ],
-        logSummary: `Burp request parsed - ${parsed.method} ${parsed.url.substring(0, 80)} - ${headerCount} headers preserved`,
+        logSummary,
     };
 }

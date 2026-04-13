@@ -134,7 +134,10 @@ export class GitHubIntegrationStore {
         if (legacyConfig && !copilotConfig) {
             db.prepare(`
                 UPDATE llm_config
-                SET provider = ?, updated_at = CURRENT_TIMESTAMP
+                SET provider = ?,
+                    api_key = '',
+                    settings_json = '{}',
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE provider = ?
             `).run(GITHUB_COPILOT_PROVIDER, LEGACY_GITHUB_MODELS_PROVIDER);
 
@@ -148,14 +151,6 @@ export class GitHubIntegrationStore {
                     SET model = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE provider = ?
                 `).run(legacyConfig.model, GITHUB_COPILOT_PROVIDER);
-            }
-
-            if ((copilotConfig.settings_json === '{}' || !copilotConfig.settings_json) && legacyConfig.settings_json) {
-                db.prepare(`
-                    UPDATE llm_config
-                    SET settings_json = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE provider = ?
-                `).run(legacyConfig.settings_json, GITHUB_COPILOT_PROVIDER);
             }
 
             db.prepare('DELETE FROM llm_config WHERE provider = ?').run(LEGACY_GITHUB_MODELS_PROVIDER);

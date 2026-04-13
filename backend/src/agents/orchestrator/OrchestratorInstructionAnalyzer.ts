@@ -1,4 +1,4 @@
-import { llmQueue } from '../../services/LLMQueue';
+import { llmRuntime } from '../../services/llm/LlmRuntime';
 import {
     buildInstructionAnalysisUserPrompt,
     INSTRUCTION_ANALYSIS_SYSTEM_PROMPT,
@@ -14,13 +14,18 @@ export class OrchestratorInstructionAnalyzer {
         private readonly log?: LogFn,
     ) {}
 
-    public async analyze(instructions: string, targetUrl: string): Promise<InstructionAnalysis | null> {
-        this.log?.('system', '🔍 Analyzing operator instructions with LLM...');
+    public async analyze(instructions: string, targetUrl: string, scanId: string, userId?: number): Promise<InstructionAnalysis | null> {
+        this.log?.('system', 'Analyzing operator instructions with LLM...');
 
         try {
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: INSTRUCTION_ANALYSIS_SYSTEM_PROMPT,
                 userPrompt: buildInstructionAnalysisUserPrompt(instructions, targetUrl),
+            }, {
+                scanId,
+                userId,
+                callSite: 'instruction_analysis',
+                context: 'orchestrator-instruction-analysis',
             });
 
             const parsed = this.parser.extractJsonObject(response.text);
