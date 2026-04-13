@@ -28,7 +28,7 @@ interface Scan {
     id: string;
     type: 'web' | 'mobile';
     target: string;
-    status: 'queued' | 'running' | 'completed' | 'failed';
+    status: 'queued' | 'running' | 'completed' | 'stopped' | 'failed' | 'interrupted' | 'paused' | string;
     created_at: string;
     completed_at: string | null;
     vulnerabilities?: any[];
@@ -71,7 +71,7 @@ export default function ReportsPage() {
 
     const filteredScans = scans.filter(s => {
         if (filter === 'all') return true;
-        if (filter === 'completed') return s.status === 'completed';
+        if (filter === 'completed') return s.status === 'completed' || s.status === 'stopped';
         if (filter === 'running') return s.status === 'running' || s.status === 'queued';
         return true;
     });
@@ -112,6 +112,7 @@ export default function ReportsPage() {
     const getStatusIcon = (status: string) => {
         switch (status) {
             case 'completed': return <CheckCircle className="w-4 h-4 text-green-400" />;
+            case 'stopped': return <Clock className="w-4 h-4 text-cyan-400" />;
             case 'running': return <Clock className="w-4 h-4 text-yellow-400 animate-spin" />;
             case 'failed': return <AlertTriangle className="w-4 h-4 text-red-400" />;
             default: return <Clock className="w-4 h-4 text-slate-400" />;
@@ -121,6 +122,7 @@ export default function ReportsPage() {
     const getStatusColor = (status: string) => {
         switch (status) {
             case 'completed': return 'text-green-400 bg-green-500/10 border-green-500/30';
+            case 'stopped': return 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30';
             case 'running': return 'text-yellow-400 bg-yellow-500/10 border-yellow-500/30';
             case 'failed': return 'text-red-400 bg-red-500/10 border-red-500/30';
             default: return 'text-slate-400 bg-slate-500/10 border-slate-500/30';
@@ -240,7 +242,7 @@ export default function ReportsPage() {
                                         >
                                             <ExternalLink className="w-4 h-4" />
                                         </a>
-                                        {scan.status === 'completed' && (
+                                        {(scan.status === 'completed' || scan.status === 'stopped') && (
                                             <button
                                                 onClick={() => openReportOptions(scan.id)}
                                                 className="p-2 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 transition-colors"

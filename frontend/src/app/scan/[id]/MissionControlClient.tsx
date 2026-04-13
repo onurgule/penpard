@@ -677,7 +677,7 @@ User Question: ${userQuestion}`;
                                 <Play className="w-3.5 h-3.5" /> Resume
                             </button>
                         )}
-                        {status === 'completed' && (
+                        {(status === 'completed' || status === 'stopped') && (
                             <button
                                 onClick={() => setReportModalOpen(true)}
                                 className="btn-primary flex items-center gap-2 text-xs"
@@ -688,7 +688,9 @@ User Question: ${userQuestion}`;
                         <div className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
                             isPaused ? 'bg-amber-500/20 text-amber-400' :
                             status === 'scanning' || status === 'crawling' || status === 'testing' ? 'bg-cyan-500/20 text-cyan-400 animate-pulse' :
-                            status === 'completed' ? 'bg-green-500/20 text-green-400' : 'bg-slate-800 text-slate-400'
+                            status === 'completed' ? 'bg-green-500/20 text-green-400' :
+                            status === 'stopped' ? 'bg-cyan-500/20 text-cyan-400' :
+                            'bg-slate-800 text-slate-400'
                             }`}>
                             {isPaused ? 'paused' : status}
                         </div>

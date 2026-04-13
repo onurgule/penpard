@@ -1,22 +1,14 @@
-import { Router, Response } from 'express';
-import path from 'path';
 import fs from 'fs';
-import { db, getScan, getVulnerabilitiesByScan, getSourceAnalysisResult } from '../db/init';
+import { Router, Response } from 'express';
+import { getScan } from '../db/init';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
-import { logger } from '../utils/logger';
-import { generatePdfReport } from '../services/report';
-import { generateDocxReport } from '../services/report-docx';
-import { generatePptxReport } from '../services/report-pptx';
-import { enhanceVulnerabilityDescriptions, generateExecutiveSummary, enhanceRemediations } from '../services/report-llm';
 import { llmProvider } from '../services/LLMProviderService';
+import { reportExportService } from '../services/reporting/ReportExportService';
+import { reportExportFormatValues, reportEnrichmentModeValues, type ReportExportRecord } from '../services/reporting/types';
+import { logger } from '../utils/logger';
 
 const router = Router();
 
-/**
- * Check if the active LLM supports vision.
- * Used by the frontend to show/hide the image processing toggle.
- * IMPORTANT: This must be defined BEFORE /:scanId routes to avoid Express matching "capabilities" as a scanId.
- */
 router.get('/capabilities/check', authenticateToken, async (_req: AuthRequest, res: Response) => {
     try {
         const visionCheck = llmProvider.checkVisionSupport();
@@ -24,7 +16,9 @@ router.get('/capabilities/check', authenticateToken, async (_req: AuthRequest, r
         try {
             llmProvider.getActiveConfig();
             llmAvailable = true;
-        } catch { /* no active LLM */ }
+        } catch {
+            llmAvailable = false;
+        }
 
         res.json({
             llmAvailable,
@@ -32,183 +26,194 @@ router.get('/capabilities/check', authenticateToken, async (_req: AuthRequest, r
             provider: visionCheck.provider,
             model: visionCheck.model,
         });
-    } catch (error: any) {
+    } catch {
         res.json({ llmAvailable: false, visionSupported: false, provider: 'none', model: 'none' });
     }
 });
 
-// Get report for a scan
-router.get('/:scanId', authenticateToken, async (req: AuthRequest, res: Response) => {
+router.get('/:scanId', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
-        const { scanId } = req.params;
-        const user = req.user!;
+        const scan = getOwnedScanOrRespond(req.params.scanId, req.user!, res);
+        if (!scan) return;
 
-        const scan = getScan(scanId);
+        const exportEligible = ['completed', 'stopped'].includes(scan.status);
+        res.json({
+            scanId: scan.id,
+            scanStatus: scan.status,
+            exportEligible,
+            eligibilityReason: exportEligible
+                ? null
+                : `Scan status "${scan.status}" is not exportable. Only completed or stopped scans can be exported.`,
+            supportedFormats: reportExportFormatValues,
+            supportedEnrichmentModes: reportEnrichmentModeValues,
+            exports: reportExportService.listExports(scan.id).map(toApiExportJob),
+        });
+    } catch (error: any) {
+        logger.error('Get report metadata error', { error: error.message });
+        res.status(500).json({ error: true, message: 'Failed to get report metadata' });
+    }
+});
 
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
-            return;
-        }
+router.post('/:scanId/exports', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const scan = getOwnedScanOrRespond(req.params.scanId, req.user!, res);
+        if (!scan) return;
 
-        // Check access
-        if (scan.user_id !== user.id && user.role === 'user') {
-            res.status(403).json({ error: true, message: 'Access denied' });
-            return;
-        }
-
-        // Check if report exists
-        const report = db.prepare('SELECT * FROM reports WHERE scan_id = ?').get(scanId) as any;
-
-        if (report && fs.existsSync(report.file_path)) {
-            res.json({
-                scanId,
-                reportUrl: `/api/reports/${scanId}/download`,
-                createdAt: report.created_at,
+        if (!['completed', 'stopped'].includes(scan.status)) {
+            res.status(400).json({
+                error: true,
+                message: `Scan status "${scan.status}" is not exportable. Only completed or stopped scans can be exported.`,
             });
             return;
         }
 
-        // Generate report if scan is complete
-        if (scan.status !== 'completed') {
-            res.status(400).json({ error: true, message: 'Scan not yet completed' });
+        const format = String(req.body?.format || '').toLowerCase();
+        const enrichmentMode = String(req.body?.enrichmentMode || 'deterministic').toLowerCase();
+
+        if (!reportExportFormatValues.includes(format as any)) {
+            res.status(400).json({ error: true, message: `Invalid export format "${format}"` });
+            return;
+        }
+        if (!reportEnrichmentModeValues.includes(enrichmentMode as any)) {
+            res.status(400).json({ error: true, message: `Invalid enrichment mode "${enrichmentMode}"` });
             return;
         }
 
-        const vulnerabilities = getVulnerabilitiesByScan(scanId);
-        const sourceAnalysis = getSourceAnalysisResult(scanId);
-        const reportPath = await generatePdfReport(scan, vulnerabilities, sourceAnalysis);
+        const job = await reportExportService.createOrReuseExport(
+            scan.id,
+            format as any,
+            enrichmentMode as any,
+        );
 
-        // Save report record
-        db.prepare(`
-      INSERT OR REPLACE INTO reports (scan_id, file_path)
-      VALUES (?, ?)
-    `).run(scanId, reportPath);
+        res.status(202).json({ export: toApiExportJob(job) });
+    } catch (error: any) {
+        logger.error('Create report export error', { error: error.message });
+        res.status(500).json({ error: true, message: error.message || 'Failed to create report export' });
+    }
+});
+
+router.get('/:scanId/exports', authenticateToken, (req: AuthRequest, res: Response) => {
+    try {
+        const scan = getOwnedScanOrRespond(req.params.scanId, req.user!, res);
+        if (!scan) return;
 
         res.json({
-            scanId,
-            reportUrl: `/api/reports/${scanId}/download`,
-            createdAt: new Date().toISOString(),
+            exports: reportExportService.listExports(scan.id).map(toApiExportJob),
         });
     } catch (error: any) {
-        logger.error('Get report error', { error: error.message });
-        res.status(500).json({ error: true, message: 'Failed to get report' });
+        logger.error('List report exports error', { error: error.message });
+        res.status(500).json({ error: true, message: 'Failed to list report exports' });
     }
 });
 
-/**
- * Download report in the requested format with options.
- * 
- * Query params:
- *   format: 'pdf' | 'docx' | 'pptx'  (default: 'pdf')
- *   mode: 'static' | 'llm'           (default: 'static')
- *   imageProcessing: 'true' | 'false' (default: 'false', only applies to 'llm' mode PDF)
- */
-router.get('/:scanId/download', authenticateToken, async (req: AuthRequest, res: Response) => {
+router.get('/:scanId/exports/:jobId', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
-        const { scanId } = req.params;
-        const format = (req.query.format as string || 'pdf').toLowerCase();
-        const mode = (req.query.mode as string || 'static').toLowerCase();
-        const imageProcessing = req.query.imageProcessing === 'true';
-        const user = req.user!;
+        const scan = getOwnedScanOrRespond(req.params.scanId, req.user!, res);
+        if (!scan) return;
 
-        const scan = getScan(scanId);
-
-        if (!scan) {
-            res.status(404).json({ error: true, message: 'Scan not found' });
+        const job = reportExportService.getExport(req.params.jobId);
+        if (!job || job.scan_id !== scan.id) {
+            res.status(404).json({ error: true, message: 'Report export not found' });
             return;
         }
 
-        if (scan.user_id !== user.id && user.role === 'user') {
-            res.status(403).json({ error: true, message: 'Access denied' });
-            return;
-        }
-
-        if (scan.status !== 'completed' && scan.status !== 'stopped') {
-            res.status(400).json({ error: true, message: 'Scan not yet completed. Please wait for the scan to finish.' });
-            return;
-        }
-
-        const vulnerabilities = getVulnerabilitiesByScan(scanId);
-        const sourceAnalysis = getSourceAnalysisResult(scanId);
-
-        // ── LLM Enhancement (if mode === 'llm') ──
-        let enhancedDescriptions: Map<number, string> | undefined;
-        let enhancedRemediations: Map<number, string> | undefined;
-
-        if (mode === 'llm') {
-            try {
-                logger.info('Running LLM-driven report enhancement...', { scanId });
-
-                // Run description and remediation enhancement in parallel
-                const [descResult, remResult] = await Promise.all([
-                    enhanceVulnerabilityDescriptions(vulnerabilities).catch(() => new Map<number, string>()),
-                    enhanceRemediations(vulnerabilities).catch(() => new Map<number, string>()),
-                ]);
-
-                enhancedDescriptions = descResult;
-                enhancedRemediations = remResult;
-
-                logger.info(`LLM enhancement complete: ${enhancedDescriptions.size} descriptions, ${enhancedRemediations.size} remediations enhanced`);
-            } catch (err: any) {
-                logger.warn('LLM enhancement failed, using static content', { error: err.message });
-            }
-        }
-
-        // ── Generate Report in Requested Format ──
-        let reportPath: string;
-        let filename: string;
-        let contentType: string;
-
-        switch (format) {
-            case 'docx':
-                reportPath = await generateDocxReport(scan, vulnerabilities, {
-                    llmEnhanced: mode === 'llm',
-                    enhancedDescriptions,
-                    sourceAnalysis,
-                });
-                filename = `PenPard-Report-${scanId}.docx`;
-                contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-                break;
-
-            case 'pptx':
-                reportPath = await generatePptxReport(scan, vulnerabilities, {
-                    llmEnhanced: mode === 'llm',
-                    enhancedDescriptions,
-                    sourceAnalysis,
-                });
-                filename = `PenPard-Report-${scanId}.pptx`;
-                contentType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
-                break;
-
-            case 'pdf':
-            default:
-                // For static PDF, check if we have a cached version
-                if (mode === 'static' && !imageProcessing) {
-                    const existing = db.prepare('SELECT * FROM reports WHERE scan_id = ?').get(scanId) as any;
-                    if (existing && fs.existsSync(existing.file_path)) {
-                        res.download(existing.file_path, `PenPard-Report-${scanId}.pdf`);
-                        return;
-                    }
-                }
-
-                reportPath = await generatePdfReport(scan, vulnerabilities, sourceAnalysis);
-                filename = `PenPard-Report-${scanId}.pdf`;
-                contentType = 'application/pdf';
-
-                // Cache the static PDF
-                db.prepare(`INSERT OR REPLACE INTO reports (scan_id, file_path) VALUES (?, ?)`).run(scanId, reportPath);
-                break;
-        }
-
-        // Set proper headers and download
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        res.download(reportPath, filename);
-
+        res.json({ export: toApiExportJob(job) });
     } catch (error: any) {
-        logger.error('Download report error', { error: error.message });
-        res.status(500).json({ error: true, message: 'Failed to generate report. ' + (error.message || '') });
+        logger.error('Get report export error', { error: error.message });
+        res.status(500).json({ error: true, message: 'Failed to get report export' });
     }
 });
+
+router.post('/:scanId/exports/:jobId/retry', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const scan = getOwnedScanOrRespond(req.params.scanId, req.user!, res);
+        if (!scan) return;
+
+        const job = await reportExportService.retryExport(scan.id, req.params.jobId);
+        res.status(202).json({ export: toApiExportJob(job) });
+    } catch (error: any) {
+        const status = /not found/i.test(error.message) ? 404 : 400;
+        res.status(status).json({ error: true, message: error.message || 'Failed to retry export' });
+    }
+});
+
+router.post('/:scanId/exports/:jobId/cancel', authenticateToken, (req: AuthRequest, res: Response) => {
+    try {
+        const scan = getOwnedScanOrRespond(req.params.scanId, req.user!, res);
+        if (!scan) return;
+
+        const job = reportExportService.cancelExport(scan.id, req.params.jobId);
+        res.json({ export: toApiExportJob(job) });
+    } catch (error: any) {
+        const status = /not found/i.test(error.message) ? 404 : 400;
+        res.status(status).json({ error: true, message: error.message || 'Failed to cancel export' });
+    }
+});
+
+router.get('/:scanId/exports/:jobId/download', authenticateToken, (req: AuthRequest, res: Response) => {
+    try {
+        const scan = getOwnedScanOrRespond(req.params.scanId, req.user!, res);
+        if (!scan) return;
+
+        const job = reportExportService.getExport(req.params.jobId);
+        if (!job || job.scan_id !== scan.id) {
+            res.status(404).json({ error: true, message: 'Report export not found' });
+            return;
+        }
+        if (job.status !== 'completed' || job.stage !== 'completed' || !job.artifact_path || !fs.existsSync(job.artifact_path)) {
+            res.status(409).json({ error: true, message: 'Export artifact is not ready for download yet.' });
+            return;
+        }
+
+        const filename = `PenPard-Report-${scan.id}.${job.format}`;
+        res.download(job.artifact_path, filename);
+    } catch (error: any) {
+        logger.error('Download report export error', { error: error.message });
+        res.status(500).json({ error: true, message: 'Failed to download export' });
+    }
+});
+
+function getOwnedScanOrRespond(scanId: string, user: NonNullable<AuthRequest['user']>, res: Response): any | null {
+    const scan = getScan(scanId);
+    if (!scan) {
+        res.status(404).json({ error: true, message: 'Scan not found' });
+        return null;
+    }
+
+    if (scan.user_id !== user.id && user.role === 'user') {
+        res.status(403).json({ error: true, message: 'Access denied' });
+        return null;
+    }
+
+    return scan;
+}
+
+function toApiExportJob(job: ReportExportRecord) {
+    const stageLabel = job.stage === 'rendering_export'
+        ? `Rendering ${job.format.toUpperCase()}`
+        : job.stage;
+
+    return {
+        id: job.id,
+        scanId: job.scan_id,
+        snapshotId: job.snapshot_id,
+        format: job.format,
+        enrichmentMode: job.enrichment_mode,
+        status: job.status,
+        stage: job.stage,
+        stageLabel,
+        llmStatus: job.llm_status,
+        artifactReady: job.status === 'completed' && job.stage === 'completed' && !!job.artifact_path && fs.existsSync(job.artifact_path),
+        errorMessage: job.error_message,
+        llmErrorMessage: job.llm_error_message,
+        attemptCount: job.attempt_count,
+        createdAt: job.created_at,
+        updatedAt: job.updated_at,
+        startedAt: job.started_at,
+        completedAt: job.completed_at,
+        canceledAt: job.canceled_at,
+        downloadUrl: `/api/reports/${job.scan_id}/exports/${job.id}/download`,
+    };
+}
 
 export default router;

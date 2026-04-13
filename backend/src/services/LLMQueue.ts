@@ -3,11 +3,12 @@
  * Prevents parallel agents from making simultaneous LLM requests
  */
 
-import { llmProvider, GenerationRequest, GenerationResponse } from './LLMProviderService';
+import { llmProvider, GenerationMetadata, GenerationRequest, GenerationResponse } from './LLMProviderService';
 import { logger } from '../utils/logger';
 
 interface QueuedRequest {
     request: GenerationRequest;
+    metadata?: GenerationMetadata;
     resolve: (value: GenerationResponse) => void;
     reject: (error: any) => void;
     timestamp: number;
@@ -21,10 +22,11 @@ class LLMQueue {
     private activeRequests: number = 0;
     private readonly timeout: number = 30000; // 30 second timeout
 
-    async enqueue(request: GenerationRequest): Promise<GenerationResponse> {
+    async enqueue(request: GenerationRequest, metadata: GenerationMetadata = {}): Promise<GenerationResponse> {
         return new Promise((resolve, reject) => {
             this.queue.push({
                 request,
+                metadata,
                 resolve,
                 reject,
                 timestamp: Date.now()
@@ -81,7 +83,7 @@ class LLMQueue {
 
         try {
             const response = await Promise.race([
-                llmProvider.generate(item.request),
+                llmProvider.generate(item.request, item.metadata?.context, item.metadata),
                 timeoutPromise
             ]);
             
@@ -107,7 +109,7 @@ class LLMQueue {
                     });
                     
                     const retryResponse = await Promise.race([
-                        llmProvider.generate(item.request),
+                        llmProvider.generate(item.request, item.metadata?.context, item.metadata),
                         retryTimeoutPromise
                     ]);
                     

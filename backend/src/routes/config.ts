@@ -2,6 +2,7 @@
 import { Router, Response } from 'express';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
 import { llmProvider, LLMConfig } from '../services/LLMProviderService';
+import { githubIntegration } from '../services/GitHubIntegrationService';
 import { mcpManager, McpServerConfig } from '../services/McpManagerService';
 import { logger } from '../utils/logger';
 
@@ -12,9 +13,11 @@ const router = Router();
  */
 
 // Get all LLM configs
-router.get('/llm', authenticateToken, (req: AuthRequest, res: Response) => {
+router.get('/llm', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
-        const configs = llmProvider.getAllConfigs();
+        const userId = req.user?.id || 1;
+        await githubIntegration.getResolvedConnectionStatus(userId);
+        const configs = llmProvider.getAllConfigs(userId);
         res.json({ configs });
     } catch (error: any) {
         logger.error('Failed to get LLM configs', { error: error.message });
@@ -26,11 +29,12 @@ router.get('/llm', authenticateToken, (req: AuthRequest, res: Response) => {
 router.post('/llm', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
         const config: LLMConfig = req.body;
-        llmProvider.updateConfig(config);
+        llmProvider.updateConfig(config, req.user?.id || 1);
         res.json({ message: 'Configuration saved' });
     } catch (error: any) {
         logger.error('Failed to save LLM config', { error: error.message });
-        res.status(500).json({ error: true, message: 'Failed to save settings' });
+        const statusCode = error?.message?.includes('GitHub is not connected') ? 400 : 500;
+        res.status(statusCode).json({ error: true, message: error.message || 'Failed to save settings' });
     }
 });
 
@@ -44,7 +48,7 @@ router.post('/llm/test', authenticateToken, async (req: AuthRequest, res: Respon
             return;
         }
 
-        const result = await llmProvider.checkConnection(provider);
+        const result = await llmProvider.checkConnection(provider, req.user?.id || 1);
 
         if (result.success) {
             res.json({ message: 'Connection successful', status: 'online' });

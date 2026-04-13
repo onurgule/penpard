@@ -308,6 +308,7 @@ export class AnalyticsService {
         this.flushInterval = setInterval(() => {
             this.flushEvents();
         }, 30000);
+        this.flushInterval.unref?.();
     }
 
     /**

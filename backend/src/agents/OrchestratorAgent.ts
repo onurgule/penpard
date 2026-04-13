@@ -32,6 +32,7 @@ import {
     buildOperatorInstructionMessages,
 } from '../prompts/orchestratorPrompts';
 import { createBurpToolHandlers, BurpToolClient } from './orchestrator/OrchestratorBurpToolHandlers';
+import { OrchestratorContinuationCoordinator, ContinuationPrepareResult } from './orchestrator/OrchestratorContinuationCoordinator';
 import { OrchestratorBrowserSession } from './orchestrator/OrchestratorBrowserSession';
 import { OrchestratorBrowserTools } from './orchestrator/OrchestratorBrowserTools';
 import { OrchestratorContextSignals } from './orchestrator/OrchestratorContextSignals';
@@ -40,7 +41,6 @@ import { OrchestratorFallbackPlanner } from './orchestrator/OrchestratorFallback
 import { OrchestratorFindingTracker } from './orchestrator/OrchestratorFindingTracker';
 import { OrchestratorInstructionAnalyzer } from './orchestrator/OrchestratorInstructionAnalyzer';
 import { OrchestratorLogLedger } from './orchestrator/OrchestratorLogLedger';
-import { OrchestratorLogSink } from './orchestrator/OrchestratorLogSink';
 import { OrchestratorLlmResponseParser } from './orchestrator/OrchestratorLlmResponseParser';
 import { OrchestratorPlanner } from './orchestrator/OrchestratorPlanner';
 import { OrchestratorRequestExecutor } from './orchestrator/OrchestratorRequestExecutor';
@@ -401,7 +401,8 @@ export class OrchestratorAgent {
     private readonly domainCoordinator: OrchestratorDomainCoordinator;
     private readonly persistence: OrchestratorPersistenceSeam;
     private readonly systemPromptBuilder: OrchestratorSystemPromptBuilder;
-    private readonly logSink: OrchestratorLogSink;
+    private readonly continuationCoordinator: OrchestratorContinuationCoordinator;
+    private lastContinuationResult: ContinuationPrepareResult | null = null;
 
     private readonly RATE_LIMIT_PAUSE_MS = 1 * 60 * 1000;
 
@@ -423,8 +424,7 @@ export class OrchestratorAgent {
         const maxPlanRounds = requested > 0 ? requested : 0;
         this.state = new OrchestratorScanState({ maxIterations, maxPlanRounds });
 
-        this.logLedger = new OrchestratorLogLedger();
-        this.logSink = new OrchestratorLogSink({ scanId });
+        this.logLedger = new OrchestratorLogLedger({ scanId });
         this.persistence = new OrchestratorPersistenceSeam();
         this.systemPromptBuilder = new OrchestratorSystemPromptBuilder(this.persistence);
         this.initialRequestContext = config.initialRequest?.trim()
@@ -567,13 +567,39 @@ export class OrchestratorAgent {
             handlers: this.toolRegistry.getHandlers(),
         });
 
+        // ── Build the continuation coordinator ──
+        this.continuationCoordinator = new OrchestratorContinuationCoordinator({
+            targetUrl,
+            burp,
+            llm: { hasActiveConfig: () => { try { return !!llmProvider.getAllConfigs().find(c => c.is_active); } catch { return false; } } },
+            state: this.state,
+            scanSurface: this.scanSurface,
+            scanStatus: this.scanStatus,
+            lifecycle: {
+                persistRuntimeCheckpoint: (reason: string) =>
+                    this.persistRuntimeCheckpoint(reason),
+            },
+            initialRequestContext: this.initialRequestContext,
+            systemPromptBuilder: this.systemPromptBuilder,
+            buildAccountPromptContext: () => this.buildAccountPromptContext(),
+            buildContinuationScopeMessage: (analysis) => buildContinuationScopeMessage(analysis),
+            analyzeOperatorInstructions: async (instruction: string) => {
+                await this.analyzeOperatorInstructions(instruction);
+                return {
+                    analysis: this.instructionAnalysis,
+                    isFocusedScope: this.isFocusedScope,
+                };
+            },
+            log: (channel, message) => this.log(channel as any, message),
+        });
+
         // ── Build the harness agent contract ──
         const agentContract: HarnessAgentContract<ContinueScanOptions> = {
             beforeRun: (kind) => this.prepareRun(kind),
             finalizeRun: () => this.finalizeRun(),
             handleFailure: (kind, error) => this.handleRunFailure(kind, error),
             runInit: () => this.phaseInit(),
-            prepareContinuation: (opts) => this.prepareContinuation(opts),
+            prepareContinuation: (opts) => this.prepareContinuationViaCoordinator(opts),
             createPlan: () => this.createPlanForHarness(),
             executeStep: (step, stepToolResults, totalActions) => this.executeStepForHarness(step, stepToolResults, totalActions),
             shouldContinueTesting: (roundResults) => this.shouldContinueTesting(roundResults),
@@ -818,88 +844,25 @@ export class OrchestratorAgent {
     }
 
     /**
-     * Prepare the agent state for a continuation run.
+     * Prepare the agent state for a continuation run via the ContinuationCoordinator.
+     *
+     * IMPORTANT: This is NOT a resume. Continuation creates a new runtime seeded
+     * from persisted state (findings + endpoints). See OrchestratorContinuationCoordinator
+     * for the full continuation truth contract.
+     *
      * Called by the harness before the continuation loop begins.
      */
-    private async prepareContinuation(opts: ContinueScanOptions): Promise<void> {
-        const extraRounds = Math.min(Math.max(opts.iterations, 1), 20);
-
-        this.log('system', `═══ CONTINUING SCAN ═══`);
-        this.log('system', `Instruction: ${opts.instruction}`);
-        this.log('system', `Additional rounds: ${extraRounds}, Planning: ${opts.planningEnabled ? 'ON' : 'OFF'}`);
-        this.scanStatus.testing();
-
-        if (opts.existingFindings) {
-            this.state.setFindings(opts.existingFindings);
-            this.log('system', `Restored ${this.state.findingsCount} existing findings`);
-        }
-        if (opts.existingEndpoints) {
-            const restored = this.scanSurface.restoreDiscoveredEndpoints(opts.existingEndpoints);
-            this.log('system', `Restored ${restored} discovered endpoints`);
-        }
-
-        const burpOk = await this.burp.isAvailable();
-        if (!burpOk) {
-            this.log('error', 'Burp MCP not available! Attempting to continue anyway...');
-        } else {
-            this.log('system', '✓ Burp MCP: Connected');
-        }
-
-        const llmOk = await this.checkLLM();
-        if (!llmOk) {
-            throw new Error('No active LLM configured.');
-        }
-        this.log('system', '✓ LLM: Connected');
-
-        if (this.state.conversationHistory.length === 0) {
-            const systemPrompt = await this.systemPromptBuilder.build({
-                targetUrl: this.targetUrl,
-                accounts: this.buildAccountPromptContext(),
-                initialRequestAppendix: this.initialRequestContext?.systemPromptAppendix,
-            });
-
-            this.state.setSystemPromptContent(systemPrompt);
-            this.state.pushMessage({ role: 'system', content: systemPrompt });
-        }
-
-        if (this.initialRequestContext) {
-            this.state.pushMessages(this.initialRequestContext.continuationMessages);
-            this.log('system', `✓ ${this.initialRequestContext.logSummary}`);
-        }
-
-        const findingsSummary = this.state.findingsCount > 0
-            ? this.state.findings.map((finding: any) => `- [${finding.severity?.toUpperCase()}] ${finding.name}`).join('\n')
-            : 'No findings yet.';
-
-        this.state.pushMessage({
-            role: 'user',
-            content: `⚠️ [OPERATOR COMMAND — SCAN CONTINUATION] The operator has resumed this completed scan with new instructions:
-
-INSTRUCTION: ${opts.instruction}
-
-PREVIOUS FINDINGS (${this.state.findingsCount} total):
-${findingsSummary}
-
-DISCOVERED ENDPOINTS:
-${this.scanSurface.getDiscoveredEndpoints().join('\n') || 'None recorded'}
-
-You have ${extraRounds} planning round(s) to execute this instruction. ${opts.planningEnabled ? 'Use the PLAN → EXECUTE → REPLAN cycle.' : 'Skip planning — execute the instruction directly with tool calls.'} Be thorough within the given rounds.`,
+    private async prepareContinuationViaCoordinator(opts: ContinueScanOptions): Promise<void> {
+        const result = await this.continuationCoordinator.prepare({
+            instruction: opts.instruction,
+            iterations: opts.iterations,
+            planningEnabled: opts.planningEnabled,
+            existingFindings: opts.existingFindings,
+            existingEndpoints: opts.existingEndpoints,
         });
 
-        await this.analyzeOperatorInstructions(opts.instruction);
-
-        if (this.instructionAnalysis?.is_focused) {
-            this.isFocusedScope = true;
-            this.state.pushMessage(buildContinuationScopeMessage(this.instructionAnalysis));
-        }
-
-        // Swap budget for continuation scope
-        const restoreBudget = this.state.swapContinuationBudget(extraRounds);
-        await this.persistRuntimeCheckpoint('continuation-prepared');
-
-        // Store the restorer and resolved max rounds on the opts so the run method can use them
-        (opts as any)._restoreBudget = restoreBudget;
-        (opts as any)._resolvedMaxRounds = extraRounds;
+        // Store the result so the harness can access continuation-specific decisions
+        this.lastContinuationResult = result;
     }
 
     /**
@@ -1456,8 +1419,7 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
         await new Promise(r => setTimeout(r, ms));
     }
     private log(type: string, message: string) {
-        const entry = this.logLedger.append(type, message);
-        this.logSink.record(entry, this.logLedger);
+        this.logLedger.append(type, message);
     }
 
     /**
@@ -1466,16 +1428,16 @@ You have ${extraRounds} planning round(s) to execute this instruction. ${opts.pl
      * Returns the number of logs flushed.
      */
     public flushLogsToDB(): number {
-        return this.logSink.flushToDB(this.logLedger);
+        return this.logLedger.flushToDB();
     }
 
     /** Number of logs that have NOT yet been persisted to the database. */
     public get unflushedLogCount(): number {
-        return this.logSink.getUnflushedCount(this.logLedger);
+        return this.logLedger.unflushedCount;
     }
 
     private saveLogs() {
-        this.logSink.persistToFile(this.logLedger, path.join(__dirname, '../../logs', `${this.scanId}.log`));
+        this.logLedger.persistToFile(path.join(__dirname, '../../logs', `${this.scanId}.log`));
     }
 
     /**
