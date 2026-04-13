@@ -9,12 +9,13 @@ import { logger } from '../utils/logger';
 
 const router = Router();
 
-router.get('/capabilities/check', authenticateToken, async (_req: AuthRequest, res: Response) => {
+router.get('/capabilities/check', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
-        const visionCheck = llmProvider.checkVisionSupport();
+        const userId = req.user?.id || 1;
+        const visionCheck = llmProvider.checkVisionSupport(userId);
         let llmAvailable = false;
         try {
-            llmProvider.getActiveConfig();
+            llmProvider.getActiveConfig(userId);
             llmAvailable = true;
         } catch {
             llmAvailable = false;
@@ -69,6 +70,7 @@ router.post('/:scanId/exports', authenticateToken, async (req: AuthRequest, res:
 
         const format = String(req.body?.format || '').toLowerCase();
         const enrichmentMode = String(req.body?.enrichmentMode || 'deterministic').toLowerCase();
+        const forceRegenerate = req.body?.forceRegenerate === true;
 
         if (!reportExportFormatValues.includes(format as any)) {
             res.status(400).json({ error: true, message: `Invalid export format "${format}"` });
@@ -83,6 +85,7 @@ router.post('/:scanId/exports', authenticateToken, async (req: AuthRequest, res:
             scan.id,
             format as any,
             enrichmentMode as any,
+            { forceNew: forceRegenerate },
         );
 
         res.status(202).json({ export: toApiExportJob(job) });

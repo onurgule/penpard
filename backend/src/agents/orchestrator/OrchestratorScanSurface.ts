@@ -3,6 +3,7 @@ import { CoverageTracker } from '../../services/CoverageTracker';
 import { browserService } from '../../services/BrowserService';
 import { EndpointIntelligenceService, EndpointInventorySnapshot } from '../../services/EndpointIntelligenceService';
 import { AuthStartupConfig, AuthStartupInventory, AuthStateManager } from '../../services/auth';
+import { buildPromptIdentityLabel } from '../../services/prompt-data-minimization';
 import { WebAuthStartupService } from '../../services/WebAuthStartupService';
 import { OrchestratorBrowserSession } from './OrchestratorBrowserSession';
 
@@ -191,6 +192,7 @@ export class OrchestratorScanSurface {
                     this.options.scanId,
                     this.options.targetUrl,
                     this.options.burp as any,
+                    this.options.userId,
                     (level, message) => this.options.log?.(
                         level === 'error' ? 'error' : level === 'system' ? 'system' : 'debug',
                         message,
@@ -279,9 +281,16 @@ Rules for subsequent work:
             `- [${element.type}] ${element.tagName} text="${element.text}" selector=${element.selector || 'n/a'} href=${element.href || element.action || ''}`,
         ).join('\n') || '- none';
 
-        const credentialLines = inventory.discoveredCredentials.slice(0, 10).map((credential) =>
-            `- ${credential.identityId || 'unknown'} ${credential.label || credential.username || credential.email || 'credential'} created=${credential.created ? 'yes' : 'no'} success=${credential.success ? 'yes' : 'no'} role=${credential.role || 'unknown'} privilege=${credential.privilege || 'unknown'}`,
-        ).join('\n') || '- none';
+        const credentialLines = inventory.discoveredCredentials.slice(0, 10).map((credential) => {
+            const identityId = credential.identityId || 'unknown';
+            const promptLabel = buildPromptIdentityLabel({
+                identityId,
+                label: credential.label,
+                username: credential.username,
+                email: credential.email,
+            });
+            return `- ${identityId} ${promptLabel} created=${credential.created ? 'yes' : 'no'} success=${credential.success ? 'yes' : 'no'} role=${credential.role || 'unknown'} privilege=${credential.privilege || 'unknown'}`;
+        }).join('\n') || '- none';
 
         const blockerLines = inventory.blockers.slice(0, 8).map((blocker) => `- ${blocker}`).join('\n') || '- none';
 

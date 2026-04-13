@@ -6,7 +6,7 @@ import path from 'path';
 
 import { EndpointIntelligenceService } from '../src/services/EndpointIntelligenceService';
 import { browserService } from '../src/services/BrowserService';
-import { llmProvider } from '../src/services/LLMProviderService';
+import { llmRuntime } from '../src/services/llm/LlmRuntime';
 
 test('EndpointIntelligenceService extracts auth-relevant endpoints from loaded JS and merges Burp observations', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'penpard-endpoint-intel-'));
@@ -25,7 +25,7 @@ test('EndpointIntelligenceService extracts auth-relevant endpoints from loaded J
 
     const originalCapture = browserService.captureJavaScriptArtifacts.bind(browserService);
     const originalTraffic = browserService.getTrafficSnapshot.bind(browserService);
-    const originalGenerate = llmProvider.generate.bind(llmProvider);
+    const originalGenerate = llmRuntime.generate.bind(llmRuntime);
 
     (browserService as any).captureJavaScriptArtifacts = async () => ([
         {
@@ -54,7 +54,10 @@ test('EndpointIntelligenceService extracts auth-relevant endpoints from loaded J
             requestHeaders: {},
         },
     ]);
-    (llmProvider as any).generate = async () => ({
+    let capturedUserId: number | undefined;
+    (llmRuntime as any).generate = async (_request: any, options: any) => {
+        capturedUserId = options?.userId;
+        return {
         text: JSON.stringify({
             records: [
                 {
@@ -74,7 +77,8 @@ test('EndpointIntelligenceService extracts auth-relevant endpoints from loaded J
                 },
             ],
         }),
-    });
+        };
+    };
 
     const fakeBurp = {
         async callTool() {
@@ -98,7 +102,7 @@ test('EndpointIntelligenceService extracts auth-relevant endpoints from loaded J
     };
 
     try {
-        const service = new EndpointIntelligenceService('scan-1', 'http://target.local', fakeBurp as any);
+        const service = new EndpointIntelligenceService('scan-1', 'http://target.local', fakeBurp as any, 7);
         const inventory = await service.buildInventory({
             browserSessionId: 'session-1',
             allowAiClassification: true,
@@ -117,10 +121,11 @@ test('EndpointIntelligenceService extracts auth-relevant endpoints from loaded J
 
         assert.ok(inventory.records.some((record) => record.storageKeys.includes('token')));
         assert.ok(inventory.summary.includes('auth-relevant'));
+        assert.equal(capturedUserId, 7);
     } finally {
         (browserService as any).captureJavaScriptArtifacts = originalCapture;
         (browserService as any).getTrafficSnapshot = originalTraffic;
-        (llmProvider as any).generate = originalGenerate;
+        (llmRuntime as any).generate = originalGenerate;
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
 });

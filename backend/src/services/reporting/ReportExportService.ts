@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { db, createReportExport, getReportExport, getReusableReportExport, listRecoverableReportExports, listReportExportsByScan, updateReportExport } from '../../db/init';
+import { db, createReportExport, getReportExport, getReusableReportExport, getScan, listRecoverableReportExports, listReportExportsByScan, updateReportExport } from '../../db/init';
 import { logger } from '../../utils/logger';
 import { reportEnrichmentService } from './ReportEnrichmentService';
 import { reportSnapshotService } from './ReportSnapshotService';
@@ -13,8 +13,14 @@ import type { CanonicalReportModel, ReportEnrichmentMode, ReportExportFormat, Re
 export class ReportExportService {
     private readonly activeJobs = new Set<string>();
     private readonly cancelRequested = new Set<string>();
+    private readonly abortControllers = new Map<string, AbortController>();
 
-    public async createOrReuseExport(scanId: string, format: ReportExportFormat, enrichmentMode: ReportEnrichmentMode): Promise<ReportExportRecord> {
+    public async createOrReuseExport(
+        scanId: string,
+        format: ReportExportFormat,
+        enrichmentMode: ReportEnrichmentMode,
+        options: { forceNew?: boolean } = {},
+    ): Promise<ReportExportRecord> {
         const { snapshot } = reportSnapshotService.getOrCreateSnapshot(scanId);
         const existing = getReusableReportExport({
             scanId,
@@ -24,18 +30,25 @@ export class ReportExportService {
         }) as ReportExportRecord | undefined;
 
         if (existing) {
-            if (existing.status === 'completed' && existing.artifact_path && fs.existsSync(existing.artifact_path)) {
-                return existing;
-            }
-            if (existing.status === 'completed' && existing.artifact_path && !fs.existsSync(existing.artifact_path)) {
-                updateReportExport(existing.id, {
-                    status: 'failed',
-                    stage: 'failed',
-                    error_message: 'Previously completed artifact was missing from disk.',
-                });
+            if (options.forceNew) {
+                if (existing.status === 'running' || existing.status === 'pending') {
+                    this.enqueue(existing.id);
+                    return getReportExport(existing.id) as ReportExportRecord;
+                }
             } else {
-                this.enqueue(existing.id);
-                return getReportExport(existing.id) as ReportExportRecord;
+                if (existing.status === 'completed' && existing.artifact_path && fs.existsSync(existing.artifact_path)) {
+                    return existing;
+                }
+                if (existing.status === 'completed' && existing.artifact_path && !fs.existsSync(existing.artifact_path)) {
+                    updateReportExport(existing.id, {
+                        status: 'failed',
+                        stage: 'failed',
+                        error_message: 'Previously completed artifact was missing from disk.',
+                    });
+                } else {
+                    this.enqueue(existing.id);
+                    return getReportExport(existing.id) as ReportExportRecord;
+                }
             }
         }
 
@@ -86,6 +99,7 @@ export class ReportExportService {
         }
 
         this.cancelRequested.add(exportId);
+        this.abortControllers.get(exportId)?.abort(new Error('Export canceled by user.'));
         updateReportExport(exportId, {
             status: 'canceled',
             stage: 'canceled',
@@ -148,6 +162,8 @@ export class ReportExportService {
         }
 
         this.activeJobs.add(exportId);
+        const abortController = new AbortController();
+        this.abortControllers.set(exportId, abortController);
         ensureReportsDir();
 
         try {
@@ -164,6 +180,7 @@ export class ReportExportService {
             });
 
             const { snapshot, report: snapshotReport } = reportSnapshotService.getSnapshotById(job.snapshot_id);
+            const scanRecord = getScan(job.scan_id);
             await this.throwIfCanceled(exportId);
 
             let resolvedReport = job.resolved_report_json
@@ -184,7 +201,9 @@ export class ReportExportService {
                 try {
                     const enrichment = await reportEnrichmentService.enrichReport(resolvedReport, {
                         scanId: job.scan_id,
+                        userId: scanRecord?.user_id,
                         reportExportId: job.id,
+                        signal: abortController.signal,
                     });
                     resolvedReport = enrichment.report;
                     updateReportExport(exportId, {
@@ -281,6 +300,7 @@ export class ReportExportService {
         } finally {
             this.cancelRequested.delete(exportId);
             this.activeJobs.delete(exportId);
+            this.abortControllers.delete(exportId);
         }
     }
 

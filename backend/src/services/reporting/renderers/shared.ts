@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import type { PDFFont } from 'pdf-lib';
 import type { ReportSeverity } from '../types';
 
 export const REPORTS_DIR = path.join(__dirname, '../../../../reports');
@@ -50,4 +51,71 @@ export function formatDisplayDate(value: string | null | undefined): string {
 
 export function safeText(value: string | null | undefined): string {
     return String(value || '').replace(/\r\n/g, '\n').trim();
+}
+
+const PDF_CHAR_REPLACEMENTS: Record<string, string> = {
+    '\u00a0': ' ',
+    '\u00ad': '-',
+    '\u200b': '',
+    '\u200c': '',
+    '\u200d': '',
+    '\u2010': '-',
+    '\u2011': '-',
+    '\u2012': '-',
+    '\u2013': '-',
+    '\u2014': '-',
+    '\u2015': '-',
+    '\u2018': '\'',
+    '\u2019': '\'',
+    '\u201a': '\'',
+    '\u201b': '\'',
+    '\u201c': '"',
+    '\u201d': '"',
+    '\u201e': '"',
+    '\u2022': '*',
+    '\u2023': '*',
+    '\u2026': '...',
+    '\u2043': '-',
+    '\u2060': '',
+    '\u2190': '<-',
+    '\u2192': '->',
+    '\u2194': '<->',
+    '\u21d0': '<=',
+    '\u21d2': '=>',
+    '\u21d4': '<=>',
+    '\u2212': '-',
+    '\u2260': '!=',
+    '\u2264': '<=',
+    '\u2265': '>=',
+    '\u25e6': '*',
+    '\ufeff': '',
+    '\ufe0f': '',
+};
+
+export function safePdfText(value: string | null | undefined, font: PDFFont): string {
+    const normalized = safeText(value).replace(/\t/g, '    ');
+    let result = '';
+
+    for (const char of normalized) {
+        if (char === '\n') {
+            result += '\n';
+            continue;
+        }
+
+        const replacement = PDF_CHAR_REPLACEMENTS[char] ?? char;
+        for (const candidateChar of replacement) {
+            if (!candidateChar) {
+                continue;
+            }
+
+            try {
+                font.encodeText(candidateChar);
+                result += candidateChar;
+            } catch {
+                result += '?';
+            }
+        }
+    }
+
+    return result;
 }

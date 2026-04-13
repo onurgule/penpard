@@ -17,7 +17,7 @@
  */
 
 import { llmProvider } from '../services/LLMProviderService';
-import { llmQueue } from '../services/LLMQueue';
+import { llmRuntime } from '../services/llm/LlmRuntime';
 import { browserService } from '../services/BrowserService';
 import { logger } from '../utils/logger';
 import path from 'path';
@@ -53,7 +53,9 @@ import { OrchestratorSystemPromptBuilder } from './orchestrator/OrchestratorSyst
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
 import { OrchestratorToolRegistry } from './orchestrator/OrchestratorToolRegistry';
 import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
+import { safeSnippetForLog, summarizeToolCallForLog } from './orchestrator/OrchestratorSafeLogging';
 import { evaluateToolExecutionGuard, resolveAuthIdentityId } from './orchestrator/OrchestratorToolPolicy';
+import { buildPromptIdentityContext } from '../services/prompt-data-minimization';
 import {
     AgentReflection,
     AgentPhase,
@@ -130,8 +132,8 @@ When asked to REPLAN, review all findings so far and create the next 5-step plan
 ═══════════════════════════════════════════════════════════════
 
 1. send_http_request
-   Args: { "method": "GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS", "url": "full_url", "headers": {...}, "body": "...", "identityId": "primary-user|idor-user-1|__none__", "preserveExplicitAuth": true|false }
-   Send any HTTP request through Burp proxy. Auth is injected automatically unless preserveExplicitAuth=true.
+   Args: { "method": "GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS", "url": "full_url", "headers": {...}, "body": "...", "identityId": "primary-user|idor-user-1|__none__", "preserveExplicitAuth": true|false, "useInitialRequestBaseline": true|false, "queryMutations": [...], "bodyMutations": [...] }
+   Send any HTTP request through Burp proxy. Auth is injected automatically unless preserveExplicitAuth=true. When replaying a Burp-originated baseline request, set useInitialRequestBaseline=true and prefer queryMutations/bodyMutations over reconstructing the raw request.
    Use identityId="__none__" for anonymous requests or identityId="idor-user-1" for cross-user replay.
 
 2. send_to_scanner
@@ -571,7 +573,7 @@ export class OrchestratorAgent {
         this.continuationCoordinator = new OrchestratorContinuationCoordinator({
             targetUrl,
             burp,
-            llm: { hasActiveConfig: () => { try { return !!llmProvider.getAllConfigs().find(c => c.is_active); } catch { return false; } } },
+            llm: { hasActiveConfig: () => { try { return !!llmProvider.getAllConfigs(this.config.userId).find(c => c.is_active); } catch { return false; } } },
             state: this.state,
             scanSurface: this.scanSurface,
             scanStatus: this.scanStatus,
@@ -623,7 +625,7 @@ export class OrchestratorAgent {
      * Returns structured JSON: is_focused, focused_endpoints, focused_vulns, etc.
      */
     private async analyzeOperatorInstructions(instructions: string): Promise<void> {
-        const analysis = await this.instructionAnalyzer.analyze(instructions, this.targetUrl);
+        const analysis = await this.instructionAnalyzer.analyze(instructions, this.targetUrl, this.scanId, this.config.userId);
         if (!analysis) {
             this.log('error', 'Failed to parse instruction analysis — treating as full scan');
             this.instructionAnalysis = null;
@@ -720,6 +722,8 @@ export class OrchestratorAgent {
      */
     private async createPlanForHarness(): Promise<{ kind: 'plan'; plan: AttackPlan } | { kind: 'complete' } | null> {
         const decision = await this.planner.createPlan({
+            scanId: this.scanId,
+            userId: this.config.userId,
             systemPrompt: this.state.systemPromptContent,
             conversationHistory: this.state.conversationHistory,
             rateLimitPauseUntil: this.state.rateLimitPauseUntil,
@@ -774,7 +778,7 @@ export class OrchestratorAgent {
 
         // Log thought
         if (response.thought) {
-            this.log('agent', `Thought: ${response.thought.substring(0, 200)}...`);
+            this.log('agent', `Thought: ${safeSnippetForLog(response.thought, 200) || 'captured'}`);
         }
         this.logReflection(response.reflection);
 
@@ -793,7 +797,7 @@ export class OrchestratorAgent {
 
         // Execute action
         if (response.action && response.action.tool) {
-            this.log('tool', `→ ${response.action.tool}: ${JSON.stringify(response.action.args).substring(0, 150)}`);
+            this.log('tool', `-> ${summarizeToolCallForLog(response.action.tool, response.action.args)}`);
             const result = await this.executeToolCall(response.action);
 
             // Analyze for auto-detected vulns
@@ -813,7 +817,7 @@ export class OrchestratorAgent {
             return { stepFindings, toolResultSummary, stepComplete: false };
         } else if (response.answer) {
             // Step is done
-            this.log('agent', `Step complete: ${response.answer.substring(0, 100)}`);
+            this.log('agent', `Step complete: ${safeSnippetForLog(response.answer, 120) || 'completed'}`);
             return { stepFindings, toolResultSummary: null, stepComplete: true };
         } else {
             // No action, no answer - LLM is done with this step
@@ -902,6 +906,8 @@ export class OrchestratorAgent {
 
             try {
                 const parsed = await this.planner.executeDirectInstructionTurn({
+                    scanId: this.scanId,
+                    userId: this.config.userId,
                     systemPrompt: this.state.systemPromptContent,
                     conversationHistory: this.state.conversationHistory,
                     rateLimitPauseUntil: this.state.rateLimitPauseUntil,
@@ -946,7 +952,7 @@ export class OrchestratorAgent {
 
                 // Check for completion
                 if (parsed.answer) {
-                    this.log('agent', `Conclusion: ${parsed.answer}`);
+                    this.log('agent', `Conclusion: ${safeSnippetForLog(parsed.answer, 160) || 'recorded'}`);
                     break;
                 }
             } catch (e: any) {
@@ -981,7 +987,7 @@ export class OrchestratorAgent {
     }
 
     public handleUserCommand(command: string) {
-        this.log('human', `User Command: ${command}`);
+        this.log('human', `User Command: ${safeSnippetForLog(command, 160) || 'received'}`);
         this.state.pushHumanCommand(command);
     }
 
@@ -1124,7 +1130,7 @@ export class OrchestratorAgent {
             try {
                 const mode = this.config.sourceAnalysisMode as SourceAnalysisMode;
                 this.log('system', `🔬 Source Analysis: Running ${mode} analysis on ${this.config.sourcePackagePath}...`);
-                const sourceResult = await analyzeSource(this.scanId, this.config.sourcePackagePath, mode);
+                const sourceResult = await analyzeSource(this.scanId, this.config.sourcePackagePath, mode, this.config.userId);
                 sourceContextBlock = buildAgentContextBlock(sourceResult);
                 this.log('system', `✓ Source Analysis complete: ${sourceResult.framework}, ${sourceResult.dependencies.length} deps, ${sourceResult.cves.length} CVEs`);
                 if (mode === SourceAnalysisMode.FULL_SOURCE_AWARE) {
@@ -1203,7 +1209,7 @@ export class OrchestratorAgent {
             const instr = this.config.customSystemPrompt;
             this.state.pushMessages(buildOperatorInstructionMessages(instr, this.instructionAnalysis));
 
-            this.log('system', `✓ Operator instructions processed: "${instr.substring(0, 100)}${instr.length > 100 ? '...' : ''}"`);
+            this.log('system', '✓ Operator instructions processed and injected into the conversation');
         }
 
         // Request sent from Burp "Send to PenPard" — parse and inject structured data
@@ -1219,29 +1225,33 @@ export class OrchestratorAgent {
     }
 
     private buildAccountPromptContext(): any[] {
-        const startupAccounts = (this.config.authStartup?.credentials || []).map((credential, index) => ({
-            identityId: index === 0 ? 'primary-user' : `provided-user-${index}`,
-            username: credential.username,
-            email: credential.email,
-            label: credential.label,
-            role: credential.role,
-            privilege: credential.privilege || 'unknown',
-            source: 'scan_start',
-        }));
+        const startupAccounts = (this.config.authStartup?.credentials || []).map((credential, index) =>
+            buildPromptIdentityContext({
+                identityId: index === 0 ? 'primary-user' : `provided-user-${index}`,
+                username: credential.username,
+                email: credential.email,
+                label: credential.label,
+                role: credential.role,
+                privilege: credential.privilege || 'unknown',
+                source: 'scan_start',
+            }),
+        );
 
-        const legacyAccounts = (this.config.idorUsers || []).map((account: any, index: number) => ({
-            identityId: account.identityId || `idor-user-${index + 1}`,
-            username: account.username,
-            email: account.email,
-            label: account.label,
-            role: account.role,
-            privilege: account.privilege || 'unknown',
-            source: 'idor_pool',
-        }));
+        const legacyAccounts = (this.config.idorUsers || []).map((account: any, index: number) =>
+            buildPromptIdentityContext({
+                identityId: account.identityId || `idor-user-${index + 1}`,
+                username: account.username,
+                email: account.email,
+                label: account.label,
+                role: account.role,
+                privilege: account.privilege || 'unknown',
+                source: 'idor_pool',
+            }),
+        );
 
         const seen = new Set<string>();
         return [...startupAccounts, ...legacyAccounts].filter((account) => {
-            const key = JSON.stringify([account.identityId, account.username, account.email, account.role, account.label]);
+            const key = JSON.stringify([account.identityId, account.label, account.role, account.privilege, account.source]);
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
@@ -1274,11 +1284,16 @@ export class OrchestratorAgent {
         if (vulns.length > 0) {
             try {
                 const vulnList = vulns.map((v: any) => `[${v.severity.toUpperCase()}] ${v.name}`).join('\n');
-                const summary = await llmQueue.enqueue({
+                const summary = await llmRuntime.generate({
                     systemPrompt: 'You are a security report writer. Provide a concise executive summary of the penetration test findings. Include: total vulns by severity, most critical issues, and key recommendations.',
                     userPrompt: `Target: ${this.targetUrl}\nPlanning rounds completed: ${this.state.planRound}\nEndpoints tested: ${this.scanSurface.getDiscoveredEndpointCount()}\n\nFindings:\n${vulnList}`
+                }, {
+                    scanId: this.scanId,
+                    userId: this.config.userId,
+                    callSite: 'executive_summary',
+                    context: 'orchestrator-executive-summary-legacy',
                 });
-                this.log('agent', `Executive Summary:\n${summary.text.substring(0, 500)}`);
+                this.log('agent', `Executive Summary: ${safeSnippetForLog(summary.text, 240) || 'generated'}`);
             } catch (e: any) {
                 this.log('error', `Summary generation failed: ${e.message}`);
             }
@@ -1311,6 +1326,8 @@ export class OrchestratorAgent {
 
     private async askLLMForStepExecution(step: PlanStep, previousResults: string[], totalActions: number): Promise<LLMResponse | null> {
         return this.planner.askForStepExecution({
+            scanId: this.scanId,
+            userId: this.config.userId,
             systemPrompt: this.state.systemPromptContent,
             conversationHistory: this.state.conversationHistory,
             rateLimitPauseUntil: this.state.rateLimitPauseUntil,
@@ -1324,6 +1341,8 @@ export class OrchestratorAgent {
 
     private async shouldContinueTesting(roundResults: StepExecutionResult[]): Promise<boolean> {
         return this.planner.shouldContinueTesting({
+            scanId: this.scanId,
+            userId: this.config.userId,
             systemPrompt: this.state.systemPromptContent,
             conversationHistory: this.state.conversationHistory,
             rateLimitPauseUntil: this.state.rateLimitPauseUntil,
@@ -1350,13 +1369,13 @@ export class OrchestratorAgent {
 
         const parts: string[] = [];
         if (reflection.evaluationPreviousGoal) {
-            parts.push(`prev=${reflection.evaluationPreviousGoal.substring(0, 120)}`);
+            parts.push(`prev=${safeSnippetForLog(reflection.evaluationPreviousGoal, 120)}`);
         }
         if (reflection.memory) {
-            parts.push(`memory=${reflection.memory.substring(0, 120)}`);
+            parts.push(`memory=${safeSnippetForLog(reflection.memory, 120)}`);
         }
         if (reflection.nextGoal) {
-            parts.push(`next=${reflection.nextGoal.substring(0, 120)}`);
+            parts.push(`next=${safeSnippetForLog(reflection.nextGoal, 120)}`);
         }
 
         if (parts.length > 0) {
@@ -1392,7 +1411,7 @@ export class OrchestratorAgent {
     // ═══════════════════════════════════════════════════════════
 
     private async processHumanCommand(cmd: string) {
-        this.log('system', `Processing operator command: ${cmd}`);
+        this.log('system', 'Processing operator command');
         this.state.pushMessage({
             role: 'user',
             content: `⚠️ [OPERATOR COMMAND — HIGHEST PRIORITY] The human operator has issued the following directive. You MUST follow this immediately and override any current plan:\n\n${cmd}\n\nACKNOWLEDGE this command and adjust your next actions accordingly.`
@@ -1401,7 +1420,7 @@ export class OrchestratorAgent {
 
     private async checkLLM(): Promise<boolean> {
         try {
-            const configs = llmProvider.getAllConfigs();
+            const configs = llmProvider.getAllConfigs(this.config.userId);
             const active = configs.find(c => c.is_active);
             return !!active;
         } catch { return false; }

@@ -144,7 +144,7 @@ router.post('/extract-endpoints-ai', authenticateToken, upload.single('sourceZip
             }
 
             const { extractRoutesWithAI } = await import('../services/source-analysis/utils/ai-route-extractor');
-            const aiEndpoints = await extractRoutesWithAI(finalSourcePath, existingEndpoints);
+            const aiEndpoints = await extractRoutesWithAI(finalSourcePath, existingEndpoints, req.user?.id);
 
             for (const p of cleanupPaths) {
                 try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) {}

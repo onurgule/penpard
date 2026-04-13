@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 const { OrchestratorPlanner } = require('../src/agents/orchestrator/OrchestratorPlanner') as typeof import('../src/agents/orchestrator/OrchestratorPlanner');
 const { OrchestratorLlmResponseParser } = require('../src/agents/orchestrator/OrchestratorLlmResponseParser') as typeof import('../src/agents/orchestrator/OrchestratorLlmResponseParser');
-const { llmQueue } = require('../src/services/LLMQueue') as typeof import('../src/services/LLMQueue');
+const { llmRuntime } = require('../src/services/llm/LlmRuntime') as typeof import('../src/services/llm/LlmRuntime');
 
 test('planner creates a plan through the extracted LLM decision layer', async () => {
     const parser = new OrchestratorLlmResponseParser('https://app.example.com', () => false);
@@ -13,10 +13,12 @@ test('planner creates a plan through the extracted LLM decision layer', async ()
         handleRateLimitError: () => {},
     });
     const conversationHistory: Array<{ role: string; content: string }> = [];
-    const originalEnqueue = llmQueue.enqueue;
+    const originalGenerate = llmRuntime.generate;
 
-    llmQueue.enqueue = (async (request: any) => {
+    llmRuntime.generate = (async (request: any, metadata: any) => {
         assert.match(request.userPrompt, /Respond with ONLY a valid JSON object/);
+        assert.equal(metadata.scanId, 'scan-test');
+        assert.equal(metadata.callSite, 'plan_creation');
         return {
             text: JSON.stringify({
                 analysis: 'Continue validating the authenticated API surface',
@@ -33,6 +35,7 @@ test('planner creates a plan through the extracted LLM decision layer', async ()
 
     try {
         const result = await planner.createPlan({
+            scanId: 'scan-test',
             systemPrompt: 'system',
             conversationHistory,
             rateLimitPauseUntil: null,
@@ -54,6 +57,6 @@ test('planner creates a plan through the extracted LLM decision layer', async ()
         assert.equal(conversationHistory[0].role, 'user');
         assert.equal(conversationHistory[1].role, 'assistant');
     } finally {
-        llmQueue.enqueue = originalEnqueue;
+        llmRuntime.generate = originalGenerate;
     }
 });

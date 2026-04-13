@@ -16,6 +16,11 @@ export interface McpServerConfig {
     is_enabled: number;
 }
 
+export interface McpServerSummary extends Omit<McpServerConfig, 'env_vars'> {
+    env_vars: string;
+    has_env_vars: boolean;
+}
+
 /**
  * Interface for a running MCP Server instance.
  */
@@ -61,6 +66,14 @@ class McpManagerService {
      */
     public getAllServers(): McpServerConfig[] {
         return db.prepare('SELECT * FROM mcp_servers').all() as McpServerConfig[];
+    }
+
+    public getAllServerSummaries(): McpServerSummary[] {
+        return this.getAllServers().map((server) => ({
+            ...server,
+            env_vars: '{}',
+            has_env_vars: !!server.env_vars && server.env_vars !== '{}',
+        }));
     }
 
     /**

@@ -3,21 +3,23 @@ import assert from 'node:assert/strict';
 
 const { OrchestratorInstructionAnalyzer } = require('../src/agents/orchestrator/OrchestratorInstructionAnalyzer') as typeof import('../src/agents/orchestrator/OrchestratorInstructionAnalyzer');
 const { OrchestratorLlmResponseParser } = require('../src/agents/orchestrator/OrchestratorLlmResponseParser') as typeof import('../src/agents/orchestrator/OrchestratorLlmResponseParser');
-const { llmQueue } = require('../src/services/LLMQueue') as typeof import('../src/services/LLMQueue');
+const { llmRuntime } = require('../src/services/llm/LlmRuntime') as typeof import('../src/services/llm/LlmRuntime');
 
 test('instruction analyzer returns structured focused scope data', async () => {
     const parser = new OrchestratorLlmResponseParser('https://app.example.com', () => false);
     const analyzer = new OrchestratorInstructionAnalyzer(parser);
-    const originalEnqueue = llmQueue.enqueue;
+    const originalGenerate = llmRuntime.generate;
 
-    llmQueue.enqueue = (async () => ({
+    llmRuntime.generate = (async (_request: any, metadata: any) => ({
         text: '```json\n{"is_focused":true,"focused_endpoints":["https://app.example.com/login"],"focused_vulns":["SQL Injection"],"skip_recon":true,"auto_finish":true,"summary":"Test only /login for SQL injection, then finish"}\n```',
+        usage: undefined,
     })) as any;
 
     try {
         const analysis = await analyzer.analyze(
             'only focus on /login endpoint and test for sql injection only, then finish',
             'https://app.example.com',
+            'scan-test',
         );
 
         assert.ok(analysis);
@@ -27,6 +29,6 @@ test('instruction analyzer returns structured focused scope data', async () => {
         assert.equal(analysis.skip_recon, true);
         assert.equal(analysis.auto_finish, true);
     } finally {
-        llmQueue.enqueue = originalEnqueue;
+        llmRuntime.generate = originalGenerate;
     }
 });

@@ -2,6 +2,13 @@ import { AuthStateManager, RequestAuthIntent } from '../../services/auth';
 import { normalizeProxyHistoryItems, normalizeSendHttpResponse } from '../../services/burp-tool-result';
 import { resolveAuthIdentityId, resolveRequestAuthIntent } from './OrchestratorToolPolicy';
 import {
+    applyStoredInitialRequestBodyMutations,
+    applyStoredInitialRequestQueryMutations,
+    type InitialRequestProfile,
+    mergeStoredInitialRequestHeaders,
+    parseInitialRequestProfile,
+} from './OrchestratorInitialRequestProfile';
+import {
     ManagedAuthRequestInterceptor,
     RequestExecutionContext,
     RequestPreparationInterceptor,
@@ -56,9 +63,14 @@ export class OrchestratorRequestExecutor {
     private readonly requestHistory = new Map<string, RequestHistoryEntry>();
     private readonly preparationInterceptors: RequestPreparationInterceptor[];
     private readonly responseInterceptors: RequestResponseInterceptor[];
+    private readonly initialRequestProfile: InitialRequestProfile | null;
     private lastExchange: RequestExecutionExchange | null = null;
 
     constructor(private readonly options: OrchestratorRequestExecutorOptions) {
+        this.initialRequestProfile = this.options.initialRequest?.trim()
+            ? parseInitialRequestProfile(this.options.initialRequest.trim())
+            : null;
+
         const authInterceptor = new ManagedAuthRequestInterceptor({
             authManager: this.options.authManager,
             burp: this.options.burp,
@@ -106,12 +118,36 @@ export class OrchestratorRequestExecutor {
     }
 
     private buildExecutionContext(toolCall: ToolCall<'send_http_request'>): RequestExecutionContext {
-        const url = toolCall.args.url;
-        const method = toolCall.args.method || 'GET';
-        const identityId = resolveAuthIdentityId(toolCall.args);
         const preserveExplicitAuth = toolCall.args?.preserveExplicitAuth === true;
-        const originalBody = this.normalizeRequestBody(toolCall.args.body ?? toolCall.args.data ?? '');
-        const originalHeaders = toolCall.args.headers as Record<string, string> | undefined;
+        const useInitialRequestBaseline = toolCall.args?.useInitialRequestBaseline === true && !!this.initialRequestProfile;
+        const explicitHeaders = this.normalizeRequestHeaders(toolCall.args.headers as Record<string, string> | undefined);
+        const hasExplicitBody = Object.prototype.hasOwnProperty.call(toolCall.args, 'body')
+            || Object.prototype.hasOwnProperty.call(toolCall.args, 'data');
+        const explicitBody = hasExplicitBody
+            ? this.normalizeRequestBody(toolCall.args.body ?? toolCall.args.data ?? '')
+            : undefined;
+        const baselineBody = explicitBody !== undefined
+            ? explicitBody
+            : useInitialRequestBaseline
+                ? applyStoredInitialRequestBodyMutations(
+                    this.initialRequestProfile?.body || '',
+                    this.initialRequestProfile?.contentType,
+                    toolCall.args.bodyMutations,
+                )
+                : '';
+        const requestedUrl = typeof toolCall.args.url === 'string' ? toolCall.args.url : '';
+        const baseUrl = useInitialRequestBaseline
+            ? (!requestedUrl || requestedUrl.includes('<preserved>'))
+                ? this.initialRequestProfile?.url || ''
+                : requestedUrl
+            : requestedUrl;
+        const url = applyStoredInitialRequestQueryMutations(baseUrl, toolCall.args.queryMutations);
+        const method = toolCall.args.method || (useInitialRequestBaseline ? this.initialRequestProfile?.method : undefined) || 'GET';
+        const identityId = resolveAuthIdentityId(toolCall.args);
+        const originalBody = baselineBody;
+        const originalHeaders = useInitialRequestBaseline
+            ? mergeStoredInitialRequestHeaders(this.initialRequestProfile, explicitHeaders, true)
+            : explicitHeaders;
         const requestIntent = resolveRequestAuthIntent({
             requestedIntent: toolCall.args.requestIntent,
             identityId,
@@ -197,11 +233,16 @@ export class OrchestratorRequestExecutor {
     ): Promise<void> {
         const requestArgs = {
             ...context.toolCall.args,
+            url: context.url,
+            method: context.method,
             headers: preparedRequest.headers,
             body: preparedRequest.body,
             identityId: context.identityId,
         } as Record<string, any>;
         delete requestArgs.data;
+        delete requestArgs.queryMutations;
+        delete requestArgs.bodyMutations;
+        delete requestArgs.useInitialRequestBaseline;
 
         context.preparedRequest = preparedRequest;
         context.requestArgs = requestArgs;
@@ -287,6 +328,16 @@ export class OrchestratorRequestExecutor {
         if (rawBody === undefined || rawBody === null) return '';
         if (typeof rawBody === 'string') return rawBody;
         return JSON.stringify(rawBody);
+    }
+
+    private normalizeRequestHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+        if (!headers) {
+            return undefined;
+        }
+
+        return Object.fromEntries(
+            Object.entries(headers).map(([name, value]) => [name, String(value)]),
+        );
     }
 
     private buildRequestHistoryKey(

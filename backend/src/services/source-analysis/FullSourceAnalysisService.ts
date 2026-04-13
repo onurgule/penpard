@@ -8,11 +8,12 @@ import {
     buildFileTree, summarizeModules, summarizeFunctions,
     analyzeSecurityFlows, generateApplicationSummary, generateArchitectureSummary,
 } from './utils/source-summarizer';
-import { llmProvider } from '../LLMProviderService';
+import { llmRuntime } from '../llm/LlmRuntime';
 import { logger } from '../../utils/logger';
 
 async function enrichEndpointDescriptions(
     endpoints: { method: string; path: string; handler: string; authRequired: boolean; description: string; userInputs: string[] }[],
+    userId?: number,
 ): Promise<typeof endpoints> {
     if (endpoints.length === 0) return endpoints;
 
@@ -22,7 +23,7 @@ async function enrichEndpointDescriptions(
     ).join('\n');
 
     try {
-        const response = await llmProvider.generate({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You are a code analysis assistant. Output ONLY valid JSON, no markdown.',
             userPrompt: `Add a short description (1 sentence) to each endpoint based on its path, handler, and inputs.
 
@@ -31,7 +32,11 @@ ${endpointList.slice(0, 4000)}
 
 Return JSON array with same order: [{"index":0,"description":"..."}]
 Return ONLY the JSON array.`,
-        }, 'source-analysis-endpoint-descriptions');
+        }, {
+            userId,
+            callSite: 'source_analysis',
+            context: 'source-analysis-endpoint-descriptions',
+        });
 
         const text = response.text.trim();
         const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -55,6 +60,7 @@ async function generateTestingHintsDeep(
     stack: string[],
     endpoints: { method: string; path: string; authRequired: boolean; userInputs: string[] }[],
     securityFlows: { category: string; description: string; riskLevel: string }[],
+    userId?: number,
 ) {
     const endpointSummary = endpoints.slice(0, 20).map(e =>
         `${e.method} ${e.path} (auth: ${e.authRequired}, inputs: ${e.userInputs.join(',')})`
@@ -65,7 +71,7 @@ async function generateTestingHintsDeep(
     ).join('\n');
 
     try {
-        const response = await llmProvider.generate({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You are a penetration testing advisor. Output ONLY valid JSON, no markdown.',
             userPrompt: `Generate security testing hints for a ${framework} application (${stack.join(', ')}).
 
@@ -83,7 +89,11 @@ Provide 8-15 precise, actionable testing hints based on the actual code structur
 
 Return JSON array: [{"category":"endpoint|auth|flow|injection|config","hint":"..."}]
 Return ONLY the JSON array.`,
-        }, 'source-analysis-deep-hints');
+        }, {
+            userId,
+            callSite: 'source_analysis',
+            context: 'source-analysis-deep-hints',
+        });
 
         const text = response.text.trim();
         const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -100,7 +110,7 @@ Return ONLY the JSON array.`,
     return [{ category: 'general', hint: `Perform thorough testing of all ${endpoints.length} endpoints.` }];
 }
 
-export async function analyzeFullSource(sourcePath: string): Promise<FullSourceAnalysisResult> {
+export async function analyzeFullSource(sourcePath: string, userId?: number): Promise<FullSourceAnalysisResult> {
     logger.info(`Starting Full Source Aware analysis: ${sourcePath}`);
 
     // Stage 1: dependency analysis (same as Version Aware)
@@ -115,26 +125,26 @@ export async function analyzeFullSource(sourcePath: string): Promise<FullSourceA
     // Stage 3: structural map
     logger.info('Stage 3/6: Building file tree and module summaries...');
     const files = buildFileTree(sourcePath);
-    const modules = await summarizeModules(files, sourcePath);
+    const modules = await summarizeModules(files, sourcePath, userId);
 
     // Stage 4: function analysis
     logger.info('Stage 4/6: Analyzing functions...');
-    const functions = await summarizeFunctions(files);
+    const functions = await summarizeFunctions(files, userId);
 
     // Stage 5: route extraction + enrichment
     logger.info('Stage 5/6: Extracting routes and analyzing security flows...');
     const rawEndpoints = await extractRoutes(sourcePath);
-    const endpoints = await enrichEndpointDescriptions(rawEndpoints);
+    const endpoints = await enrichEndpointDescriptions(rawEndpoints, userId);
 
     // Stage 6: security flow synthesis
-    const securityFlows = await analyzeSecurityFlows(files, modules, functions);
+    const securityFlows = await analyzeSecurityFlows(files, modules, functions, userId);
 
     // Generate summaries
     logger.info('Stage 6/6: Generating summaries...');
     const [applicationSummary, architectureSummary, testingHints] = await Promise.all([
-        generateApplicationSummary(files, modules, framework, technologyStack),
-        generateArchitectureSummary(modules, functions, framework),
-        generateTestingHintsDeep(framework, technologyStack, endpoints, securityFlows),
+        generateApplicationSummary(files, modules, framework, technologyStack, userId),
+        generateArchitectureSummary(modules, functions, framework, userId),
+        generateTestingHintsDeep(framework, technologyStack, endpoints, securityFlows, userId),
     ]);
 
     logger.info(`Full Source Aware analysis complete: ${dependencies.length} deps, ${cves.length} CVEs, ${modules.length} modules, ${functions.length} functions, ${endpoints.length} endpoints, ${securityFlows.length} security flows`);

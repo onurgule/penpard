@@ -8,7 +8,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { llmQueue } from '../services/LLMQueue';
+import { llmRuntime } from '../services/llm/LlmRuntime';
 import { logger } from '../utils/logger';
 import {
     saveAnalysisLog,
@@ -80,11 +80,13 @@ function parseJSONSafe(text: string): any {
 
 export class ReportLearningAgent {
     private analysisId: string;
+    private readonly userId?: number;
     private logs: string[] = [];
     private isRunning: boolean = false;
 
-    constructor(analysisId: string) {
+    constructor(analysisId: string, userId?: number) {
         this.analysisId = analysisId;
+        this.userId = userId;
     }
 
     async analyze(parsedReport: ParsedReport): Promise<void> {
@@ -148,9 +150,14 @@ export class ReportLearningAgent {
     private async deriveTTP(dbFinding: any, parsedFinding: ParsedFinding): Promise<void> {
         const context = this.buildFindingContext(parsedFinding);
 
-        const response = await llmQueue.enqueue({
+        const response = await llmRuntime.generate({
             systemPrompt: TTP_EXTRACTION_PROMPT,
             userPrompt: context,
+        }, {
+            analysisId: this.analysisId,
+            userId: this.userId,
+            callSite: 'red_team_ttp_derivation',
+            context: 'red-team-ttp-derivation',
         });
 
         const result = parseJSONSafe(response.text);

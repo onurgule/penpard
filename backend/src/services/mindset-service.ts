@@ -4,7 +4,7 @@
  */
 
 import { getActiveTTPs, getAllTTPs, upsertMindsetProfile } from '../db/init';
-import { llmQueue } from './LLMQueue';
+import { llmRuntime } from './llm/LlmRuntime';
 import { logger } from '../utils/logger';
 
 // ── Interfaces ──
@@ -167,9 +167,12 @@ class MindsetService {
                 .replace('{TTP_A}', existingStr)
                 .replace('{TTP_B}', newTTPJson);
 
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: 'You are a security analysis deduplication engine. Return ONLY valid JSON.',
                 userPrompt: prompt,
+            }, {
+                callSite: 'red_team_ttp_derivation',
+                context: 'mindset-ttp-deduplication',
             });
 
             const parsed = this.parseJSON(response.text);

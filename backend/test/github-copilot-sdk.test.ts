@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { GitHubCopilotAuthError, GitHubCopilotSdkService } from '../src/services/github/GitHubCopilotSdkService';
+import { LlmExecutionError } from '../src/services/llm/LlmRuntimeTypes';
 
 test('GitHubCopilotSdkService normalizes Copilot SDK models for the UI and sorts selectable models first', async () => {
     let started = 0;
@@ -77,6 +78,13 @@ test('GitHubCopilotSdkService generate uses a tool-free Copilot session and pass
     let createdSessionConfig: any = null;
     let sendArguments: any = null;
     let disconnected = 0;
+    const listeners = new Map<string, Array<(payload?: any) => void>>();
+
+    const emit = (eventName: string, payload?: any) => {
+        for (const listener of listeners.get(eventName) || []) {
+            listener(payload);
+        }
+    };
 
     const service = new GitHubCopilotSdkService(() => ({
         start: async () => undefined,
@@ -86,13 +94,17 @@ test('GitHubCopilotSdkService generate uses a tool-free Copilot session and pass
         createSession: async (config: any) => {
             createdSessionConfig = config;
             return {
-                sendAndWait: async (options: any, timeout?: number) => {
-                    sendArguments = { options, timeout };
-                    return {
-                        data: {
-                            content: 'copilot-answer',
-                        },
-                    };
+                on: (eventName: string, listener: (payload?: any) => void) => {
+                    if (!listeners.has(eventName)) {
+                        listeners.set(eventName, []);
+                    }
+                    listeners.get(eventName)!.push(listener);
+                },
+                send: async (options: any) => {
+                    sendArguments = { options };
+                    emit('assistant.message_delta', { data: { delta: 'copilot-' } });
+                    emit('assistant.message', { data: { content: 'copilot-answer' } });
+                    emit('session.idle');
                 },
                 disconnect: async () => {
                     disconnected += 1;
@@ -111,12 +123,12 @@ test('GitHubCopilotSdkService generate uses a tool-free Copilot session and pass
     assert.equal(disconnected, 1);
     assert.deepEqual(createdSessionConfig.availableTools, []);
     assert.deepEqual(createdSessionConfig.infiniteSessions, { enabled: false });
+    assert.equal(createdSessionConfig.streaming, true);
     assert.equal(createdSessionConfig.model, 'gpt-5');
     assert.deepEqual(createdSessionConfig.systemMessage, {
         mode: 'replace',
         content: 'You are PenPard.',
     });
-    assert.equal(sendArguments.timeout, 60000);
     assert.deepEqual(sendArguments.options.attachments, [
         {
             type: 'blob',
@@ -144,4 +156,182 @@ test('GitHubCopilotSdkService converts Copilot auth failures into refreshable au
         async () => service.listModels('ghu_expired'),
         (error: unknown) => error instanceof GitHubCopilotAuthError,
     );
+});
+
+test('GitHubCopilotSdkService returns content when the final message arrives but session.idle never does', async () => {
+    const listeners = new Map<string, Array<(payload?: any) => void>>();
+
+    const emit = (eventName: string, payload?: any) => {
+        for (const listener of listeners.get(eventName) || []) {
+            listener(payload);
+        }
+    };
+
+    const service = new GitHubCopilotSdkService(() => ({
+        start: async () => undefined,
+        stop: async () => [],
+        listModels: async () => [],
+        getAuthStatus: async () => ({ isAuthenticated: true }),
+        createSession: async () => ({
+            on: (eventName: string, listener: (payload?: any) => void) => {
+                if (!listeners.has(eventName)) {
+                    listeners.set(eventName, []);
+                }
+                listeners.get(eventName)!.push(listener);
+            },
+            send: async () => {
+                emit('assistant.message', { data: { content: 'final-without-idle' } });
+            },
+            disconnect: async () => undefined,
+        }),
+    }) as any);
+
+    const response = await service.generate(
+        'ghu_example',
+        'gpt-5',
+        {
+            systemPrompt: 'system',
+            userPrompt: 'user',
+        },
+        {
+            firstEventTimeoutMs: 50,
+            attemptTimeoutMs: 30,
+        },
+    );
+
+    assert.equal(response.text, 'final-without-idle');
+    assert.equal(response.diagnostics?.assistantMessageReceived, true);
+    assert.equal(response.diagnostics?.idleReceived, false);
+    assert.equal(response.diagnostics?.warningCategory, 'provider_idle_timeout');
+});
+
+test('GitHubCopilotSdkService classifies no-event sessions as provider_first_event_timeout', async () => {
+    const service = new GitHubCopilotSdkService(() => ({
+        start: async () => undefined,
+        stop: async () => [],
+        listModels: async () => [],
+        getAuthStatus: async () => ({ isAuthenticated: true }),
+        createSession: async () => ({
+            on: () => undefined,
+            send: async () => undefined,
+            disconnect: async () => undefined,
+        }),
+    }) as any);
+
+    await assert.rejects(
+        () => service.generate(
+            'ghu_example',
+            'gpt-5',
+            {
+                systemPrompt: 'system',
+                userPrompt: 'user',
+            },
+            {
+                firstEventTimeoutMs: 20,
+                attemptTimeoutMs: 60,
+            },
+        ),
+        (error: any) => {
+            assert.ok(error instanceof LlmExecutionError);
+            assert.equal(error.failureCategory, 'provider_first_event_timeout');
+            return true;
+        },
+    );
+});
+
+test('GitHubCopilotSdkService classifies session errors before completion as sdk_session_timeout', async () => {
+    const listeners = new Map<string, Array<(payload?: any) => void>>();
+
+    const emit = (eventName: string, payload?: any) => {
+        for (const listener of listeners.get(eventName) || []) {
+            listener(payload);
+        }
+    };
+
+    const service = new GitHubCopilotSdkService(() => ({
+        start: async () => undefined,
+        stop: async () => [],
+        listModels: async () => [],
+        getAuthStatus: async () => ({ isAuthenticated: true }),
+        createSession: async () => ({
+            on: (eventName: string, listener: (payload?: any) => void) => {
+                if (!listeners.has(eventName)) {
+                    listeners.set(eventName, []);
+                }
+                listeners.get(eventName)!.push(listener);
+            },
+            send: async () => {
+                emit('session.error', { data: { content: 'session disconnected' } });
+            },
+            disconnect: async () => undefined,
+        }),
+    }) as any);
+
+    await assert.rejects(
+        () => service.generate(
+            'ghu_example',
+            'gpt-5',
+            {
+                systemPrompt: 'system',
+                userPrompt: 'user',
+            },
+            {
+                firstEventTimeoutMs: 50,
+                attemptTimeoutMs: 50,
+            },
+        ),
+        (error: any) => {
+            assert.ok(error instanceof LlmExecutionError);
+            assert.equal(error.failureCategory, 'sdk_session_timeout');
+            return true;
+        },
+    );
+});
+
+test('GitHubCopilotSdkService allows slow responses that still finish within budget', async () => {
+    const listeners = new Map<string, Array<(payload?: any) => void>>();
+
+    const emit = (eventName: string, payload?: any) => {
+        for (const listener of listeners.get(eventName) || []) {
+            listener(payload);
+        }
+    };
+
+    const service = new GitHubCopilotSdkService(() => ({
+        start: async () => undefined,
+        stop: async () => [],
+        listModels: async () => [],
+        getAuthStatus: async () => ({ isAuthenticated: true }),
+        createSession: async () => ({
+            on: (eventName: string, listener: (payload?: any) => void) => {
+                if (!listeners.has(eventName)) {
+                    listeners.set(eventName, []);
+                }
+                listeners.get(eventName)!.push(listener);
+            },
+            send: async () => {
+                setTimeout(() => emit('assistant.message_delta', { data: { delta: 'slow-' } }), 10);
+                setTimeout(() => emit('assistant.message', { data: { content: 'slow-answer' } }), 20);
+                setTimeout(() => emit('session.idle'), 25);
+            },
+            disconnect: async () => undefined,
+        }),
+    }) as any);
+
+    const response = await service.generate(
+        'ghu_example',
+        'gpt-5',
+        {
+            systemPrompt: 'system',
+            userPrompt: 'user',
+        },
+        {
+            firstEventTimeoutMs: 50,
+            attemptTimeoutMs: 80,
+        },
+    );
+
+    assert.equal(response.text, 'slow-answer');
+    assert.equal(response.diagnostics?.idleReceived, true);
+    assert.ok((response.diagnostics?.firstEventAtMs || 0) >= 0);
 });

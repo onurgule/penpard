@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { saveScanLogs } from '../../db/init';
 import { formatLogTimestamp } from '../../utils/logger';
+import { sanitizeOrchestratorLogText } from './OrchestratorSafeLogging';
 
 type TimestampFn = () => string;
 
@@ -78,7 +79,7 @@ export class OrchestratorLogLedger {
     }
 
     public append(type: string, message: string): OrchestratorLogEntry {
-        const normalizedMessage = normalizeVisibleLogMessage(message);
+        const normalizedMessage = normalizeVisibleLogMessage(sanitizeOrchestratorLogText(message));
         const line = `[${this.timestamp()}] [${type.toUpperCase()}] ${normalizedMessage}`;
         this.logs.push(line);
         return {

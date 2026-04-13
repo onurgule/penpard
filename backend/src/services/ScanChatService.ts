@@ -1,6 +1,6 @@
 import { getVulnerabilitiesByScan, saveChatMessage } from '../db/init';
 import type { GenerationRequest, GenerationResponse } from './LLMProviderService';
-import { llmProvider } from './LLMProviderService';
+import { llmRuntime } from './llm/LlmRuntime';
 import type { ScanRuntimeService } from './runtime/ScanRuntimeService';
 import { scanRuntimeService } from './runtime/ScanRuntimeService';
 import { logger } from '../utils/logger';
@@ -10,6 +10,7 @@ export interface ScanChatContext {
     target: string;
     type: string;
     status: string;
+    user_id?: number;
     created_at: string;
     completed_at?: string | null;
 }
@@ -23,7 +24,7 @@ export interface ScanChatResult {
 
 interface ScanChatServiceOptions {
     runtimeService?: Pick<ScanRuntimeService, 'getActiveAgent'>;
-    generate?: (request: GenerationRequest, context?: string) => Promise<GenerationResponse>;
+    generate?: (request: GenerationRequest, metadata: { scanId: string; context: string; userId?: number }) => Promise<GenerationResponse>;
     persistChatMessage?: (scanId: string, role: 'human' | 'assistant', content: string) => void;
     loadFindings?: (scanId: string) => any[];
 }
@@ -41,13 +42,18 @@ export class ScanChatServiceError extends Error {
 
 export class ScanChatService {
     private readonly runtimeService: Pick<ScanRuntimeService, 'getActiveAgent'>;
-    private readonly generate: (request: GenerationRequest, context?: string) => Promise<GenerationResponse>;
+    private readonly generate: (request: GenerationRequest, metadata: { scanId: string; context: string; userId?: number }) => Promise<GenerationResponse>;
     private readonly persistChatMessage: (scanId: string, role: 'human' | 'assistant', content: string) => void;
     private readonly loadFindings: (scanId: string) => any[];
 
     constructor(options: ScanChatServiceOptions = {}) {
         this.runtimeService = options.runtimeService || scanRuntimeService;
-        this.generate = options.generate || ((request, context) => llmProvider.generate(request, context));
+        this.generate = options.generate || ((request, metadata) => llmRuntime.generate(request, {
+            scanId: metadata.scanId,
+            callSite: 'scan_post_chat',
+            context: metadata.context,
+            ...(typeof metadata.userId === 'number' ? { userId: metadata.userId } : {}),
+        }));
         this.persistChatMessage = options.persistChatMessage || saveChatMessage;
         this.loadFindings = options.loadFindings || getVulnerabilitiesByScan;
     }
@@ -69,10 +75,15 @@ export class ScanChatService {
         const systemPrompt = buildPostScanChatSystemPrompt(scan, vulnerabilities);
 
         try {
+            const metadata = {
+                scanId: scan.id,
+                context: 'scan-post-chat',
+                ...(typeof scan.user_id === 'number' ? { userId: scan.user_id } : {}),
+            };
             const response = await this.generate({
                 systemPrompt,
                 userPrompt: command,
-            }, 'scan-post-chat');
+            }, metadata);
 
             this.persistChatMessage(scan.id, 'assistant', response.text);
 

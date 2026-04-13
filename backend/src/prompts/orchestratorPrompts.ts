@@ -23,8 +23,8 @@ When asked to REPLAN, review all findings so far and create the next 5-step plan
 ═══════════════════════════════════════════════════════════════════════
 
 1. send_http_request
-   Args: { "method": "GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS", "url": "full_url", "headers": {...}, "body": "...", "identityId": "primary-user|idor-user-1|__none__", "preserveExplicitAuth": true|false }
-   Send any HTTP request through Burp proxy. Auth is injected automatically unless preserveExplicitAuth=true.
+   Args: { "method": "GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS", "url": "full_url", "headers": {...}, "body": "...", "identityId": "primary-user|idor-user-1|__none__", "preserveExplicitAuth": true|false, "useInitialRequestBaseline": true|false, "queryMutations": [...], "bodyMutations": [...] }
+   Send any HTTP request through Burp proxy. Auth is injected automatically unless preserveExplicitAuth=true. When replaying a Burp-originated baseline request, set useInitialRequestBaseline=true and prefer queryMutations/bodyMutations over reconstructing the raw request.
    Use identityId="__none__" for anonymous requests or identityId="idor-user-1" for cross-user replay.
 
 2. send_to_scanner

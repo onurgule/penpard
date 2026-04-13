@@ -9,6 +9,7 @@ export async function analyzeSource(
     scanId: string,
     sourcePath: string,
     mode: SourceAnalysisMode,
+    userId?: number,
 ): Promise<SourceAnalysisResult> {
     if (!fs.existsSync(sourcePath)) {
         throw new Error(`Source path does not exist: ${sourcePath}`);
@@ -32,10 +33,10 @@ export async function analyzeSource(
 
     switch (mode) {
         case SourceAnalysisMode.VERSION_AWARE:
-            result = await analyzeVersionAware(sourcePath);
+            result = await analyzeVersionAware(sourcePath, userId);
             break;
         case SourceAnalysisMode.FULL_SOURCE_AWARE:
-            result = await analyzeFullSource(sourcePath);
+            result = await analyzeFullSource(sourcePath, userId);
             break;
         default:
             throw new Error(`Unknown source analysis mode: ${mode}`);

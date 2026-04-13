@@ -141,3 +141,29 @@ test('report routes enforce retry state guards', async () => {
     const payload = retryResponse.body as any;
     assert.match(payload.message, /failed exports/i);
 });
+
+test('report routes can force regeneration into a fresh completed export job', async () => {
+    const scanId = await createCompletedScanFixture('force-regenerate');
+    const app = createApp();
+    const token = generateToken(1);
+
+    const firstResponse = await request(app)
+        .post(`/api/reports/${scanId}/exports`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ format: 'pdf', enrichmentMode: 'deterministic' });
+    assert.equal(firstResponse.status, 202);
+    const firstJob = firstResponse.body as any;
+    const firstCompleted = await waitForExport(app, token, scanId, firstJob.export.id);
+    assert.equal(firstCompleted.status, 'completed');
+
+    const regenerateResponse = await request(app)
+        .post(`/api/reports/${scanId}/exports`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ format: 'pdf', enrichmentMode: 'deterministic', forceRegenerate: true });
+    assert.equal(regenerateResponse.status, 202);
+    const regeneratedJob = regenerateResponse.body as any;
+
+    assert.notEqual(regeneratedJob.export.id, firstJob.export.id);
+    const regeneratedCompleted = await waitForExport(app, token, scanId, regeneratedJob.export.id);
+    assert.equal(regeneratedCompleted.status, 'completed');
+});

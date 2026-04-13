@@ -30,6 +30,7 @@ import { AuthInjector } from './AuthInjector';
 import { SessionHealthMonitor } from './SessionHealthMonitor';
 import { logger } from '../../utils/logger';
 import { getHeaderValue, hasHeaderKey, parseRawBurpRequest } from '../burp-request';
+import { buildPromptIdentityLabel } from '../prompt-data-minimization';
 
 /** Minimal Burp MCP client interface. */
 interface BurpClient {
@@ -622,7 +623,15 @@ export class AuthStateManager {
             block += 'If you need to test without auth, use identityId="__none__".\n';
             block += 'If you need to test as a different user, use identityId="idor-user-1".\n\n';
 
-            block += `Active identities: ${identities.map(i => `${i.id} (${i.label})`).join(', ')}\n`;
+            block += `Active identities: ${identities.map((identity) => {
+                const promptLabel = buildPromptIdentityLabel({
+                    identityId: identity.id,
+                    label: identity.label,
+                    username: identity.username,
+                    email: identity.email,
+                });
+                return `${identity.id} (${promptLabel})`;
+            }).join(', ')}\n`;
             block += `Cookies: ${this.getTotalCookies()} | Tokens: ${this.getTotalTokens()}\n`;
 
             if (jar && jar.size > 0) {

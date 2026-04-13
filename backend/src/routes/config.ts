@@ -17,7 +17,7 @@ router.get('/llm', authenticateToken, async (req: AuthRequest, res: Response) =>
     try {
         const userId = req.user?.id || 1;
         await githubIntegration.getResolvedConnectionStatus(userId);
-        const configs = llmProvider.getAllConfigs(userId);
+        const configs = llmProvider.getAllConfigSummaries(userId);
         res.json({ configs });
     } catch (error: any) {
         logger.error('Failed to get LLM configs', { error: error.message });
@@ -33,7 +33,9 @@ router.post('/llm', authenticateToken, (req: AuthRequest, res: Response) => {
         res.json({ message: 'Configuration saved' });
     } catch (error: any) {
         logger.error('Failed to save LLM config', { error: error.message });
-        const statusCode = error?.message?.includes('GitHub is not connected') ? 400 : 500;
+        const statusCode = /GitHub is not connected|Unsupported LLM provider|Model is required|settings_json/i.test(error?.message || '')
+            ? 400
+            : 500;
         res.status(statusCode).json({ error: true, message: error.message || 'Failed to save settings' });
     }
 });
@@ -69,7 +71,7 @@ router.post('/llm/test', authenticateToken, async (req: AuthRequest, res: Respon
 // List servers
 router.get('/mcp', authenticateToken, (req: AuthRequest, res: Response) => {
     try {
-        const servers = mcpManager.getAllServers();
+        const servers = mcpManager.getAllServerSummaries();
         res.json({ servers });
     } catch (error: any) {
         res.status(500).json({ error: true, message: 'Failed to list servers' });

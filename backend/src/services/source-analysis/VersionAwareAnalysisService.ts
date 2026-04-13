@@ -1,20 +1,21 @@
 import { SourceAnalysisMode, SourceAnalysisResult, TestingHint } from './SourceAnalysisMode';
 import { extractDependencies, detectFramework, detectTechnologyStack } from './utils/dependency-inventory';
 import { mapCVEs } from './utils/cve-mapping';
-import { llmProvider } from '../LLMProviderService';
+import { llmRuntime } from '../llm/LlmRuntime';
 import { logger } from '../../utils/logger';
 
 async function generateTestingHints(
     framework: string,
     stack: string[],
     depsWithCves: { name: string; version: string; cveCount: number }[],
+    userId?: number,
 ): Promise<TestingHint[]> {
     const riskyDeps = depsWithCves.filter(d => d.cveCount > 0)
         .map(d => `${d.name}@${d.version} (${d.cveCount} CVEs)`)
         .join(', ');
 
     try {
-        const response = await llmProvider.generate({
+        const response = await llmRuntime.generate({
             systemPrompt: 'You are a penetration testing advisor. Output ONLY valid JSON, no markdown.',
             userPrompt: `Generate testing hints for a ${framework} application.
 
@@ -30,7 +31,11 @@ Provide 5-10 concise testing hints based on:
 
 Return JSON array: [{"category":"framework|auth|config|dependency|endpoint","hint":"..."}]
 Return ONLY the JSON array.`,
-        }, 'source-analysis-testing-hints');
+        }, {
+            userId,
+            callSite: 'source_analysis',
+            context: 'source-analysis-testing-hints',
+        });
 
         const text = response.text.trim();
         const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -51,7 +56,7 @@ Return ONLY the JSON array.`,
     ];
 }
 
-export async function analyzeVersionAware(sourcePath: string): Promise<SourceAnalysisResult> {
+export async function analyzeVersionAware(sourcePath: string, userId?: number): Promise<SourceAnalysisResult> {
     logger.info(`Starting Version Aware analysis: ${sourcePath}`);
 
     const dependencies = await extractDependencies(sourcePath);
@@ -68,7 +73,7 @@ export async function analyzeVersionAware(sourcePath: string): Promise<SourceAna
         cveCount: cves.filter(c => c.packageName === d.name).length,
     }));
 
-    const testingHints = await generateTestingHints(framework, technologyStack, depCveCounts);
+    const testingHints = await generateTestingHints(framework, technologyStack, depCveCounts, userId);
 
     logger.info(`Version Aware analysis complete: ${dependencies.length} deps, ${cves.length} CVEs, ${testingHints.length} hints`);
 

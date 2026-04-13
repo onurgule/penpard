@@ -1,4 +1,4 @@
-import { llmQueue } from '../../services/LLMQueue';
+import { llmRuntime } from '../../services/llm/LlmRuntime';
 import {
     buildConversationContextBlock,
     buildDirectExecutionUserPrompt,
@@ -19,6 +19,8 @@ interface PlannerDependencies {
 }
 
 interface SharedPlannerInput {
+    scanId: string;
+    userId?: number;
     systemPrompt: string;
     conversationHistory: ConversationMessage[];
     rateLimitPauseUntil: Date | null;
@@ -86,22 +88,32 @@ export class OrchestratorPlanner {
 
             const recentMessages = input.conversationHistory.slice(-14);
             const contextBlock = buildConversationContextBlock(recentMessages.slice(0, -1));
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: input.systemPrompt,
                 userPrompt: `${contextBlock}${planPrompt}\n\nIMPORTANT: Respond with ONLY a valid JSON object. No markdown code fences, no explanation, no text before or after the JSON.`,
+            }, {
+                scanId: input.scanId,
+                userId: input.userId,
+                callSite: 'plan_creation',
+                context: 'orchestrator-plan-creation',
             });
 
             input.conversationHistory.push({ role: 'assistant', content: response.text });
 
             let parsed = this.deps.parser.extractJsonObject(response.text);
             if (!parsed) {
-                this.deps.log?.('warn', `Plan JSON parse failed. LLM response (first 300 chars): ${response.text.substring(0, 300)}`);
+                this.deps.log?.('warn', `Plan JSON parse failed for response (${response.text.length} chars)`);
 
                 try {
                     this.deps.log?.('system', '🔄 Retrying plan creation — asking LLM to return valid JSON...');
-                    const retryResponse = await llmQueue.enqueue({
+                    const retryResponse = await llmRuntime.generate({
                         systemPrompt: 'You are a JSON repair assistant. The user will give you text that should be JSON. Extract or fix the JSON and return ONLY a valid JSON object. No markdown, no explanation, no code fences.',
                         userPrompt: `Fix or extract the JSON from this text. Return ONLY valid JSON:\n\n${response.text.substring(0, 2000)}`,
+                    }, {
+                        scanId: input.scanId,
+                        userId: input.userId,
+                        callSite: 'plan_json_repair',
+                        context: 'orchestrator-plan-json-repair',
                     });
                     parsed = this.deps.parser.extractJsonObject(retryResponse.text);
                 } catch {
@@ -172,9 +184,14 @@ export class OrchestratorPlanner {
 
             const recentMessages = input.conversationHistory.slice(-11);
             const contextBlock = buildConversationContextBlock(recentMessages.slice(0, -1));
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: input.systemPrompt,
                 userPrompt: `${contextBlock}${stepPrompt}\n\nRespond with ONLY a valid JSON object.`,
+            }, {
+                scanId: input.scanId,
+                userId: input.userId,
+                callSite: 'step_execution_reasoning',
+                context: 'orchestrator-step-execution',
             });
 
             input.conversationHistory.push({ role: 'assistant', content: response.text });
@@ -204,9 +221,14 @@ export class OrchestratorPlanner {
 
             const recentMessages = input.conversationHistory.slice(-11);
             const contextBlock = buildConversationContextBlock(recentMessages.slice(0, -1));
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: input.systemPrompt,
                 userPrompt: `${contextBlock}${replanPrompt}\n\nRespond with ONLY a valid JSON object.`,
+            }, {
+                scanId: input.scanId,
+                userId: input.userId,
+                callSite: 'replan_check',
+                context: 'orchestrator-replan-check',
             });
 
             input.conversationHistory.push({ role: 'assistant', content: response.text });
@@ -232,9 +254,14 @@ export class OrchestratorPlanner {
 
             const recentMessages = input.conversationHistory.slice(-12);
             const contextBlock = buildConversationContextBlock(recentMessages);
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: input.systemPrompt,
                 userPrompt: `${contextBlock}${buildDirectExecutionUserPrompt(input.round, input.maxRounds)}`,
+            }, {
+                scanId: input.scanId,
+                userId: input.userId,
+                callSite: 'step_execution_reasoning',
+                context: 'orchestrator-direct-execution',
             });
 
             input.conversationHistory.push({ role: 'assistant', content: response.text });

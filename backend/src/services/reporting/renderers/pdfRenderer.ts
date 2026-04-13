@@ -1,5 +1,5 @@
 import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
-import { writeFileAtomically, formatDisplayDate, safeText, severityRgb } from './shared';
+import { writeFileAtomically, formatDisplayDate, safePdfText, severityRgb } from './shared';
 import type { CanonicalReportModel } from '../types';
 
 const PAGE_WIDTH = 612;
@@ -53,63 +53,63 @@ class PdfWriter {
     public addTitlePage(report: CanonicalReportModel): void {
         this.newPage();
         this.drawHeaderBar(rgb(0.04, 0.52, 0.78));
-        this.page.drawText('PENPARD', {
+        this.drawText('PENPARD', {
             x: MARGIN,
             y: PAGE_HEIGHT - 130,
             size: 30,
             font: this.boldFont,
             color: rgb(0.06, 0.52, 0.84),
         });
-        this.page.drawText('Security Assessment Report', {
+        this.drawText('Security Assessment Report', {
             x: MARGIN,
             y: PAGE_HEIGHT - 165,
             size: 20,
             font: this.boldFont,
             color: rgb(0.1, 0.1, 0.1),
         });
-        this.page.drawText(`Target: ${report.scan.target}`, {
+        this.drawText(`Target: ${report.scan.target}`, {
             x: MARGIN,
             y: PAGE_HEIGHT - 235,
             size: 14,
             font: this.boldFont,
             color: rgb(0.1, 0.1, 0.1),
         });
-        this.page.drawText(`Scan ID: ${report.scan.id}`, {
+        this.drawText(`Scan ID: ${report.scan.id}`, {
             x: MARGIN,
             y: PAGE_HEIGHT - 260,
             size: 12,
             font: this.regularFont,
             color: rgb(0.3, 0.3, 0.3),
         });
-        this.page.drawText(`Started: ${formatDisplayDate(report.scan.createdAt)}`, {
+        this.drawText(`Started: ${formatDisplayDate(report.scan.createdAt)}`, {
             x: MARGIN,
             y: PAGE_HEIGHT - 290,
             size: 12,
             font: this.regularFont,
             color: rgb(0.2, 0.2, 0.2),
         });
-        this.page.drawText(`Completed: ${formatDisplayDate(report.scan.completedAt)}`, {
+        this.drawText(`Completed: ${formatDisplayDate(report.scan.completedAt)}`, {
             x: MARGIN,
             y: PAGE_HEIGHT - 310,
             size: 12,
             font: this.regularFont,
             color: rgb(0.2, 0.2, 0.2),
         });
-        this.page.drawText(`Duration: ${report.scan.duration || 'N/A'}`, {
+        this.drawText(`Duration: ${report.scan.duration || 'N/A'}`, {
             x: MARGIN,
             y: PAGE_HEIGHT - 330,
             size: 12,
             font: this.regularFont,
             color: rgb(0.2, 0.2, 0.2),
         });
-        this.page.drawText(`Overall risk: ${report.summary.riskRating}`, {
+        this.drawText(`Overall risk: ${report.summary.riskRating}`, {
             x: MARGIN,
             y: PAGE_HEIGHT - 360,
             size: 13,
             font: this.boldFont,
             color: rgb(0.78, 0.15, 0.15),
         });
-        this.page.drawText(`Total findings: ${report.summary.totalFindings}`, {
+        this.drawText(`Total findings: ${report.summary.totalFindings}`, {
             x: MARGIN,
             y: PAGE_HEIGHT - 380,
             size: 13,
@@ -137,7 +137,7 @@ class PdfWriter {
             const [r, g, b] = severityRgb(severity as any);
             this.ensureSpace(18);
             this.page.drawRectangle({ x: MARGIN, y: this.y - 4, width: 10, height: 10, color: rgb(r, g, b) });
-            this.page.drawText(`${severity.toUpperCase()}: ${count}`, {
+            this.drawText(`${severity.toUpperCase()}: ${count}`, {
                 x: MARGIN + 18,
                 y: this.y - 1,
                 size: 10,
@@ -159,14 +159,14 @@ class PdfWriter {
         report.findingsSummary.forEach((finding, index) => {
             this.ensureSpace(20);
             const [r, g, b] = severityRgb(finding.severity);
-            this.page.drawText(`${index + 1}.`, {
+            this.drawText(`${index + 1}.`, {
                 x: MARGIN,
                 y: this.y,
                 size: 10,
                 font: this.boldFont,
                 color: rgb(0.05, 0.45, 0.67),
             });
-            this.page.drawText(`${finding.title} [${finding.severity.toUpperCase()}]`, {
+            this.drawText(`${finding.title} [${finding.severity.toUpperCase()}]`, {
                 x: MARGIN + 20,
                 y: this.y,
                 size: 10,
@@ -178,7 +178,7 @@ class PdfWriter {
                 finding.cwe ? `CWE-${finding.cwe}` : null,
             ].filter(Boolean).join(' | ');
             if (metadata) {
-                this.page.drawText(metadata, {
+                this.drawText(metadata, {
                     x: MARGIN + 20,
                     y: this.y - 11,
                     size: 8,
@@ -210,7 +210,7 @@ class PdfWriter {
                 height: 18,
                 color: rgb(r, g, b),
             });
-            this.page.drawText(`${index + 1}. ${finding.title}`, {
+            this.drawText(`${index + 1}. ${finding.title}`, {
                 x: MARGIN + 8,
                 y: this.y - 1,
                 size: 11,
@@ -324,7 +324,7 @@ class PdfWriter {
 
     private writeSectionTitle(title: string): void {
         this.ensureSpace(30);
-        this.page.drawText(title, {
+        this.drawText(title, {
             x: MARGIN,
             y: this.y,
             size: 18,
@@ -336,7 +336,7 @@ class PdfWriter {
 
     private writeLabel(label: string): void {
         this.ensureSpace(18);
-        this.page.drawText(label, {
+        this.drawText(label, {
             x: MARGIN,
             y: this.y,
             size: 11,
@@ -347,10 +347,10 @@ class PdfWriter {
     }
 
     private writeParagraph(text: string, size: number, lineHeight: number, font: PDFFont = this.regularFont): void {
-        const lines = wrapText(safeText(text), font, size, CONTENT_WIDTH);
+        const lines = wrapText(safePdfText(text, font), font, size, CONTENT_WIDTH);
         for (const line of lines) {
             this.ensureSpace(lineHeight + 2);
-            this.page.drawText(line, {
+            this.drawText(line, {
                 x: MARGIN,
                 y: this.y,
                 size,
@@ -362,7 +362,7 @@ class PdfWriter {
     }
 
     private writeCodeBlock(text: string): void {
-        const lines = wrapText(safeText(text), this.monoFont, 8, CONTENT_WIDTH - 16);
+        const lines = wrapText(safePdfText(text, this.monoFont), this.monoFont, 8, CONTENT_WIDTH - 16);
         const visibleLines = lines.slice(0, 28);
         const height = Math.max(visibleLines.length * 10 + 10, 20);
         this.ensureSpace(height + 8);
@@ -375,7 +375,7 @@ class PdfWriter {
         });
         let currentY = this.y - 8;
         visibleLines.forEach((line) => {
-            this.page.drawText(line, {
+            this.drawText(line, {
                 x: MARGIN + 8,
                 y: currentY,
                 size: 8,
@@ -395,6 +395,19 @@ class PdfWriter {
 
     private gap(amount: number): void {
         this.y -= amount;
+    }
+
+    private drawText(
+        text: string,
+        options: {
+            x: number;
+            y: number;
+            size: number;
+            font: PDFFont;
+            color: ReturnType<typeof rgb>;
+        },
+    ): void {
+        this.page.drawText(safePdfText(text, options.font), options);
     }
 }
 

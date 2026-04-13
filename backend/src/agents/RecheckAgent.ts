@@ -5,7 +5,7 @@
  */
 
 import { BurpMCPClient } from '../services/burp-mcp';
-import { llmQueue } from '../services/LLMQueue';
+import { llmRuntime } from '../services/llm/LlmRuntime';
 import { SharedContext, SharedVulnerability } from './SharedContext';
 import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
@@ -191,9 +191,13 @@ export class RecheckAgent {
             const additionalTests = await this.runAdditionalTests(suspected);
 
             // Ask LLM to analyze (use queue for rate limiting)
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: `You are a security expert verifying vulnerability reports. Be thorough but avoid false positives. Only confirm if you have strong evidence.`,
                 userPrompt: `${prompt}\n\nAdditional test results:\n${JSON.stringify(additionalTests, null, 2)}`
+            }, {
+                scanId: this.scanId,
+                callSite: 'step_execution_reasoning',
+                context: 'recheck-agent-verification',
             });
 
             // Parse response

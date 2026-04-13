@@ -1,5 +1,6 @@
 import { AgentReflection, LLMResponse, ToolCall } from './types';
 import type { OrchestratorToolRegistry } from './OrchestratorToolRegistry';
+import { summarizeLlmResponseForLog } from './OrchestratorSafeLogging';
 
 type LogFn = (channel: 'debug' | 'error', message: string) => void;
 
@@ -12,7 +13,7 @@ export class OrchestratorLlmResponseParser {
     ) {}
 
     public parseAgentResponse(text: string): LLMResponse | null {
-        this.log?.('debug', `LLM Response: ${text.substring(0, 300)}...`);
+        this.log?.('debug', `LLM response received (${summarizeLlmResponseForLog(text)})`);
 
         try {
             const jsonObj = this.extractJsonObject(text);

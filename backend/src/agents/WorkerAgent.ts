@@ -4,7 +4,7 @@
  */
 
 import { BurpMCPClient } from '../services/burp-mcp';
-import { llmQueue } from '../services/LLMQueue';
+import { llmRuntime } from '../services/llm/LlmRuntime';
 import { SharedContext, DiscoveredEndpoint, SharedVulnerability, AgentMessage } from './SharedContext';
 import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
@@ -252,9 +252,13 @@ Now execute your task and respond in the specified JSON format.`;
 
     private async askLLM(prompt: string): Promise<any> {
         try {
-            const response = await llmQueue.enqueue({
+            const response = await llmRuntime.generate({
                 systemPrompt: `You are a specialized ${this.role} agent in a security testing team. Be precise and output valid JSON.`,
                 userPrompt: prompt
+            }, {
+                scanId: this.context.scanId,
+                callSite: 'step_execution_reasoning',
+                context: `worker-agent-${this.role}`,
             });
 
             // Parse JSON from response

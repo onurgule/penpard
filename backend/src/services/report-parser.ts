@@ -5,7 +5,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { llmQueue } from './LLMQueue';
+import { llmRuntime } from './llm/LlmRuntime';
 import { logger } from '../utils/logger';
 import { saveAnalysisLog } from '../db/init';
 
@@ -173,7 +173,7 @@ function parseJSONResponse(text: string): any {
 
 export class ReportParserService {
 
-    async parseReport(filePath: string, analysisId: string): Promise<ParsedReport> {
+    async parseReport(filePath: string, analysisId: string, userId?: number): Promise<ParsedReport> {
         const ext = path.extname(filePath).toLowerCase();
 
         // Step 1: Extract raw text
@@ -210,9 +210,14 @@ export class ReportParserService {
                 : '';
 
             try {
-                const response = await llmQueue.enqueue({
+                const response = await llmRuntime.generate({
                     systemPrompt: EXTRACTION_PROMPT,
                     userPrompt: `${chunks[i]}${chunkInstruction}`,
+                }, {
+                    analysisId,
+                    userId,
+                    callSite: 'report_parser_extraction',
+                    context: 'report-parser-extraction',
                 });
 
                 const parsed = parseJSONResponse(response.text);
