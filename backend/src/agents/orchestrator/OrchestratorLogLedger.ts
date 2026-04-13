@@ -1,9 +1,13 @@
+import fs from 'fs';
+import path from 'path';
+import { saveScanLogs } from '../../db/init';
 import { formatLogTimestamp } from '../../utils/logger';
 
 type TimestampFn = () => string;
 
 export interface OrchestratorLogLedgerOptions {
     timestamp?: TimestampFn;
+    scanId?: string;
 }
 
 export interface OrchestratorLogEntry {
@@ -65,9 +69,12 @@ export function normalizeVisibleLogMessage(message: string): string {
 export class OrchestratorLogLedger {
     private readonly logs: string[] = [];
     private readonly timestamp: TimestampFn;
+    private readonly scanId: string | null;
+    private flushedCount = 0;
 
     constructor(options: OrchestratorLogLedgerOptions = {}) {
         this.timestamp = options.timestamp ?? formatLogTimestamp;
+        this.scanId = options.scanId || null;
     }
 
     public append(type: string, message: string): OrchestratorLogEntry {
@@ -87,5 +94,24 @@ export class OrchestratorLogLedger {
 
     public get count(): number {
         return this.logs.length;
+    }
+
+    public flushToDB(): number {
+        if (!this.scanId) return 0;
+        const pending = this.logs.slice(this.flushedCount);
+        if (pending.length === 0) return 0;
+        saveScanLogs(this.scanId, pending);
+        this.flushedCount = this.logs.length;
+        return pending.length;
+    }
+
+    public get unflushedCount(): number {
+        return Math.max(this.logs.length - this.flushedCount, 0);
+    }
+
+    public persistToFile(targetPath: string): void {
+        const directory = path.dirname(targetPath);
+        fs.mkdirSync(directory, { recursive: true });
+        fs.writeFileSync(targetPath, this.logs.join('\n'));
     }
 }

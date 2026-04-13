@@ -15,8 +15,8 @@ let logTokenStmt: any = null;
 function getLogTokenStmt() {
     if (!logTokenStmt) {
         logTokenStmt = db.prepare(`
-            INSERT INTO token_usage (provider, model, input_tokens, output_tokens, total_tokens, scan_id, context)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO token_usage (provider, model, input_tokens, output_tokens, total_tokens, scan_id, report_export_id, context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `);
     }
     return logTokenStmt;
@@ -43,6 +43,7 @@ export interface GenerationRequest {
     systemPrompt: string;
     userPrompt: string;
     images?: GenerationImage[];  // Optional images for vision-capable models
+    temperature?: number;
 }
 
 export interface GenerationResponse {
@@ -51,6 +52,12 @@ export interface GenerationResponse {
         input_tokens: number;
         output_tokens: number;
     };
+}
+
+export interface GenerationMetadata {
+    scanId?: string;
+    reportExportId?: string;
+    context?: string;
 }
 
 class LLMProviderService {
@@ -170,9 +177,9 @@ class LLMProviderService {
     /**
      * Primary generation method used by agents.
      */
-    public async generate(request: GenerationRequest, context?: string): Promise<GenerationResponse> {
+    public async generate(request: GenerationRequest, context?: string, metadata: GenerationMetadata = {}): Promise<GenerationResponse> {
         const config = this.getActiveConfig(GITHUB_RUNTIME_USER_ID);
-        return this.generateText(config, request, context);
+        return this.generateText(config, request, context, metadata);
     }
 
     /**
@@ -230,7 +237,14 @@ class LLMProviderService {
     /**
      * Log token usage to DB for tracking/analytics.
      */
-    private logTokenUsage(provider: string, model: string, usage?: { input_tokens: number; output_tokens: number }, scanId?: string, context?: string) {
+    private logTokenUsage(
+        provider: string,
+        model: string,
+        usage?: { input_tokens: number; output_tokens: number },
+        scanId?: string,
+        context?: string,
+        reportExportId?: string,
+    ) {
         if (!usage) return;
         try {
             const total = usage.input_tokens + usage.output_tokens;
@@ -241,6 +255,7 @@ class LLMProviderService {
                 usage.output_tokens,
                 total,
                 scanId || null,
+                reportExportId || null,
                 context || null
             );
         } catch (err: any) {
@@ -248,9 +263,16 @@ class LLMProviderService {
         }
     }
 
-    private async generateText(config: LLMConfig, req: GenerationRequest, context?: string): Promise<GenerationResponse> {
+    private async generateText(
+        config: LLMConfig,
+        req: GenerationRequest,
+        context?: string,
+        metadata: GenerationMetadata = {},
+    ): Promise<GenerationResponse> {
         const settings = JSON.parse(config.settings_json || '{}');
-        const temperature = settings.temperature || 0.7;
+        const temperature = typeof req.temperature === 'number'
+            ? req.temperature
+            : (settings.temperature ?? 0.7);
 
         logger.info(`Generating text with ${config.provider} (${config.model})`);
 
@@ -280,7 +302,14 @@ class LLMProviderService {
         }
 
         // Log token usage after every successful call
-        this.logTokenUsage(config.provider, config.model, result.usage, undefined, context);
+        this.logTokenUsage(
+            config.provider,
+            config.model,
+            result.usage,
+            metadata.scanId,
+            metadata.context || context,
+            metadata.reportExportId,
+        );
 
         return result;
     }

@@ -104,6 +104,7 @@ export class ActivityMonitorService {
 
         // Start polling
         this.pollInterval = setInterval(() => this.poll(), this.pollIntervalMs);
+        this.pollInterval.unref?.();
         
         // Initial poll
         this.poll();

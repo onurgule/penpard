@@ -149,6 +149,45 @@ export async function initDatabase(): Promise<void> {
       FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
     );
 
+    -- Canonical deterministic report snapshots
+    CREATE TABLE IF NOT EXISTS report_snapshots (
+      id TEXT PRIMARY KEY,
+      scan_id TEXT NOT NULL,
+      fingerprint TEXT NOT NULL,
+      report_json TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(scan_id, fingerprint),
+      FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
+    );
+
+    -- Persisted export jobs for report artifacts
+    CREATE TABLE IF NOT EXISTS report_exports (
+      id TEXT PRIMARY KEY,
+      scan_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      snapshot_fingerprint TEXT NOT NULL,
+      format TEXT NOT NULL CHECK(format IN ('pdf', 'docx', 'pptx')),
+      enrichment_mode TEXT NOT NULL CHECK(enrichment_mode IN ('deterministic', 'llm')),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed', 'canceled')),
+      stage TEXT NOT NULL DEFAULT 'queued'
+        CHECK(stage IN ('idle', 'queued', 'collecting_data', 'composing_report', 'enriching_with_llm', 'rendering_export', 'completed', 'failed', 'canceled')),
+      llm_status TEXT NOT NULL DEFAULT 'not_requested'
+        CHECK(llm_status IN ('not_requested', 'queued', 'running', 'completed', 'failed', 'skipped')),
+      artifact_path TEXT,
+      resolved_report_json TEXT,
+      error_message TEXT,
+      llm_error_message TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      started_at DATETIME,
+      completed_at DATETIME,
+      canceled_at DATETIME,
+      FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE,
+      FOREIGN KEY (snapshot_id) REFERENCES report_snapshots(id) ON DELETE CASCADE
+    );
+
     -- Token usage tracking table
     CREATE TABLE IF NOT EXISTS token_usage (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +197,7 @@ export async function initDatabase(): Promise<void> {
       output_tokens INTEGER NOT NULL DEFAULT 0,
       total_tokens INTEGER NOT NULL DEFAULT 0,
       scan_id TEXT,
+      report_export_id TEXT,
       context TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -186,6 +226,11 @@ export async function initDatabase(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_scans_status ON scans(status);
     CREATE INDEX IF NOT EXISTS idx_vulnerabilities_scan_id ON vulnerabilities(scan_id);
     CREATE INDEX IF NOT EXISTS idx_whitelists_user_id ON whitelists(user_id);
+    CREATE INDEX IF NOT EXISTS idx_report_snapshots_scan_id ON report_snapshots(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_report_snapshots_fingerprint ON report_snapshots(fingerprint);
+    CREATE INDEX IF NOT EXISTS idx_report_exports_scan_id ON report_exports(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_report_exports_status_stage ON report_exports(status, stage);
+    CREATE INDEX IF NOT EXISTS idx_report_exports_snapshot_format ON report_exports(snapshot_id, format, enrichment_mode);
     CREATE INDEX IF NOT EXISTS idx_token_usage_created_at ON token_usage(created_at);
     CREATE INDEX IF NOT EXISTS idx_token_usage_provider_model ON token_usage(provider, model);
     CREATE INDEX IF NOT EXISTS idx_scan_logs_scan_id ON scan_logs(scan_id);
@@ -502,6 +547,13 @@ if (!scanCols.some((c) => c.name === 'runtime_checkpoint_json')) {
   logger.info('Added scans.runtime_checkpoint_json column');
 }
 
+  const tokenUsageCols = db.prepare('PRAGMA table_info(token_usage)').all() as { name: string }[];
+  if (!tokenUsageCols.some((c) => c.name === 'report_export_id')) {
+    db.exec('ALTER TABLE token_usage ADD COLUMN report_export_id TEXT');
+    logger.info('Added token_usage.report_export_id column');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_token_usage_report_export_id ON token_usage(report_export_id)');
+
   // Migration: browser_sessions.label (user-friendly session names for multi-session testing)
   const browserCols = db.prepare('PRAGMA table_info(browser_sessions)').all() as { name: string }[];
   if (!browserCols.some((c) => c.name === 'label')) {
@@ -611,6 +663,125 @@ export const getSourceAnalysisResult = (scanId: string): any | null => {
   const row = db.prepare('SELECT source_analysis_result_json FROM scans WHERE id = ?').get(scanId) as any;
   if (!row?.source_analysis_result_json) return null;
   try { return JSON.parse(row.source_analysis_result_json); } catch { return null; }
+};
+
+export const getReportSnapshotByFingerprint = (scanId: string, fingerprint: string) => {
+  return db.prepare('SELECT * FROM report_snapshots WHERE scan_id = ? AND fingerprint = ?').get(scanId, fingerprint) as any;
+};
+
+export const getReportSnapshot = (snapshotId: string) => {
+  return db.prepare('SELECT * FROM report_snapshots WHERE id = ?').get(snapshotId) as any;
+};
+
+export const upsertReportSnapshot = (data: {
+  id: string;
+  scanId: string;
+  fingerprint: string;
+  reportJson: string;
+}) => {
+  const existing = getReportSnapshotByFingerprint(data.scanId, data.fingerprint);
+  if (existing) {
+    db.prepare(`
+      UPDATE report_snapshots
+      SET report_json = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(data.reportJson, existing.id);
+    return getReportSnapshot(existing.id);
+  }
+
+  db.prepare(`
+    INSERT INTO report_snapshots (id, scan_id, fingerprint, report_json)
+    VALUES (?, ?, ?, ?)
+  `).run(data.id, data.scanId, data.fingerprint, data.reportJson);
+  return getReportSnapshot(data.id);
+};
+
+export const listReportExportsByScan = (scanId: string) => {
+  return db.prepare(`
+    SELECT * FROM report_exports
+    WHERE scan_id = ?
+    ORDER BY created_at DESC
+  `).all(scanId) as any[];
+};
+
+export const getReportExport = (exportId: string) => {
+  return db.prepare('SELECT * FROM report_exports WHERE id = ?').get(exportId) as any;
+};
+
+export const createReportExport = (data: {
+  id: string;
+  scanId: string;
+  snapshotId: string;
+  snapshotFingerprint: string;
+  format: 'pdf' | 'docx' | 'pptx';
+  enrichmentMode: 'deterministic' | 'llm';
+  llmStatus?: string;
+}) => {
+  db.prepare(`
+    INSERT INTO report_exports (
+      id, scan_id, snapshot_id, snapshot_fingerprint, format, enrichment_mode, status, stage, llm_status
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 'queued', ?)
+  `).run(
+    data.id,
+    data.scanId,
+    data.snapshotId,
+    data.snapshotFingerprint,
+    data.format,
+    data.enrichmentMode,
+    data.llmStatus || (data.enrichmentMode === 'llm' ? 'queued' : 'skipped'),
+  );
+  return getReportExport(data.id);
+};
+
+export const updateReportExport = (exportId: string, updates: Record<string, any>) => {
+  const normalized = { ...updates };
+  delete normalized.id;
+  if (Object.keys(normalized).length === 0) {
+    return getReportExport(exportId);
+  }
+
+  normalized.updated_at = normalized.updated_at || new Date().toISOString();
+
+  const setClauses = Object.keys(normalized).map((key) => `${key} = ?`).join(', ');
+  const values = Object.values(normalized);
+  db.prepare(`UPDATE report_exports SET ${setClauses} WHERE id = ?`).run(...values, exportId);
+  return getReportExport(exportId);
+};
+
+export const getReusableReportExport = (data: {
+  scanId: string;
+  snapshotId: string;
+  format: 'pdf' | 'docx' | 'pptx';
+  enrichmentMode: 'deterministic' | 'llm';
+}) => {
+  return db.prepare(`
+    SELECT *
+    FROM report_exports
+    WHERE scan_id = ?
+      AND snapshot_id = ?
+      AND format = ?
+      AND enrichment_mode = ?
+      AND status IN ('pending', 'running', 'completed')
+    ORDER BY
+      CASE status
+        WHEN 'running' THEN 0
+        WHEN 'pending' THEN 1
+        WHEN 'completed' THEN 2
+        ELSE 3
+      END,
+      created_at DESC
+    LIMIT 1
+  `).get(data.scanId, data.snapshotId, data.format, data.enrichmentMode) as any;
+};
+
+export const listRecoverableReportExports = () => {
+  return db.prepare(`
+    SELECT *
+    FROM report_exports
+    WHERE status IN ('pending', 'running')
+      AND stage NOT IN ('completed', 'failed', 'canceled')
+    ORDER BY created_at ASC
+  `).all() as any[];
 };
 
 /** Permanently delete scans by id; only deletes rows where user_id matches (CASCADE removes related data). */
@@ -1012,7 +1183,7 @@ export const deleteClosedBrowserSessions = (userId: number) => {
 /** All tables that must exist for the backend to function correctly. */
 const REQUIRED_TABLES = [
   'users', 'whitelists', 'llm_config', 'mcp_servers', 'settings',
-  'scans', 'vulnerabilities', 'reports', 'token_usage', 'scan_logs',
+  'scans', 'vulnerabilities', 'reports', 'report_snapshots', 'report_exports', 'token_usage', 'scan_logs',
   'scan_chat_messages', 'report_analyses', 'analysis_findings', 'analysis_logs',
   'mindset_ttps', 'mindset_profile', 'ttp_test_playbooks',
   'presence_scan_runs', 'presence_scan_targets', 'presence_scan_logs', 'presence_scan_run_ttps',
