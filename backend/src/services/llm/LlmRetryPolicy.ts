@@ -1,9 +1,6 @@
 import type { LlmExecutionError, LlmFailureCategory, LlmRetryDecision, ResolvedLlmCallOptions } from './LlmRuntimeTypes';
 
 const RETRYABLE_FAILURES = new Set<LlmFailureCategory>([
-    'provider_call_timeout',
-    'provider_first_event_timeout',
-    'sdk_session_timeout',
     'transient_provider_error',
 ]);
 

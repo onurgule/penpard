@@ -6,7 +6,7 @@ import { llmProvider } from '../src/services/LLMProviderService';
 import { LlmExecutionError } from '../src/services/llm/LlmRuntimeTypes';
 import { logger } from '../src/utils/logger';
 
-function makeAttemptResult(text: string) {
+function makeAttemptResult(text: string, overrides: Record<string, unknown> = {}) {
     return {
         text,
         provider: 'github_copilot',
@@ -21,13 +21,25 @@ function makeAttemptResult(text: string) {
         diagnostics: {
             streamingStarted: true,
             anyEventReceived: true,
+            partialOutputReceived: text.length > 0,
             assistantMessageReceived: true,
             idleReceived: true,
+            finalizationReceived: true,
             firstEventAtMs: 1,
-            idleAtMs: 2,
+            firstProgressAtMs: 1,
+            partialOutputAtMs: 1,
+            lastEventAtMs: 2,
+            lastProgressAtMs: 2,
+            idleAtMs: 3,
+            finalizationAtMs: 3,
             finalContentLength: text.length,
+            progressEventCount: 2,
+            attemptPhase: 'completed',
+            completionSignal: 'session_idle',
+            livenessCategory: null,
             warningCategory: null,
             rawProviderError: null,
+            ...overrides,
         },
     };
 }
@@ -57,11 +69,10 @@ test('LLM runtime retries transient failures and succeeds on a later attempt', a
         }, {
             scanId: 'scan-runtime-retry',
             callSite: 'plan_creation',
-            attemptTimeoutMs: 50,
             retryBudgetMs: 4_000,
             maxAttempts: 2,
             queueWaitTimeoutMs: null,
-            queueExecutionTimeoutMs: 5_000,
+            executionWatchdogMs: 5_000,
         });
 
         assert.equal(response.text, 'recovered');
@@ -82,6 +93,26 @@ test('LLM runtime upgrades exhausted retry windows to retry_budget_exhausted', a
             message: 'upstream timeout',
             rawError: 'upstream timeout',
             retryable: true,
+            attemptPhase: 'awaiting_first_progress',
+            diagnostics: makeAttemptResult('', {
+                anyEventReceived: true,
+                partialOutputReceived: false,
+                assistantMessageReceived: false,
+                idleReceived: false,
+                finalizationReceived: false,
+                firstEventAtMs: 5,
+                firstProgressAtMs: null,
+                partialOutputAtMs: null,
+                lastEventAtMs: 5,
+                lastProgressAtMs: null,
+                idleAtMs: null,
+                finalizationAtMs: null,
+                finalContentLength: 0,
+                progressEventCount: 0,
+                attemptPhase: 'awaiting_first_progress',
+                completionSignal: null,
+                rawProviderError: 'upstream timeout',
+            }).diagnostics,
         });
     };
 
@@ -93,15 +124,15 @@ test('LLM runtime upgrades exhausted retry windows to retry_budget_exhausted', a
             }, {
                 scanId: 'scan-runtime-budget',
                 callSite: 'plan_creation',
-                attemptTimeoutMs: 10,
                 retryBudgetMs: 10,
                 maxAttempts: 2,
                 queueWaitTimeoutMs: null,
-                queueExecutionTimeoutMs: 5_000,
+                executionWatchdogMs: 5_000,
             }),
             (error: any) => {
                 assert.ok(error instanceof LlmExecutionError);
                 assert.equal(error.failureCategory, 'retry_budget_exhausted');
+                assert.equal(error.livenessCategory, 'retry_budget_exhausted');
                 return true;
             },
         );
@@ -112,18 +143,76 @@ test('LLM runtime upgrades exhausted retry windows to retry_budget_exhausted', a
     }
 });
 
-test('LLM runtime emits structured failure telemetry with categorized attempts', async () => {
+test('LLM runtime emits started telemetry without the old provider output deadline fields', async () => {
     const originalExecuteAttempt = llmProvider.executeAttempt.bind(llmProvider);
+    const originalInfo = logger.info.bind(logger);
+    const infoCalls: Array<{ message: string; meta: any }> = [];
+
+    (llmProvider as any).executeAttempt = async () => makeAttemptResult('ok');
+    (logger as any).info = (message: string, meta: any) => {
+        infoCalls.push({ message, meta });
+    };
+
+    try {
+        const response = await llmRuntime.generate({
+            systemPrompt: 'system',
+            userPrompt: 'user',
+        }, {
+            scanId: 'scan-runtime-started-log',
+            callSite: 'plan_creation',
+            retryBudgetMs: 4_000,
+            slowFirstProgressWarningMs: 250,
+            finalizationGraceMs: 500,
+            executionWatchdogMs: 8_000,
+            queueWaitTimeoutMs: null,
+            maxAttempts: 1,
+        });
+
+        assert.equal(response.text, 'ok');
+        const started = infoCalls.find((entry) => entry.message === 'llm.call.started');
+        assert.ok(started);
+        assert.equal(started?.meta.slowFirstProgressWarningMs, 250);
+        assert.equal(started?.meta.finalizationGraceMs, 500);
+        assert.equal(started?.meta.executionWatchdogMs, 8_000);
+        assert.ok(!Object.hasOwn(started?.meta || {}, 'firstEventTimeoutMs'));
+        assert.ok(!Object.hasOwn(started?.meta || {}, 'attemptTimeoutMs'));
+        assert.ok(!Object.hasOwn(started?.meta || {}, 'providerIdleTimeoutMs'));
+        assert.ok(!Object.hasOwn(started?.meta || {}, 'queueExecutionTimeoutMs'));
+    } finally {
+        (llmProvider as any).executeAttempt = originalExecuteAttempt;
+        (logger as any).info = originalInfo;
+    }
+});
+
+test('LLM runtime emits structured failure telemetry without fixed-window no-output wording', async () => {
+    const originalExecuteAttempt = llmProvider.executeAttempt.bind(llmProvider);
+    const originalWarn = logger.warn.bind(logger);
     const originalError = logger.error.bind(logger);
+    const warnCalls: Array<{ message: string; meta: any }> = [];
     const errorCalls: Array<{ message: string; meta: any }> = [];
 
     (llmProvider as any).executeAttempt = async () => {
         throw new LlmExecutionError({
-            failureCategory: 'provider_first_event_timeout',
-            message: 'No first event arrived in time.',
-            rawError: 'No first event arrived in time.',
-            retryable: true,
+            failureCategory: 'watchdog_timeout',
+            message: 'LLM execution watchdog expired after 50ms.',
+            rawError: 'LLM execution watchdog expired after 50ms.',
+            retryable: false,
+            attemptPhase: 'streaming',
+            livenessCategory: 'watchdog_timeout',
+            diagnostics: makeAttemptResult('partial', {
+                idleReceived: false,
+                finalizationReceived: false,
+                idleAtMs: null,
+                finalizationAtMs: null,
+                completionSignal: null,
+                attemptPhase: 'streaming',
+                warningCategory: 'slow_first_event',
+                rawProviderError: 'LLM execution watchdog expired after 50ms.',
+            }).diagnostics,
         });
+    };
+    (logger as any).warn = (message: string, meta: any) => {
+        warnCalls.push({ message, meta });
     };
     (logger as any).error = (message: string, meta: any) => {
         errorCalls.push({ message, meta });
@@ -137,26 +226,92 @@ test('LLM runtime emits structured failure telemetry with categorized attempts',
             }, {
                 scanId: 'scan-runtime-failure-log',
                 callSite: 'js_digging_classification',
-                attemptTimeoutMs: 50,
                 retryBudgetMs: 50,
                 maxAttempts: 1,
-                queueExecutionTimeoutMs: 5_000,
+                executionWatchdogMs: 5_000,
             }),
         );
+
+        const failedAttempt = warnCalls.find((entry) => entry.message === 'llm.attempt.failed');
+        assert.ok(failedAttempt);
+        assert.equal(failedAttempt?.meta.failureCategory, 'watchdog_timeout');
+        assert.equal(failedAttempt?.meta.partialOutputReceived, true);
+        assert.equal(failedAttempt?.meta.progressEventCount, 2);
+        assert.equal(failedAttempt?.meta.attemptPhase, 'streaming');
+        assert.equal(failedAttempt?.meta.livenessCategory, 'watchdog_timeout');
+        assert.ok(!(failedAttempt?.meta.rawError || '').includes('no assistant output within'));
 
         const failedCall = errorCalls.find((entry) => entry.message === 'llm.call.failed');
         assert.ok(failedCall);
         assert.equal(failedCall?.meta.callSite, 'js_digging_classification');
-        assert.equal(failedCall?.meta.failureCategory, 'provider_first_event_timeout');
+        assert.equal(failedCall?.meta.failureCategory, 'watchdog_timeout');
+        assert.equal(failedCall?.meta.livenessCategory, 'watchdog_timeout');
         assert.equal(failedCall?.meta.attemptCount, 1);
-        assert.equal(failedCall?.meta.attempts[0].failureCategory, 'provider_first_event_timeout');
+        assert.equal(failedCall?.meta.attempts[0].partialOutputReceived, true);
+        assert.equal(failedCall?.meta.attempts[0].warningCategory, 'slow_first_event');
+        assert.equal(failedCall?.meta.attempts[0].attemptPhase, 'streaming');
+        assert.equal(failedCall?.meta.attempts[0].progressEventCount, 2);
+        assert.ok(!(failedCall?.meta.rawError || '').includes('no assistant output within'));
+        assert.ok(JSON.stringify(failedCall?.meta).includes('watchdog_timeout'));
     } finally {
         (llmProvider as any).executeAttempt = originalExecuteAttempt;
+        (logger as any).warn = originalWarn;
         (logger as any).error = originalError;
     }
 });
 
-test('LLM runtime allows later calls to succeed after an earlier categorized failure', async () => {
+test('LLM runtime preserves provider diagnostics when retry budget is exhausted after meaningful progress', async () => {
+    const originalExecuteAttempt = llmProvider.executeAttempt.bind(llmProvider);
+
+    (llmProvider as any).executeAttempt = async () => {
+        throw new LlmExecutionError({
+            failureCategory: 'transient_provider_error',
+            message: 'provider stream disconnected before finalization',
+            rawError: 'provider stream disconnected before finalization',
+            retryable: true,
+            attemptPhase: 'streaming',
+            diagnostics: makeAttemptResult('partial-response', {
+                idleReceived: false,
+                finalizationReceived: false,
+                idleAtMs: null,
+                finalizationAtMs: null,
+                completionSignal: null,
+                attemptPhase: 'streaming',
+                warningCategory: 'slow_first_event',
+                rawProviderError: 'provider stream disconnected before finalization',
+            }).diagnostics,
+        });
+    };
+
+    try {
+        await assert.rejects(
+            () => llmRuntime.generate({
+                systemPrompt: 'system',
+                userPrompt: 'user',
+            }, {
+                scanId: 'scan-runtime-progress-budget',
+                callSite: 'plan_creation',
+                retryBudgetMs: 50,
+                maxAttempts: 2,
+                queueWaitTimeoutMs: null,
+                executionWatchdogMs: 5_000,
+            }),
+            (error: any) => {
+                assert.ok(error instanceof LlmExecutionError);
+                assert.equal(error.failureCategory, 'retry_budget_exhausted');
+                assert.equal(error.attemptPhase, 'streaming');
+                assert.equal(error.livenessCategory, 'retry_budget_exhausted');
+                assert.equal(error.diagnostics?.partialOutputReceived, true);
+                assert.equal(error.diagnostics?.warningCategory, 'slow_first_event');
+                return true;
+            },
+        );
+    } finally {
+        (llmProvider as any).executeAttempt = originalExecuteAttempt;
+    }
+});
+
+test('LLM runtime allows later calls to succeed after an earlier watchdog timeout', async () => {
     const originalExecuteAttempt = llmProvider.executeAttempt.bind(llmProvider);
     let callCount = 0;
 
@@ -164,10 +319,12 @@ test('LLM runtime allows later calls to succeed after an earlier categorized fai
         callCount += 1;
         if (callCount === 1) {
             throw new LlmExecutionError({
-                failureCategory: 'provider_call_timeout',
-                message: 'Attempt timed out.',
-                rawError: 'Attempt timed out.',
-                retryable: true,
+                failureCategory: 'watchdog_timeout',
+                message: 'LLM execution watchdog expired after 20ms.',
+                rawError: 'LLM execution watchdog expired after 20ms.',
+                retryable: false,
+                attemptPhase: 'awaiting_first_progress',
+                livenessCategory: 'watchdog_timeout',
             });
         }
 
@@ -182,14 +339,13 @@ test('LLM runtime allows later calls to succeed after an earlier categorized fai
             }, {
                 scanId: 'scan-runtime-sequence',
                 callSite: 'step_execution_reasoning',
-                attemptTimeoutMs: 20,
                 retryBudgetMs: 20,
                 maxAttempts: 1,
-                queueExecutionTimeoutMs: 5_000,
+                executionWatchdogMs: 5_000,
             }),
             (error: any) => {
                 assert.ok(error instanceof LlmExecutionError);
-                assert.equal(error.failureCategory, 'provider_call_timeout');
+                assert.equal(error.failureCategory, 'watchdog_timeout');
                 return true;
             },
         );
@@ -200,10 +356,9 @@ test('LLM runtime allows later calls to succeed after an earlier categorized fai
         }, {
             scanId: 'scan-runtime-sequence',
             callSite: 'executive_summary',
-            attemptTimeoutMs: 20,
             retryBudgetMs: 20,
             maxAttempts: 1,
-            queueExecutionTimeoutMs: 5_000,
+            executionWatchdogMs: 5_000,
         });
 
         assert.equal(later.text, 'later-success');
@@ -212,7 +367,7 @@ test('LLM runtime allows later calls to succeed after an earlier categorized fai
     }
 });
 
-test('LLM runtime can disable provider and retry timeouts for long-running calls', async () => {
+test('LLM runtime can disable warning, finalization, and watchdog rails when explicitly requested', async () => {
     const originalExecuteAttempt = llmProvider.executeAttempt.bind(llmProvider);
     const capturedExecutionOptions: any[] = [];
 
@@ -230,18 +385,16 @@ test('LLM runtime can disable provider and retry timeouts for long-running calls
             callSite: 'report_enrichment',
             maxAttempts: 1,
             retryBudgetMs: null,
-            firstEventTimeoutMs: null,
-            attemptTimeoutMs: null,
-            providerIdleTimeoutMs: null,
+            slowFirstProgressWarningMs: null,
+            finalizationGraceMs: null,
             queueWaitTimeoutMs: null,
-            queueExecutionTimeoutMs: null,
+            executionWatchdogMs: null,
         });
 
         assert.equal(response.text, 'long-running-ok');
         assert.equal(capturedExecutionOptions.length, 1);
-        assert.equal(capturedExecutionOptions[0].firstEventTimeoutMs, null);
-        assert.equal(capturedExecutionOptions[0].attemptTimeoutMs, null);
-        assert.equal(capturedExecutionOptions[0].providerIdleTimeoutMs, null);
+        assert.equal(capturedExecutionOptions[0].slowFirstProgressWarningMs, null);
+        assert.equal(capturedExecutionOptions[0].finalizationGraceMs, null);
     } finally {
         (llmProvider as any).executeAttempt = originalExecuteAttempt;
     }
@@ -266,7 +419,7 @@ test('LLM runtime forwards caller userId into provider execution metadata', asyn
             callSite: 'plan_creation',
             maxAttempts: 1,
             retryBudgetMs: 100,
-            queueExecutionTimeoutMs: 5_000,
+            executionWatchdogMs: 5_000,
         });
 
         assert.equal(response.text, 'user-scoped-ok');

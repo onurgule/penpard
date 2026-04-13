@@ -19,15 +19,10 @@ const TWO_ATTEMPT_NON_CRITICAL_SITES = new Set<LlmCallSite>([
     'red_team_ttp_derivation',
 ]);
 
-const CRITICAL_ATTEMPT_TIMEOUTS = [45_000, 60_000, 75_000, 90_000];
-const NON_CRITICAL_ATTEMPT_TIMEOUTS = [30_000, 45_000, 60_000, 75_000];
-
-function resolvePromptTier(totalPromptChars: number): number {
-    if (totalPromptChars <= 8_000) return 0;
-    if (totalPromptChars <= 20_000) return 1;
-    if (totalPromptChars <= 40_000) return 2;
-    return 3;
-}
+const CRITICAL_SLOW_FIRST_PROGRESS_WARNING_MS = 20_000;
+const NON_CRITICAL_SLOW_FIRST_PROGRESS_WARNING_MS = 15_000;
+const DEFAULT_FINALIZATION_GRACE_MS = 15_000;
+const DEFAULT_EXECUTION_WATCHDOG_SLACK_MS = 20_000;
 
 function resolveCriticality(callSite: LlmCallSite): LlmCriticality {
     return CRITICAL_CALL_SITES.has(callSite) ? 'critical' : 'non_critical';
@@ -59,16 +54,18 @@ export function resolveLlmCallOptions(
 ): ResolvedLlmCallOptions {
     const promptMetrics = options.promptMetrics || computePromptMetrics(request);
     const criticality = options.criticality || resolveCriticality(options.callSite);
-    const tier = resolvePromptTier(promptMetrics.totalPromptChars);
-    const attemptTimeoutMs = options.attemptTimeoutMs !== undefined
-        ? options.attemptTimeoutMs
-        : (criticality === 'critical' ? CRITICAL_ATTEMPT_TIMEOUTS[tier] : NON_CRITICAL_ATTEMPT_TIMEOUTS[tier]);
     const retryBudgetMs = options.retryBudgetMs !== undefined
         ? options.retryBudgetMs
         : (criticality === 'critical' ? 150_000 : 75_000);
-    const firstEventTimeoutMs = options.firstEventTimeoutMs !== undefined
-        ? options.firstEventTimeoutMs
-        : (criticality === 'critical' ? 20_000 : 15_000);
+    const slowFirstProgressWarningMs = options.slowFirstProgressWarningMs !== undefined
+        ? options.slowFirstProgressWarningMs
+        : (criticality === 'critical' ? CRITICAL_SLOW_FIRST_PROGRESS_WARNING_MS : NON_CRITICAL_SLOW_FIRST_PROGRESS_WARNING_MS);
+    const finalizationGraceMs = options.finalizationGraceMs !== undefined
+        ? options.finalizationGraceMs
+        : DEFAULT_FINALIZATION_GRACE_MS;
+    const executionWatchdogMs = options.executionWatchdogMs !== undefined
+        ? options.executionWatchdogMs
+        : (retryBudgetMs === null ? null : retryBudgetMs + DEFAULT_EXECUTION_WATCHDOG_SLACK_MS);
 
     return {
         ...options,
@@ -77,16 +74,11 @@ export function resolveLlmCallOptions(
         promptMetrics,
         maxAttempts: options.maxAttempts ?? resolveMaxAttempts(options.callSite, criticality),
         retryBudgetMs,
-        firstEventTimeoutMs,
-        attemptTimeoutMs,
-        providerIdleTimeoutMs: options.providerIdleTimeoutMs !== undefined
-            ? options.providerIdleTimeoutMs
-            : attemptTimeoutMs,
+        slowFirstProgressWarningMs,
+        finalizationGraceMs,
         queueWaitTimeoutMs: options.queueWaitTimeoutMs !== undefined
             ? options.queueWaitTimeoutMs
             : (criticality === 'critical' ? null : 30_000),
-        queueExecutionTimeoutMs: options.queueExecutionTimeoutMs !== undefined
-            ? options.queueExecutionTimeoutMs
-            : (retryBudgetMs === null ? null : retryBudgetMs + 5_000),
+        executionWatchdogMs,
     };
 }
