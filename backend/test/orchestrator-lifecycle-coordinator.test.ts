@@ -191,3 +191,21 @@ test('lifecycle coordinator finalizes by checkpointing around cleanup and log pe
         'checkpoint:run-finalized',
     ]);
 });
+
+test('lifecycle coordinator completes reporting when non-critical executive summary generation fails', async () => {
+    const { coordinator, state, statusEvents, logs } = createCoordinator({
+        summarizeReport: async () => {
+            throw new Error('summary worker stalled');
+        },
+    });
+
+    state.setRunning(true);
+    state.setPlanRound(2);
+
+    await coordinator.runReporting();
+
+    assert.equal(state.phase, 'completed');
+    assert.deepEqual(statusEvents, ['reporting', 'completed']);
+    assert.ok(logs.some((entry) => entry.includes('Summary generation failed: summary worker stalled')));
+    assert.ok(logs.some((entry) => entry.includes('Rounds: 2 | Endpoints: 3 | Findings: 2')));
+});

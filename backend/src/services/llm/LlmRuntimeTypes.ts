@@ -12,17 +12,39 @@ export type LlmCallSite =
     | 'scan_post_chat'
     | 'source_analysis';
 
-export type LlmFailureCategory =
-    | 'provider_call_timeout'
-    | 'provider_first_event_timeout'
-    | 'provider_idle_timeout'
+export type LlmLivenessCategory =
+    | 'slow_first_event'
+    | 'finalization_missing'
     | 'retry_budget_exhausted'
-    | 'queue_wait_timeout'
-    | 'queue_execution_timeout'
-    | 'sdk_session_timeout'
+    | 'queue_timeout'
+    | 'watchdog_timeout'
+    | 'canceled';
+
+export type LlmFailureCategory =
+    | 'retry_budget_exhausted'
+    | 'queue_timeout'
+    | 'watchdog_timeout'
     | 'transient_provider_error'
     | 'malformed_provider_result'
-    | 'canceled_due_to_scan_state';
+    | 'canceled';
+
+export type LlmWarningCategory =
+    | 'slow_first_event'
+    | 'finalization_missing';
+
+export type LlmAttemptPhase =
+    | 'queued'
+    | 'awaiting_first_event'
+    | 'awaiting_first_progress'
+    | 'streaming'
+    | 'awaiting_finalization'
+    | 'completed';
+
+export type LlmCompletionSignal =
+    | 'provider_response'
+    | 'session_idle'
+    | 'assistant_message'
+    | 'final_message_silence';
 
 export type LlmCriticality = 'critical' | 'non_critical';
 export type LlmQueueMode = 'queued' | 'direct';
@@ -47,11 +69,10 @@ export interface LlmCallOptions {
     promptMetrics?: LlmPromptMetrics;
     maxAttempts?: number;
     retryBudgetMs?: number | null;
-    firstEventTimeoutMs?: number | null;
-    attemptTimeoutMs?: number | null;
-    providerIdleTimeoutMs?: number | null;
+    slowFirstProgressWarningMs?: number | null;
+    finalizationGraceMs?: number | null;
     queueWaitTimeoutMs?: number | null;
-    queueExecutionTimeoutMs?: number | null;
+    executionWatchdogMs?: number | null;
     signal?: AbortSignal;
 }
 
@@ -61,11 +82,10 @@ export interface ResolvedLlmCallOptions extends LlmCallOptions {
     promptMetrics: LlmPromptMetrics;
     maxAttempts: number;
     retryBudgetMs: number | null;
-    firstEventTimeoutMs: number | null;
-    attemptTimeoutMs: number | null;
-    providerIdleTimeoutMs: number | null;
+    slowFirstProgressWarningMs: number | null;
+    finalizationGraceMs: number | null;
     queueWaitTimeoutMs: number | null;
-    queueExecutionTimeoutMs: number | null;
+    executionWatchdogMs: number | null;
 }
 
 export interface LlmQueueMetrics {
@@ -76,12 +96,23 @@ export interface LlmQueueMetrics {
 export interface ProviderAttemptDiagnostics {
     streamingStarted: boolean;
     anyEventReceived: boolean;
+    partialOutputReceived: boolean;
     assistantMessageReceived: boolean;
     idleReceived: boolean;
+    finalizationReceived: boolean;
     firstEventAtMs: number | null;
+    firstProgressAtMs: number | null;
+    partialOutputAtMs: number | null;
+    lastEventAtMs: number | null;
+    lastProgressAtMs: number | null;
     idleAtMs: number | null;
+    finalizationAtMs: number | null;
     finalContentLength: number;
-    warningCategory?: LlmFailureCategory | null;
+    progressEventCount: number;
+    attemptPhase: LlmAttemptPhase;
+    completionSignal: LlmCompletionSignal | null;
+    livenessCategory?: LlmLivenessCategory | null;
+    warningCategory?: LlmWarningCategory | null;
     rawProviderError?: string | null;
 }
 
@@ -108,11 +139,23 @@ export interface LlmAttemptTrace {
     promptMetrics: LlmPromptMetrics;
     streamingStarted: boolean;
     anyEventReceived: boolean;
+    partialOutputReceived: boolean;
     assistantMessageReceived: boolean;
     idleReceived: boolean;
+    finalizationReceived: boolean;
     firstEventAtMs: number | null;
+    firstProgressAtMs: number | null;
+    partialOutputAtMs: number | null;
+    lastEventAtMs: number | null;
+    lastProgressAtMs: number | null;
     idleAtMs: number | null;
-    warningCategory?: LlmFailureCategory | null;
+    finalizationAtMs: number | null;
+    finalContentLength: number;
+    progressEventCount: number;
+    attemptPhase: LlmAttemptPhase;
+    completionSignal: LlmCompletionSignal | null;
+    livenessCategory?: LlmLivenessCategory | null;
+    warningCategory?: LlmWarningCategory | null;
     failureCategory?: LlmFailureCategory | null;
     rawError?: string | null;
     retryDecision?: LlmRetryDecision;
@@ -132,9 +175,8 @@ export interface LlmCallTrace {
 
 export interface ProviderExecutionOptions {
     signal?: AbortSignal;
-    firstEventTimeoutMs?: number | null;
-    attemptTimeoutMs?: number | null;
-    providerIdleTimeoutMs?: number | null;
+    slowFirstProgressWarningMs?: number | null;
+    finalizationGraceMs?: number | null;
 }
 
 export interface LlmExecutionErrorOptions {
@@ -143,6 +185,9 @@ export interface LlmExecutionErrorOptions {
     budgetMs?: number | null;
     rawError?: string | null;
     retryable?: boolean;
+    attemptPhase?: LlmAttemptPhase | null;
+    livenessCategory?: LlmLivenessCategory | null;
+    diagnostics?: Partial<ProviderAttemptDiagnostics> | null;
     cause?: unknown;
 }
 
@@ -151,6 +196,9 @@ export class LlmExecutionError extends Error {
     public readonly budgetMs: number | null;
     public readonly rawError: string | null;
     public readonly retryable: boolean;
+    public readonly attemptPhase: LlmAttemptPhase | null;
+    public readonly livenessCategory: LlmLivenessCategory | null;
+    public readonly diagnostics: Partial<ProviderAttemptDiagnostics> | null;
 
     constructor(options: LlmExecutionErrorOptions) {
         super(options.message);
@@ -159,6 +207,9 @@ export class LlmExecutionError extends Error {
         this.budgetMs = options.budgetMs ?? null;
         this.rawError = options.rawError ?? null;
         this.retryable = options.retryable ?? false;
+        this.attemptPhase = options.attemptPhase ?? null;
+        this.livenessCategory = options.livenessCategory ?? null;
+        this.diagnostics = options.diagnostics ?? null;
         if (options.cause !== undefined) {
             (this as Error & { cause?: unknown }).cause = options.cause;
         }

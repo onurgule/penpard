@@ -22,8 +22,8 @@ test('planner returns null for timed-out plan creation so higher layers can fall
 
     llmRuntime.generate = (async () => {
         throw new LlmExecutionError({
-            failureCategory: 'provider_call_timeout',
-            message: 'provider call timed out',
+            failureCategory: 'watchdog_timeout',
+            message: 'LLM execution watchdog expired after 95000ms.',
         });
     }) as any;
 
@@ -60,8 +60,8 @@ test('planner falls back to continue-testing on replan timeout before the final 
 
     llmRuntime.generate = (async () => {
         throw new LlmExecutionError({
-            failureCategory: 'provider_call_timeout',
-            message: 'provider call timed out',
+            failureCategory: 'watchdog_timeout',
+            message: 'LLM execution watchdog expired after 95000ms.',
         });
     }) as any;
 
@@ -97,8 +97,8 @@ test('planner returns null for step execution timeouts without crashing the roun
 
     llmRuntime.generate = (async () => {
         throw new LlmExecutionError({
-            failureCategory: 'provider_call_timeout',
-            message: 'provider call timed out',
+            failureCategory: 'watchdog_timeout',
+            message: 'LLM execution watchdog expired after 95000ms.',
         });
     }) as any;
 
@@ -203,8 +203,8 @@ test('endpoint intelligence continues building deterministic inventory when AI c
     (browserService as any).getTrafficSnapshot = () => ([]);
     llmRuntime.generate = (async () => {
         throw new LlmExecutionError({
-            failureCategory: 'provider_first_event_timeout',
-            message: 'No first event arrived in time.',
+            failureCategory: 'watchdog_timeout',
+            message: 'LLM execution watchdog expired after 95000ms.',
         });
     }) as any;
 

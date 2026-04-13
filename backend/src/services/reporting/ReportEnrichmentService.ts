@@ -88,11 +88,10 @@ export class ReportEnrichmentService {
             context: 'report-export-enrichment',
             maxAttempts: 1,
             retryBudgetMs: null,
-            firstEventTimeoutMs: null,
-            attemptTimeoutMs: null,
-            providerIdleTimeoutMs: null,
+            slowFirstProgressWarningMs: null,
+            finalizationGraceMs: null,
             queueWaitTimeoutMs: null,
-            queueExecutionTimeoutMs: null,
+            executionWatchdogMs: null,
             signal: options.signal,
         });
 

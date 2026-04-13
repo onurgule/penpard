@@ -1,6 +1,7 @@
 /**
  * LLM Queue - serializes LLM execution and records queue timing.
  * Timeout policy and retry policy live in the LLM runtime layer.
+ * The execution watchdog is a last-resort guardrail, not ordinary provider liveness judgement.
  */
 
 import type { GenerationMetadata, GenerationRequest, GenerationResponse } from './LLMProviderService';
@@ -15,7 +16,7 @@ export interface LlmQueueExecutionContext {
 
 export interface LlmQueueExecutionOptions {
     waitTimeoutMs?: number | null;
-    executionTimeoutMs?: number | null;
+    executionWatchdogMs?: number | null;
     callSite?: string;
     scanId?: string;
 }
@@ -27,7 +28,7 @@ interface QueuedExecution<T> {
     enqueuedAt: number;
     queueDepthAtEnqueue: number;
     waitTimeoutMs: number | null;
-    executionTimeoutMs: number | null;
+    executionWatchdogMs: number | null;
     callSite?: string;
     scanId?: string;
     waitTimeoutId?: NodeJS.Timeout;
@@ -53,7 +54,7 @@ class LLMQueue {
                 enqueuedAt: Date.now(),
                 queueDepthAtEnqueue: this.queue.length + this.activeRequests,
                 waitTimeoutMs: options.waitTimeoutMs ?? null,
-                executionTimeoutMs: options.executionTimeoutMs ?? null,
+                executionWatchdogMs: options.executionWatchdogMs ?? null,
                 callSite: options.callSite,
                 scanId: options.scanId,
                 started: false,
@@ -71,9 +72,11 @@ class LLMQueue {
                     }
 
                     reject(new LlmExecutionError({
-                        failureCategory: 'queue_wait_timeout',
+                        failureCategory: 'queue_timeout',
                         message: `LLM queue wait exceeded ${entry.waitTimeoutMs}ms before execution started.`,
                         budgetMs: entry.waitTimeoutMs,
+                        attemptPhase: 'queued',
+                        livenessCategory: 'queue_timeout',
                     }));
                 }, entry.waitTimeoutMs);
             }
@@ -138,14 +141,14 @@ class LLMQueue {
     private async runEntry<T>(entry: QueuedExecution<T>): Promise<void> {
         const queueWaitMs = Date.now() - entry.enqueuedAt;
         const controller = new AbortController();
-        let executionTimedOut = false;
-        let executionTimeoutId: NodeJS.Timeout | undefined;
+        let executionWatchdogExpired = false;
+        let executionWatchdogId: NodeJS.Timeout | undefined;
 
-        if (entry.executionTimeoutMs && entry.executionTimeoutMs > 0) {
-            executionTimeoutId = setTimeout(() => {
-                executionTimedOut = true;
-                controller.abort(new Error(`LLM queue execution exceeded ${entry.executionTimeoutMs}ms.`));
-            }, entry.executionTimeoutMs);
+        if (entry.executionWatchdogMs && entry.executionWatchdogMs > 0) {
+            executionWatchdogId = setTimeout(() => {
+                executionWatchdogExpired = true;
+                controller.abort(new Error(`LLM execution watchdog expired after ${entry.executionWatchdogMs}ms.`));
+            }, entry.executionWatchdogMs);
         }
 
         try {
@@ -155,22 +158,33 @@ class LLMQueue {
                 signal: controller.signal,
             });
 
-            if (executionTimedOut) {
+            if (executionWatchdogExpired) {
                 throw new LlmExecutionError({
-                    failureCategory: 'queue_execution_timeout',
-                    message: `LLM queue execution exceeded ${entry.executionTimeoutMs}ms.`,
-                    budgetMs: entry.executionTimeoutMs,
+                    failureCategory: 'watchdog_timeout',
+                    message: `LLM execution watchdog expired after ${entry.executionWatchdogMs}ms.`,
+                    budgetMs: entry.executionWatchdogMs,
+                    attemptPhase: 'queued',
+                    livenessCategory: 'watchdog_timeout',
                 });
             }
 
             entry.resolve(result);
         } catch (error) {
-            if (executionTimedOut && !(error instanceof LlmExecutionError)) {
+            if (
+                executionWatchdogExpired
+                && (
+                    !(error instanceof LlmExecutionError)
+                    || error.failureCategory === 'canceled'
+                )
+            ) {
                 entry.reject(new LlmExecutionError({
-                    failureCategory: 'queue_execution_timeout',
-                    message: `LLM queue execution exceeded ${entry.executionTimeoutMs}ms.`,
-                    budgetMs: entry.executionTimeoutMs,
+                    failureCategory: 'watchdog_timeout',
+                    message: `LLM execution watchdog expired after ${entry.executionWatchdogMs}ms.`,
+                    budgetMs: entry.executionWatchdogMs,
                     rawError: error instanceof Error ? error.message : String(error),
+                    attemptPhase: 'queued',
+                    livenessCategory: 'watchdog_timeout',
+                    diagnostics: error instanceof LlmExecutionError ? error.diagnostics : null,
                     cause: error,
                 }));
                 return;
@@ -178,8 +192,8 @@ class LLMQueue {
 
             entry.reject(error);
         } finally {
-            if (executionTimeoutId) {
-                clearTimeout(executionTimeoutId);
+            if (executionWatchdogId) {
+                clearTimeout(executionWatchdogId);
             }
 
             logger.debug?.('llm.queue.execution.finished', {
@@ -187,7 +201,7 @@ class LLMQueue {
                 scanId: entry.scanId,
                 queueWaitMs,
                 queueDepthAtEnqueue: entry.queueDepthAtEnqueue,
-                executionTimedOut,
+                executionWatchdogExpired,
             });
         }
     }

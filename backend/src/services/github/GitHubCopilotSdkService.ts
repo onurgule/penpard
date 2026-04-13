@@ -55,6 +55,7 @@ export interface GitHubCopilotClientLike {
         infiniteSessions?: { enabled: boolean };
         systemMessage?: { mode: 'replace'; content: string };
         streaming?: boolean;
+        onEvent?: (event: { type?: string; data?: any; id?: string }) => void;
         onPermissionRequest: typeof approveAll;
     }): Promise<CopilotSessionLike>;
 }
@@ -143,18 +144,48 @@ function subscribe(
     return () => {};
 }
 
-function buildSdkSessionError(message: string, sendCompleted: boolean): LlmExecutionError {
-    const lower = message.toLowerCase();
-    const sessionLikeFailure = !sendCompleted
-        || lower.includes('session')
-        || lower.includes('disconnect')
-        || lower.includes('idle');
+function createEmptyDiagnostics(): ProviderAttemptDiagnostics {
+    return {
+        streamingStarted: false,
+        anyEventReceived: false,
+        partialOutputReceived: false,
+        assistantMessageReceived: false,
+        idleReceived: false,
+        finalizationReceived: false,
+        firstEventAtMs: null,
+        firstProgressAtMs: null,
+        partialOutputAtMs: null,
+        lastEventAtMs: null,
+        lastProgressAtMs: null,
+        idleAtMs: null,
+        finalizationAtMs: null,
+        finalContentLength: 0,
+        progressEventCount: 0,
+        attemptPhase: 'awaiting_first_event',
+        completionSignal: null,
+        livenessCategory: null,
+        warningCategory: null,
+        rawProviderError: null,
+    };
+}
 
+function snapshotDiagnostics(diagnostics: ProviderAttemptDiagnostics): Partial<ProviderAttemptDiagnostics> {
+    return {
+        ...diagnostics,
+    };
+}
+
+function buildSdkSessionError(message: string, diagnostics: ProviderAttemptDiagnostics): LlmExecutionError {
     return new LlmExecutionError({
-        failureCategory: sessionLikeFailure ? 'sdk_session_timeout' : 'transient_provider_error',
+        failureCategory: 'transient_provider_error',
         message,
         rawError: message,
         retryable: true,
+        attemptPhase: diagnostics.attemptPhase,
+        diagnostics: snapshotDiagnostics({
+            ...diagnostics,
+            rawProviderError: message,
+        }),
     });
 }
 
@@ -260,6 +291,59 @@ export class GitHubCopilotSdkService {
         executionOptions: ProviderExecutionOptions = {},
     ): Promise<CopilotPromptResponse> {
         return this.withClient(accessToken, async (client) => {
+            const startedAtMs = Date.now();
+            const diagnostics = createEmptyDiagnostics();
+            const slowFirstProgressWarningMs = executionOptions.slowFirstProgressWarningMs === undefined
+                ? 20_000
+                : executionOptions.slowFirstProgressWarningMs;
+            const finalizationGraceMs = executionOptions.finalizationGraceMs === undefined
+                ? 15_000
+                : executionOptions.finalizationGraceMs;
+            let settled = false;
+            let deltaText = '';
+            let finalMessage = '';
+            let slowFirstProgressTimer: NodeJS.Timeout | undefined;
+            let finalizationTimer: NodeJS.Timeout | undefined;
+            let abortCleanup = () => {};
+            const unsubs: Array<() => void> = [];
+            let pendingReject: ((reason?: unknown) => void) | null = null;
+
+            const elapsedMs = () => Date.now() - startedAtMs;
+            const currentText = () => (finalMessage || deltaText).trim();
+            const refreshContentMetrics = () => {
+                diagnostics.finalContentLength = currentText().length;
+            };
+            const setPhase = (phase: ProviderAttemptDiagnostics['attemptPhase']) => {
+                diagnostics.attemptPhase = phase;
+            };
+            const clearTimers = () => {
+                if (slowFirstProgressTimer) {
+                    clearTimeout(slowFirstProgressTimer);
+                }
+                if (finalizationTimer) {
+                    clearTimeout(finalizationTimer);
+                }
+            };
+            const cleanup = async () => {
+                clearTimers();
+                abortCleanup();
+                for (const unsub of unsubs) {
+                    unsub();
+                }
+                await session.disconnect();
+            };
+            const attachDiagnostics = (error: LlmExecutionError): LlmExecutionError => new LlmExecutionError({
+                failureCategory: error.failureCategory,
+                message: error.message,
+                budgetMs: error.budgetMs,
+                rawError: error.rawError,
+                retryable: error.retryable,
+                attemptPhase: error.attemptPhase ?? diagnostics.attemptPhase,
+                diagnostics: error.diagnostics ?? snapshotDiagnostics(diagnostics),
+                livenessCategory: error.livenessCategory ?? diagnostics.livenessCategory ?? null,
+                cause: (error as Error & { cause?: unknown }).cause,
+            });
+
             const session = await client.createSession({
                 clientName: 'PenPard',
                 model,
@@ -272,127 +356,156 @@ export class GitHubCopilotSdkService {
                     mode: 'replace',
                     content: request.systemPrompt,
                 },
+                onEvent: (event) => {
+                    if (!event?.type) {
+                        return;
+                    }
+
+                    if (
+                        event.type === 'assistant.message_delta'
+                        || event.type === 'assistant.message'
+                        || event.type === 'session.idle'
+                        || event.type === 'session.error'
+                    ) {
+                        return;
+                    }
+
+                    diagnostics.anyEventReceived = true;
+                    diagnostics.lastEventAtMs = elapsedMs();
+                    if (diagnostics.firstEventAtMs === null) {
+                        diagnostics.firstEventAtMs = diagnostics.lastEventAtMs;
+                    }
+                    if (diagnostics.attemptPhase === 'awaiting_first_event') {
+                        setPhase('awaiting_first_progress');
+                    }
+                },
                 onPermissionRequest: approveAll,
             });
 
-            const firstEventTimeoutMs = executionOptions.firstEventTimeoutMs !== undefined
-                ? executionOptions.firstEventTimeoutMs
-                : 20_000;
-            const attemptTimeoutMs = executionOptions.attemptTimeoutMs !== undefined
-                ? executionOptions.attemptTimeoutMs
-                : 60_000;
-            const diagnostics: ProviderAttemptDiagnostics = {
-                streamingStarted: false,
-                anyEventReceived: false,
-                assistantMessageReceived: false,
-                idleReceived: false,
-                firstEventAtMs: null,
-                idleAtMs: null,
-                finalContentLength: 0,
-                warningCategory: null,
-                rawProviderError: null,
+            const recordProviderEvent = (phaseAfterEvent?: ProviderAttemptDiagnostics['attemptPhase']) => {
+                diagnostics.anyEventReceived = true;
+                diagnostics.lastEventAtMs = elapsedMs();
+                if (diagnostics.firstEventAtMs === null) {
+                    diagnostics.firstEventAtMs = diagnostics.lastEventAtMs;
+                }
+                if (phaseAfterEvent) {
+                    setPhase(phaseAfterEvent);
+                } else if (diagnostics.attemptPhase === 'awaiting_first_event') {
+                    setPhase('awaiting_first_progress');
+                }
             };
 
-            const startedAtMs = Date.now();
-            let sendCompleted = false;
-            let settled = false;
-            let deltaText = '';
-            let finalMessage = '';
-            let firstEventTimer: NodeJS.Timeout | undefined;
-            let attemptTimer: NodeJS.Timeout | undefined;
-            let abortCleanup = () => {};
-            const unsubs: Array<() => void> = [];
-
-            const cleanup = async () => {
-                if (firstEventTimer) {
-                    clearTimeout(firstEventTimer);
+            const recordProgress = (phaseAfterProgress: ProviderAttemptDiagnostics['attemptPhase']) => {
+                recordProviderEvent(phaseAfterProgress);
+                diagnostics.partialOutputReceived = true;
+                if (diagnostics.firstProgressAtMs === null) {
+                    diagnostics.firstProgressAtMs = elapsedMs();
+                    if (slowFirstProgressTimer) {
+                        clearTimeout(slowFirstProgressTimer);
+                    }
                 }
-                if (attemptTimer) {
-                    clearTimeout(attemptTimer);
+                if (diagnostics.partialOutputAtMs === null) {
+                    diagnostics.partialOutputAtMs = elapsedMs();
                 }
-                abortCleanup();
-                for (const unsub of unsubs) {
-                    unsub();
+                diagnostics.lastProgressAtMs = elapsedMs();
+                diagnostics.progressEventCount += 1;
+                refreshContentMetrics();
+                if (finalizationTimer) {
+                    clearTimeout(finalizationTimer);
                 }
-                await session.disconnect();
             };
+
+            const settleResult = (
+                resolve: (value: CopilotPromptResponse) => void,
+                reject: (reason?: unknown) => void,
+                warningCategory?: ProviderAttemptDiagnostics['warningCategory'],
+                completionSignal?: ProviderAttemptDiagnostics['completionSignal'],
+                finalizationReceived?: boolean,
+            ) => {
+                const text = currentText();
+                if (!text) {
+                    reject(new LlmExecutionError({
+                        failureCategory: 'malformed_provider_result',
+                        message: 'GitHub Copilot SDK returned an empty response.',
+                        attemptPhase: diagnostics.attemptPhase,
+                        diagnostics: snapshotDiagnostics(diagnostics),
+                    }));
+                    return;
+                }
+
+                refreshContentMetrics();
+                diagnostics.warningCategory = warningCategory ?? diagnostics.warningCategory ?? null;
+                diagnostics.livenessCategory = diagnostics.warningCategory ?? diagnostics.livenessCategory ?? null;
+                diagnostics.completionSignal = completionSignal
+                    ?? (diagnostics.idleReceived ? 'session_idle' : diagnostics.assistantMessageReceived ? 'assistant_message' : null);
+                diagnostics.finalizationReceived = finalizationReceived
+                    ?? diagnostics.idleReceived
+                    ?? diagnostics.finalizationReceived;
+                if (diagnostics.finalizationReceived && diagnostics.finalizationAtMs === null) {
+                    diagnostics.finalizationAtMs = diagnostics.idleAtMs ?? elapsedMs();
+                }
+                setPhase('completed');
+                resolve({
+                    text,
+                    diagnostics,
+                });
+            };
+
+            const settle = (callback: () => void) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                callback();
+            };
+
+            const settleSuccess = (
+                resolve: (value: CopilotPromptResponse) => void,
+                reject: (reason?: unknown) => void,
+                warningCategory?: ProviderAttemptDiagnostics['warningCategory'],
+                completionSignal?: ProviderAttemptDiagnostics['completionSignal'],
+                finalizationReceived?: boolean,
+            ) => {
+                settle(() => settleResult(resolve, reject, warningCategory, completionSignal, finalizationReceived));
+            };
+
+            const settleError = (error: unknown) => {
+                diagnostics.rawProviderError = normalizeString(error instanceof Error ? error.message : error);
+                settle(() => {
+                    if (!pendingReject) {
+                        return;
+                    }
+                    if (error instanceof LlmExecutionError) {
+                        pendingReject(attachDiagnostics(error));
+                        return;
+                    }
+                    pendingReject(error);
+                });
+            };
+
+            if (slowFirstProgressWarningMs && slowFirstProgressWarningMs > 0) {
+                slowFirstProgressTimer = setTimeout(() => {
+                    if (diagnostics.firstProgressAtMs !== null) {
+                        return;
+                    }
+                    diagnostics.warningCategory = 'slow_first_event';
+                    diagnostics.livenessCategory = diagnostics.livenessCategory ?? 'slow_first_event';
+                }, slowFirstProgressWarningMs);
+            }
 
             try {
                 const result = await new Promise<CopilotPromptResponse>((resolve, reject) => {
-                    const settle = (callback: () => void) => {
-                        if (settled) {
-                            return;
-                        }
-                        settled = true;
-                        callback();
-                    };
-
-                    const recordAssistantEvent = () => {
-                        diagnostics.anyEventReceived = true;
-                        if (diagnostics.firstEventAtMs === null) {
-                            diagnostics.firstEventAtMs = Date.now() - startedAtMs;
-                            if (firstEventTimer) {
-                                clearTimeout(firstEventTimer);
-                            }
-                        }
-                    };
-
-                    const settleSuccess = (warningCategory?: ProviderAttemptDiagnostics['warningCategory']) => {
-                        const text = (finalMessage || deltaText).trim();
-                        if (!text) {
-                            settle(() => reject(new LlmExecutionError({
-                                failureCategory: 'malformed_provider_result',
-                                message: 'GitHub Copilot SDK returned an empty response.',
-                            })));
-                            return;
-                        }
-
-                        diagnostics.finalContentLength = text.length;
-                        diagnostics.warningCategory = warningCategory ?? null;
-                        settle(() => resolve({
-                            text,
-                            diagnostics,
-                        }));
-                    };
-
-                    const settleError = (error: unknown) => {
-                        diagnostics.rawProviderError = normalizeString(error instanceof Error ? error.message : error);
-                        settle(() => reject(error));
-                    };
-
-                    if (firstEventTimeoutMs && firstEventTimeoutMs > 0) {
-                        firstEventTimer = setTimeout(() => {
-                            settleError(new LlmExecutionError({
-                                failureCategory: 'provider_first_event_timeout',
-                                message: `No GitHub Copilot event received within ${firstEventTimeoutMs}ms.`,
-                                budgetMs: firstEventTimeoutMs,
-                                retryable: true,
-                            }));
-                        }, firstEventTimeoutMs);
-                    }
-
-                    if (attemptTimeoutMs && attemptTimeoutMs > 0) {
-                        attemptTimer = setTimeout(() => {
-                            if (finalMessage.trim()) {
-                                settleSuccess('provider_idle_timeout');
-                                return;
-                            }
-
-                            settleError(new LlmExecutionError({
-                                failureCategory: 'provider_call_timeout',
-                                message: `GitHub Copilot provider call exceeded ${attemptTimeoutMs}ms.`,
-                                budgetMs: attemptTimeoutMs,
-                                retryable: true,
-                            }));
-                        }, attemptTimeoutMs);
-                    }
-
+                    pendingReject = reject;
                     if (executionOptions.signal) {
                         const abortHandler = () => {
                             settleError(new LlmExecutionError({
-                                failureCategory: 'canceled_due_to_scan_state',
+                                failureCategory: 'canceled',
                                 message: 'GitHub Copilot session aborted.',
                                 rawError: normalizeString(executionOptions.signal?.reason),
+                                retryable: false,
+                                attemptPhase: diagnostics.attemptPhase,
+                                livenessCategory: 'canceled',
+                                diagnostics: snapshotDiagnostics(diagnostics),
                             }));
                         };
 
@@ -407,35 +520,62 @@ export class GitHubCopilotSdkService {
 
                     unsubs.push(
                         subscribe(session, 'assistant.message_delta', (payload) => {
-                            recordAssistantEvent();
                             diagnostics.streamingStarted = true;
                             const text = extractTextContent(payload);
                             if (text) {
                                 deltaText += text;
+                                recordProgress('streaming');
                             }
                         }),
                     );
                     unsubs.push(
                         subscribe(session, 'assistant.message', (payload) => {
-                            recordAssistantEvent();
+                            recordProviderEvent('awaiting_finalization');
                             diagnostics.assistantMessageReceived = true;
                             const text = extractTextContent(payload);
                             if (text) {
                                 finalMessage = text;
+                                recordProgress('awaiting_finalization');
                             }
+
+                            if (finalizationGraceMs === null) {
+                                settleSuccess(resolve, reject, undefined, 'assistant_message', true);
+                                return;
+                            }
+
+                            if (finalizationGraceMs && finalizationGraceMs > 0) {
+                                if (finalizationTimer) {
+                                    clearTimeout(finalizationTimer);
+                                }
+                                finalizationTimer = setTimeout(() => {
+                                    diagnostics.finalizationReceived = false;
+                                    settleSuccess(resolve, reject, 'finalization_missing', 'final_message_silence', false);
+                                }, finalizationGraceMs);
+                                return;
+                            }
+
+                            settleSuccess(resolve, reject, 'finalization_missing', 'final_message_silence', false);
                         }),
                     );
                     unsubs.push(
                         subscribe(session, 'session.idle', () => {
+                            recordProviderEvent('awaiting_finalization');
                             diagnostics.idleReceived = true;
-                            diagnostics.idleAtMs = Date.now() - startedAtMs;
-                            settleSuccess();
+                            diagnostics.idleAtMs = elapsedMs();
+                            diagnostics.finalizationReceived = true;
+                            diagnostics.finalizationAtMs = diagnostics.idleAtMs;
+                            settleSuccess(resolve, reject, undefined, 'session_idle', true);
                         }),
                     );
                     unsubs.push(
                         subscribe(session, 'session.error', (payload) => {
-                            const message = extractTextContent(payload) || normalizeString(payload) || 'GitHub Copilot session error.';
-                            settleError(buildSdkSessionError(message, sendCompleted));
+                            recordProviderEvent();
+                            const message = extractTextContent(payload)
+                                || normalizeString(payload?.data?.message)
+                                || normalizeString(payload?.message)
+                                || normalizeString(payload)
+                                || 'GitHub Copilot session error.';
+                            settleError(buildSdkSessionError(message, diagnostics));
                         }),
                     );
 
@@ -447,12 +587,10 @@ export class GitHubCopilotSdkService {
                             mimeType: image.mimeType,
                             displayName: `image-${index + 1}`,
                         })),
-                    }).then(() => {
-                        sendCompleted = true;
                     }).catch((error) => {
                         settleError(buildSdkSessionError(
                             error instanceof Error ? error.message : String(error || 'GitHub Copilot send failed.'),
-                            sendCompleted,
+                            diagnostics,
                         ));
                     });
                 });

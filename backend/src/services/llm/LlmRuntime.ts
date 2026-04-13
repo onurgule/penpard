@@ -1,17 +1,26 @@
 import type { GenerationRequest, GenerationResponse } from '../LLMProviderService';
 import { llmProvider } from '../LLMProviderService';
 import { llmQueue } from '../LLMQueue';
-import { logLlmAttemptFinished, logLlmCallFailed, logLlmCallFinished, logLlmCallStarted } from './LlmTelemetry';
+import {
+    logLlmAttemptFailed,
+    logLlmAttemptFinished,
+    logLlmCallFailed,
+    logLlmCallFinished,
+    logLlmCallStarted,
+} from './LlmTelemetry';
 import { shouldRetryLlmAttempt } from './LlmRetryPolicy';
 import { resolveLlmCallOptions } from './LlmTimeoutPolicy';
 import {
     isLlmExecutionError,
     LlmCallOptions,
     LlmAttemptTrace,
+    LlmAttemptPhase,
     LlmCallTrace,
     LlmExecutionError,
     LlmFailureCategory,
+    LlmLivenessCategory,
     LlmPromptMetrics,
+    ProviderAttemptDiagnostics,
     ProviderAttemptResult,
     ResolvedLlmCallOptions,
 } from './LlmRuntimeTypes';
@@ -32,12 +41,6 @@ function errorMessage(error: unknown): string {
     return String(error || 'Unknown LLM error');
 }
 
-function minNullable(left: number | null, right: number | null): number | null {
-    if (left === null) return right;
-    if (right === null) return left;
-    return Math.min(left, right);
-}
-
 function normalizeFailureCategory(message: string): LlmFailureCategory {
     const lower = message.toLowerCase();
     if (
@@ -48,6 +51,7 @@ function normalizeFailureCategory(message: string): LlmFailureCategory {
         || lower.includes('connection reset')
         || lower.includes('econnreset')
         || lower.includes('socket hang up')
+        || lower.includes('timeout')
     ) {
         return 'transient_provider_error';
     }
@@ -59,9 +63,6 @@ function normalizeFailureCategory(message: string): LlmFailureCategory {
         || lower.includes('malformed')
     ) {
         return 'malformed_provider_result';
-    }
-    if (lower.includes('timeout')) {
-        return 'provider_call_timeout';
     }
     return 'transient_provider_error';
 }
@@ -98,9 +99,12 @@ function createAttemptTrace(
     queueDepthAtEnqueue: number,
     promptMetrics: LlmPromptMetrics,
     result?: ProviderAttemptResult,
+    normalizedError?: LlmExecutionError,
     failureCategory?: LlmFailureCategory,
     rawError?: string | null,
 ): LlmAttemptTrace {
+    const diagnostics = normalizedError?.diagnostics ?? result?.diagnostics ?? null;
+
     return {
         attempt,
         executionMs: result?.executionMs ?? 0,
@@ -109,15 +113,27 @@ function createAttemptTrace(
         provider: result?.provider ?? 'unknown',
         model: result?.model ?? 'unknown',
         promptMetrics: result?.promptMetrics ?? promptMetrics,
-        streamingStarted: result?.diagnostics.streamingStarted ?? false,
-        anyEventReceived: result?.diagnostics.anyEventReceived ?? false,
-        assistantMessageReceived: result?.diagnostics.assistantMessageReceived ?? false,
-        idleReceived: result?.diagnostics.idleReceived ?? false,
-        firstEventAtMs: result?.diagnostics.firstEventAtMs ?? null,
-        idleAtMs: result?.diagnostics.idleAtMs ?? null,
-        warningCategory: result?.diagnostics.warningCategory ?? null,
+        streamingStarted: diagnostics?.streamingStarted ?? false,
+        anyEventReceived: diagnostics?.anyEventReceived ?? false,
+        partialOutputReceived: diagnostics?.partialOutputReceived ?? false,
+        assistantMessageReceived: diagnostics?.assistantMessageReceived ?? false,
+        idleReceived: diagnostics?.idleReceived ?? false,
+        finalizationReceived: diagnostics?.finalizationReceived ?? false,
+        firstEventAtMs: diagnostics?.firstEventAtMs ?? null,
+        firstProgressAtMs: diagnostics?.firstProgressAtMs ?? null,
+        partialOutputAtMs: diagnostics?.partialOutputAtMs ?? null,
+        lastEventAtMs: diagnostics?.lastEventAtMs ?? null,
+        lastProgressAtMs: diagnostics?.lastProgressAtMs ?? null,
+        idleAtMs: diagnostics?.idleAtMs ?? null,
+        finalizationAtMs: diagnostics?.finalizationAtMs ?? null,
+        finalContentLength: diagnostics?.finalContentLength ?? result?.text.length ?? 0,
+        progressEventCount: diagnostics?.progressEventCount ?? 0,
+        attemptPhase: diagnostics?.attemptPhase ?? normalizedError?.attemptPhase ?? 'awaiting_first_event',
+        completionSignal: diagnostics?.completionSignal ?? null,
+        livenessCategory: diagnostics?.livenessCategory ?? normalizedError?.livenessCategory ?? null,
+        warningCategory: diagnostics?.warningCategory ?? null,
         failureCategory,
-        rawError: rawError ?? result?.diagnostics.rawProviderError ?? null,
+        rawError: rawError ?? diagnostics?.rawProviderError ?? null,
         retryDecision: undefined,
         retryReason: null,
     };
@@ -137,18 +153,71 @@ function makeAttemptResultStub(
         diagnostics: {
             streamingStarted: false,
             anyEventReceived: false,
+            partialOutputReceived: false,
             assistantMessageReceived: false,
             idleReceived: false,
+            finalizationReceived: false,
             firstEventAtMs: null,
+            firstProgressAtMs: null,
+            partialOutputAtMs: null,
+            lastEventAtMs: null,
+            lastProgressAtMs: null,
             idleAtMs: null,
+            finalizationAtMs: null,
             finalContentLength: 0,
+            progressEventCount: 0,
+            attemptPhase: 'awaiting_first_event',
+            completionSignal: null,
+            livenessCategory: null,
             warningCategory: null,
             rawProviderError: null,
         },
     };
 }
 
+function deriveRetryBudgetLiveness(
+    normalized?: Pick<LlmExecutionError, 'failureCategory' | 'livenessCategory' | 'diagnostics'>,
+): LlmLivenessCategory {
+    return 'retry_budget_exhausted';
+}
+
+function deriveFailureLiveness(
+    failureCategory: LlmFailureCategory,
+    diagnostics?: Partial<ProviderAttemptDiagnostics> | null,
+): LlmLivenessCategory | null {
+    if (failureCategory === 'transient_provider_error' || failureCategory === 'malformed_provider_result') {
+        return null;
+    }
+
+    if (failureCategory === 'retry_budget_exhausted') {
+        return deriveRetryBudgetLiveness({
+            failureCategory,
+            diagnostics: diagnostics ?? null,
+            livenessCategory: null,
+        });
+    }
+
+    return failureCategory;
+}
+
 class LlmRuntime {
+    private buildRetryBudgetError(
+        budgetMs: number | null,
+        normalized?: Pick<LlmExecutionError, 'rawError' | 'message' | 'diagnostics' | 'attemptPhase' | 'failureCategory' | 'livenessCategory'>,
+    ): LlmExecutionError {
+        return new LlmExecutionError({
+            failureCategory: 'retry_budget_exhausted',
+            message: budgetMs === null
+                ? 'LLM attempts exhausted before a successful completion.'
+                : `LLM retry budget exhausted after ${budgetMs}ms.`,
+            budgetMs,
+            rawError: normalized?.rawError || normalized?.message || null,
+            attemptPhase: normalized?.attemptPhase ?? null,
+            livenessCategory: deriveRetryBudgetLiveness(normalized),
+            diagnostics: normalized?.diagnostics ?? null,
+        });
+    }
+
     private getConfiguredProviderSnapshot(userId?: number): { provider: string; model: string } {
         try {
             const config = llmProvider.getActiveConfig(userId);
@@ -188,7 +257,7 @@ class LlmRuntime {
                     },
                     {
                         waitTimeoutMs: resolved.queueWaitTimeoutMs,
-                        executionTimeoutMs: resolved.queueExecutionTimeoutMs,
+                        executionWatchdogMs: resolved.executionWatchdogMs,
                         callSite: resolved.callSite,
                         scanId: resolved.scanId,
                     },
@@ -200,7 +269,7 @@ class LlmRuntime {
             logLlmCallFinished(resolved, trace);
             return response;
         } catch (error) {
-            const normalized = this.normalizeError(error, resolved.attemptTimeoutMs, resolved.signal);
+            const normalized = this.normalizeError(error, resolved.signal);
             trace.totalMs = Date.now() - startedAtMs;
             trace.attemptCount = trace.attempts.length;
             logLlmCallFailed(resolved, trace, normalized);
@@ -218,9 +287,11 @@ class LlmRuntime {
         for (let attempt = 1; attempt <= resolved.maxAttempts; attempt += 1) {
             if (resolved.signal?.aborted || queueSignal?.aborted) {
                 throw new LlmExecutionError({
-                    failureCategory: 'canceled_due_to_scan_state',
+                    failureCategory: 'canceled',
                     message: 'LLM call canceled before attempt execution completed.',
                     rawError: 'AbortSignal triggered',
+                    attemptPhase: 'queued',
+                    livenessCategory: 'canceled',
                 });
             }
 
@@ -229,14 +300,9 @@ class LlmRuntime {
                 ? null
                 : resolved.retryBudgetMs - elapsedMs;
             if (remainingBudgetMs !== null && remainingBudgetMs <= 0) {
-                throw new LlmExecutionError({
-                    failureCategory: 'retry_budget_exhausted',
-                    message: `LLM retry budget exhausted after ${resolved.retryBudgetMs}ms.`,
-                    budgetMs: resolved.retryBudgetMs,
-                });
+                throw this.buildRetryBudgetError(resolved.retryBudgetMs);
             }
 
-            const attemptTimeoutMs = minNullable(resolved.attemptTimeoutMs, remainingBudgetMs);
             const signalBundle = combineAbortSignals([resolved.signal, queueSignal]);
 
             try {
@@ -248,9 +314,8 @@ class LlmRuntime {
                     },
                     {
                         signal: signalBundle.signal,
-                        firstEventTimeoutMs: minNullable(resolved.firstEventTimeoutMs, attemptTimeoutMs),
-                        attemptTimeoutMs,
-                        providerIdleTimeoutMs: minNullable(resolved.providerIdleTimeoutMs, attemptTimeoutMs),
+                        slowFirstProgressWarningMs: resolved.slowFirstProgressWarningMs,
+                        finalizationGraceMs: resolved.finalizationGraceMs,
                     },
                 );
 
@@ -279,7 +344,7 @@ class LlmRuntime {
                     usage: result.usage,
                 };
             } catch (error) {
-                const normalized = this.normalizeError(error, attemptTimeoutMs, resolved.signal);
+                const normalized = this.normalizeError(error, resolved.signal);
                 const providerSnapshot = this.getConfiguredProviderSnapshot(resolved.userId);
                 const attemptTrace = createAttemptTrace(
                     attempt,
@@ -289,6 +354,7 @@ class LlmRuntime {
                     {
                         ...makeAttemptResultStub(providerSnapshot.provider, providerSnapshot.model, resolved.promptMetrics),
                     },
+                    normalized,
                     normalized.failureCategory,
                     normalized.rawError || errorMessage(error),
                 );
@@ -298,6 +364,7 @@ class LlmRuntime {
                 trace.attempts.push(attemptTrace);
                 trace.provider = trace.provider || providerSnapshot.provider;
                 trace.model = trace.model || providerSnapshot.model;
+                logLlmAttemptFailed(resolved, attemptTrace);
 
                 if (retryDecision.decision === 'retry') {
                     await sleep(Math.min(1500 * attempt, 3000));
@@ -309,12 +376,7 @@ class LlmRuntime {
                     && resolved.retryBudgetMs !== null
                     && normalized.failureCategory !== 'retry_budget_exhausted'
                 ) {
-                    throw new LlmExecutionError({
-                        failureCategory: 'retry_budget_exhausted',
-                        message: `LLM retry budget exhausted after ${resolved.retryBudgetMs}ms.`,
-                        budgetMs: resolved.retryBudgetMs,
-                        rawError: normalized.rawError || normalized.message,
-                    });
+                    throw this.buildRetryBudgetError(resolved.retryBudgetMs, normalized);
                 }
 
                 throw normalized;
@@ -323,42 +385,55 @@ class LlmRuntime {
             }
         }
 
-        throw new LlmExecutionError({
-            failureCategory: 'retry_budget_exhausted',
-            message: resolved.retryBudgetMs === null
-                ? `LLM attempts exhausted after ${resolved.maxAttempts} attempt(s).`
-                : `LLM retry budget exhausted after ${resolved.retryBudgetMs}ms.`,
-            budgetMs: resolved.retryBudgetMs,
-        });
+        throw this.buildRetryBudgetError(resolved.retryBudgetMs);
     }
 
     private normalizeError(
         error: unknown,
-        attemptTimeoutMs: number | null,
         signal?: AbortSignal,
     ): LlmExecutionError {
         if (isLlmExecutionError(error)) {
-            return error;
+            if (error.livenessCategory) {
+                return error;
+            }
+
+            return new LlmExecutionError({
+                failureCategory: error.failureCategory,
+                message: error.message,
+                budgetMs: error.budgetMs,
+                rawError: error.rawError,
+                retryable: error.retryable,
+                attemptPhase: error.attemptPhase,
+                livenessCategory: deriveFailureLiveness(error.failureCategory, error.diagnostics),
+                diagnostics: error.diagnostics,
+                cause: (error as Error & { cause?: unknown }).cause,
+            });
         }
 
         if (signal?.aborted) {
             return new LlmExecutionError({
-                failureCategory: 'canceled_due_to_scan_state',
+                failureCategory: 'canceled',
                 message: 'LLM call canceled due to scan state change.',
                 rawError: errorMessage(error),
+                attemptPhase: 'queued',
+                livenessCategory: 'canceled',
                 cause: error,
             });
         }
 
         const message = errorMessage(error);
         const failureCategory = normalizeFailureCategory(message);
+        const retryable = failureCategory === 'transient_provider_error';
+        const attemptPhase: LlmAttemptPhase | null = null;
 
         return new LlmExecutionError({
             failureCategory,
             message,
-            budgetMs: failureCategory === 'provider_call_timeout' ? attemptTimeoutMs : null,
+            budgetMs: null,
             rawError: message,
-            retryable: failureCategory === 'provider_call_timeout' || failureCategory === 'transient_provider_error',
+            retryable,
+            attemptPhase,
+            livenessCategory: deriveFailureLiveness(failureCategory),
             cause: error,
         });
     }
