@@ -17,7 +17,7 @@ import {
 } from './llm/LlmRuntimeTypes';
 
 const GITHUB_RUNTIME_USER_ID = 1;
-const SUPPORTED_LLM_PROVIDERS = ['openai', 'anthropic', 'gemini', 'deepseek', 'ollama', GITHUB_COPILOT_PROVIDER] as const;
+const SUPPORTED_LLM_PROVIDERS = ['openai', 'anthropic', 'gemini', 'deepseek', 'ollama', 'local_llm', GITHUB_COPILOT_PROVIDER] as const;
 const SUPPORTED_LLM_PROVIDER_SET = new Set<string>(SUPPORTED_LLM_PROVIDERS);
 type SupportedLlmProvider = (typeof SUPPORTED_LLM_PROVIDERS)[number];
 
@@ -182,12 +182,25 @@ class LLMProviderService {
             }
         }
 
+        // Normalize local_llm settings: build baseUrl from host/port
+        if (data.provider === 'local_llm') {
+            const parsed = JSON.parse(data.settings_json || '{}');
+            if (parsed.host || parsed.port) {
+                const host = String(parsed.host || '127.0.0.1').trim();
+                const port = parsed.port ? Number(parsed.port) : 8080;
+                const protocol = parsed.protocol || 'http';
+                parsed.baseUrl = `${protocol}://${host}:${port}`;
+                data.settings_json = JSON.stringify(parsed);
+            }
+        }
+
         const existing = db.prepare('SELECT * FROM llm_config WHERE provider = ?').get(data.provider) as LLMConfig | undefined;
         const normalizedModel = String(
             data.model
             || (data.provider === GITHUB_COPILOT_PROVIDER ? githubIntegration.getConnectionStatus(userId).selectedModel || '' : ''),
         ).trim();
-        const normalizedApiKey = data.provider === GITHUB_COPILOT_PROVIDER
+        const noApiKeyProviders: ReadonlySet<string> = new Set([GITHUB_COPILOT_PROVIDER, 'local_llm']);
+        const normalizedApiKey = noApiKeyProviders.has(data.provider)
             ? ''
             : (data.api_key && data.api_key.trim())
                 ? data.api_key
@@ -235,7 +248,7 @@ class LLMProviderService {
         const config = db.prepare('SELECT * FROM llm_config WHERE provider = ?').get(provider) as LLMConfig;
 
         if (!config) {
-            return { success: false, error: `No configuration found for provider '${provider}'. Please save API key first.` };
+            return { success: false, error: `No configuration found for provider '${provider}'. Please save configuration first.` };
         }
 
         if (!config.api_key || config.api_key.trim() === '') {
@@ -248,7 +261,8 @@ class LLMProviderService {
                 if (!status.providerReady) {
                     return { success: false, error: status.lastDiscoveryError || 'GitHub Copilot is connected, but no selectable models are ready yet.' };
                 }
-            } else {
+            } else if (config.provider !== 'local_llm') {
+                // local_llm does not require an API key
                 return { success: false, error: `API key is empty for provider '${provider}'. Please enter a valid API key.` };
             }
         }
@@ -362,6 +376,10 @@ class LLMProviderService {
                     // Some Ollama models support vision (llava, bakllava, etc.)
                     supported = model.includes('llava') || model.includes('vision') || model.includes('moondream');
                     break;
+                case 'local_llm':
+                    // Conservative: do not assume vision support for local models
+                    supported = false;
+                    break;
                 case GITHUB_COPILOT_PROVIDER:
                     supported = githubIntegration.getCachedModel(userId, config.model)?.supportsVision
                         || model.includes('vision')
@@ -449,6 +467,9 @@ class LLMProviderService {
                 break;
             case 'ollama':
                 result = await this.callOllama(config, req, temperature);
+                break;
+            case 'local_llm':
+                result = await this.callLocalLlm(config, req, temperature);
                 break;
             case GITHUB_COPILOT_PROVIDER:
                 result = await this.callGitHubCopilot(config, req, metadata.userId, executionOptions);
@@ -661,6 +682,138 @@ class LLMProviderService {
                 input_tokens: data.prompt_eval_count || 0,
                 output_tokens: data.eval_count || 0,
             } : undefined
+        };
+    }
+
+    /**
+     * Extract usable text from a local LLM response choice.
+     *
+     * Real OpenAI-compatible servers (vLLM, LM Studio, Ollama HTTP, text-generation-webui)
+     * and Qwen reasoning models may return text in several locations:
+     *   - choices[0].message.content           (standard OpenAI)
+     *   - choices[0].message.reasoning_content  (Qwen reasoning models)
+     *   - choices[0].message.reasoning           (some vLLM variants)
+     *   - choices[0].reasoning_content            (flat choice-level field)
+     *   - choices[0].reasoning                    (flat choice-level field)
+     *
+     * Content may also be an array of content blocks (e.g. [{type:"text", text:"..."}])
+     * rather than a plain string.
+     *
+     * Returns the extracted text, or null if nothing usable was found.
+     */
+    private extractLocalLlmText(choice: any): string | null {
+        const message = choice?.message;
+
+        // Probe candidate fields in priority order
+        const candidates: unknown[] = [
+            message?.content,
+            message?.reasoning_content,
+            message?.reasoning,
+            choice?.reasoning_content,
+            choice?.reasoning,
+        ];
+
+        for (const candidate of candidates) {
+            if (typeof candidate === 'string' && candidate.length > 0) {
+                return candidate;
+            }
+            // Support array-based content blocks: [{type:"text", text:"..."}, ...]
+            if (Array.isArray(candidate) && candidate.length > 0) {
+                const parts: string[] = [];
+                for (const block of candidate) {
+                    if (typeof block === 'string') {
+                        parts.push(block);
+                    } else if (block && typeof block.text === 'string') {
+                        parts.push(block.text);
+                    }
+                }
+                if (parts.length > 0) {
+                    return parts.join('');
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Call a local OpenAI-compatible LLM endpoint.
+     * Uses raw axios to avoid OpenAI SDK API-key validation.
+     */
+    private async callLocalLlm(config: LLMConfig, req: GenerationRequest, temp: number) {
+        const settings = JSON.parse(config.settings_json || '{}');
+        const baseUrl = settings.baseUrl;
+
+        if (!baseUrl) {
+            throw new Error('Local LLM base URL is not configured. Please set host and port in settings.');
+        }
+
+        const url = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
+
+        let response: any;
+        try {
+            response = await axios.post(url, {
+                model: config.model,
+                messages: [
+                    { role: 'system', content: req.systemPrompt },
+                    { role: 'user', content: req.userPrompt },
+                ],
+                max_tokens: settings.maxTokens || 4096,
+                temperature: temp,
+            }, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: settings.timeout || 120_000,
+                validateStatus: () => true,
+            });
+        } catch (e: any) {
+            if (e.code === 'ECONNREFUSED' || e.code === 'ENOTFOUND') {
+                throw new Error(`Local LLM endpoint unreachable at ${baseUrl}. Ensure the server is running and the host/port are correct.`);
+            }
+            if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') {
+                throw new Error(`Local LLM request timed out connecting to ${baseUrl}. The server may be overloaded or unresponsive.`);
+            }
+            throw new Error(`Local LLM request failed: ${e.message || e}`);
+        }
+
+        const data = response.data;
+
+        // Handle HTTP error status codes
+        if (response.status !== 200) {
+            const errorMsg = data?.error?.message || data?.error || data?.message || JSON.stringify(data);
+            if (response.status === 404) {
+                throw new Error(`Local LLM model '${config.model}' not found. Check the model name and ensure it is loaded on the server.`);
+            }
+            throw new Error(`Local LLM returned HTTP ${response.status}: ${errorMsg}`);
+        }
+
+        // Diagnostic: log a short preview of the response body for debugging
+        try {
+            const preview = JSON.stringify(data).slice(0, 512);
+            logger.info('local_llm.response.preview', { provider: 'local_llm', model: config.model, preview });
+        } catch { /* best-effort diagnostic — never block on logging failures */ }
+
+        // Validate OpenAI-compatible response shape
+        if (!data || !data.choices || !Array.isArray(data.choices) || data.choices.length === 0) {
+            throw new Error('Local LLM returned an invalid response format. Expected OpenAI-compatible choices array.');
+        }
+
+        const text = this.extractLocalLlmText(data.choices[0]);
+        if (!text) {
+            const bodyPreview = JSON.stringify(data).slice(0, 300);
+            throw new Error(
+                `Local LLM returned a response with no extractable text. `
+                + `Checked message.content, message.reasoning_content, message.reasoning, `
+                + `choice.reasoning_content, and choice.reasoning. `
+                + `Body preview: ${bodyPreview}`,
+            );
+        }
+
+        return {
+            text,
+            usage: data.usage ? {
+                input_tokens: data.usage.prompt_tokens || 0,
+                output_tokens: data.usage.completion_tokens || 0,
+            } : undefined,
         };
     }
 
