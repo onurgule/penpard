@@ -172,6 +172,7 @@
         "wait-on": "^7.2.0"
     },
     "dependencies": {
+        "@github/copilot-sdk": "^0.2.2",
         "electron-updater": "^6.1.0"
     },
     "overrides": {

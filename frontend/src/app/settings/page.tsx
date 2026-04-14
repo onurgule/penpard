@@ -36,6 +36,7 @@ import ReportTemplateEditor from '@/components/ReportTemplateEditor';
 import { API_URL } from '@/lib/api-config';
 import { idleGitHubAuthUiState, isGitHubProviderSelected, normalizeGitHubProviderSelection, startGitHubBrowserAuthFlow } from './github-auth-flow';
 import GitHubCopilotProviderCard from './GitHubCopilotProviderCard';
+import LocalLlmProviderCard from './LocalLlmProviderCard';
 import {
     createGitHubAppConfigDraft,
     isGitHubAppConfigDirty,
@@ -50,7 +51,7 @@ import {
     type GitHubCopilotModel,
 } from './github-copilot-types';
 
-type LLMProvider = 'gemini' | 'deepseek' | 'openai' | 'anthropic' | 'ollama' | typeof GITHUB_COPILOT_PROVIDER;
+type LLMProvider = 'gemini' | 'deepseek' | 'openai' | 'anthropic' | 'ollama' | 'local_llm' | typeof GITHUB_COPILOT_PROVIDER;
 
 interface LLMConfig {
     provider: LLMProvider;
@@ -130,6 +131,14 @@ export default function SettingsPage() {
     const githubAppConfigDirty = isGitHubAppConfigDirty(githubAppConfig, githubAppConfigDraft);
     const githubAppConfigRequiresSecret = requiresGitHubAppClientSecret(githubAppConfig, githubAppConfigDraft);
 
+    // Local LLM State
+    const [localLlmHost, setLocalLlmHost] = useState('127.0.0.1');
+    const [localLlmPort, setLocalLlmPort] = useState('8080');
+    const [localLlmModel, setLocalLlmModel] = useState('');
+    const [localLlmSaving, setLocalLlmSaving] = useState(false);
+    const localLlmConfig = configs.find(c => c.provider === 'local_llm');
+    const localLlmIsActive = localLlmConfig?.is_active === 1;
+
     // Auth guard - redirect to login if not authenticated
     useEffect(() => {
         if (!isAuthenticated) {
@@ -192,7 +201,22 @@ export default function SettingsPage() {
     const fetchSettings = async (githubProviderReady = githubStatus.providerReady) => {
         try {
             const res = await axios.get(`${API_URL}/config/llm`, { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 });
-            setConfigs(normalizeGitHubProviderSelection(res.data.configs || [], githubProviderReady));
+            const fetched = normalizeGitHubProviderSelection(
+                (res.data.configs || []) as LLMConfig[],
+                githubProviderReady,
+            );
+            setConfigs(fetched);
+
+            // Sync local LLM fields from fetched config
+            const llmCfg = fetched.find(c => c.provider === 'local_llm');
+            if (llmCfg) {
+                try {
+                    const s = JSON.parse(llmCfg.settings_json || '{}');
+                    if (s.host) setLocalLlmHost(s.host);
+                    if (s.port) setLocalLlmPort(String(s.port));
+                } catch { /* ignore */ }
+                if (llmCfg.model && llmCfg.model !== 'default') setLocalLlmModel(llmCfg.model);
+            }
         } catch {
             // Backend may not be ready yet
         }
@@ -596,6 +620,48 @@ export default function SettingsPage() {
         }
     };
 
+    // ── Local LLM Methods ──
+
+    const buildLocalLlmSettingsJson = () => JSON.stringify({
+        host: localLlmHost.trim() || '127.0.0.1',
+        port: Number(localLlmPort) || 8080,
+    });
+
+    const saveLocalLlm = async () => {
+        if (!localLlmModel.trim()) {
+            toast.error('Model name is required for Local LLM.');
+            return;
+        }
+        setLocalLlmSaving(true);
+        try {
+            await updateConfig('local_llm', {
+                api_key: '',
+                model: localLlmModel.trim(),
+                settings_json: buildLocalLlmSettingsJson(),
+            });
+        } finally {
+            setLocalLlmSaving(false);
+        }
+    };
+
+    const saveAndTestLocalLlm = async () => {
+        if (!localLlmModel.trim()) {
+            toast.error('Model name is required for Local LLM.');
+            return;
+        }
+        setLocalLlmSaving(true);
+        try {
+            await updateConfig('local_llm', {
+                api_key: '',
+                model: localLlmModel.trim(),
+                settings_json: buildLocalLlmSettingsJson(),
+            });
+            await testConnection('local_llm');
+        } finally {
+            setLocalLlmSaving(false);
+        }
+    };
+
     if (!isAuthenticated) return null;
 
     return (
@@ -684,6 +750,35 @@ export default function SettingsPage() {
                                 onTestConnection={() => testConnection(GITHUB_COPILOT_PROVIDER)}
                                 onOpenBrowserAgain={() => githubAuthorizationUrl ? openGithubAuthorization(githubAuthorizationUrl) : startGithubBrowserAuth()}
                                 onRefreshAuthSession={() => githubAuthSessionId ? fetchGithubAuthSession(githubAuthSessionId) : Promise.resolve()}
+                            />
+                        </motion.div>
+
+                        {/* Separator */}
+                        <div className="flex items-center gap-3 py-1">
+                            <div className="h-px flex-1 bg-slate-800"></div>
+                            <span className="text-[10px] text-slate-600 uppercase font-bold tracking-widest">Self-Hosted</span>
+                            <div className="h-px flex-1 bg-slate-800"></div>
+                        </div>
+
+                        <motion.div layout>
+                            <LocalLlmProviderCard
+                                host={localLlmHost}
+                                port={localLlmPort}
+                                model={localLlmModel}
+                                isActive={localLlmIsActive}
+                                testStatus={statusMap['local_llm']}
+                                saving={localLlmSaving}
+                                onChangeHost={setLocalLlmHost}
+                                onChangePort={setLocalLlmPort}
+                                onChangeModel={setLocalLlmModel}
+                                onSave={saveLocalLlm}
+                                onSaveAndTest={saveAndTestLocalLlm}
+                                onToggleActive={() => updateConfig('local_llm', {
+                                    api_key: '',
+                                    model: localLlmModel.trim() || 'default',
+                                    is_active: localLlmIsActive ? 0 : 1,
+                                    settings_json: buildLocalLlmSettingsJson(),
+                                })}
                             />
                         </motion.div>
 
