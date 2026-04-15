@@ -1,3 +1,5 @@
+import type { NormalizedUsage } from './LlmProviderTypes';
+
 export type LlmCallSite =
     | 'plan_creation'
     | 'plan_json_repair'
@@ -114,14 +116,26 @@ export interface ProviderAttemptDiagnostics {
     livenessCategory?: LlmLivenessCategory | null;
     warningCategory?: LlmWarningCategory | null;
     rawProviderError?: string | null;
+    finishReason?: string | null;
+    toolCallCount?: number;
+    reasoningContentLength?: number;
+    visibleContentLength?: number;
 }
 
 export interface ProviderAttemptResult {
     text: string;
-    usage?: {
-        input_tokens: number;
-        output_tokens: number;
-    };
+    reasoning?: string | null;
+    toolCalls?: Array<{
+        id?: string;
+        type: 'function';
+        function: {
+            name: string;
+            arguments: string;
+            parsedArguments?: unknown;
+        };
+    }>;
+    finishReason?: string | null;
+    usage?: NormalizedUsage;
     provider: string;
     model: string;
     executionMs: number;
@@ -156,6 +170,10 @@ export interface LlmAttemptTrace {
     completionSignal: LlmCompletionSignal | null;
     livenessCategory?: LlmLivenessCategory | null;
     warningCategory?: LlmWarningCategory | null;
+    finishReason?: string | null;
+    toolCallCount?: number;
+    reasoningContentLength?: number;
+    visibleContentLength?: number;
     failureCategory?: LlmFailureCategory | null;
     rawError?: string | null;
     retryDecision?: LlmRetryDecision;

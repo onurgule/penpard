@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { EndpointSummary } from '../SourceAnalysisMode';
 import { llmRuntime } from '../../llm/LlmRuntime';
+import { buildJsonObjectResponseFormat, parseStructuredJsonResponse } from '../../llm/LlmStructuredOutput';
 import { logger } from '../../../utils/logger';
 
 const SOURCE_EXTENSIONS = new Set([
@@ -124,17 +125,40 @@ export async function extractRoutesWithAI(sourcePath: string, existingRoutes: En
         const response = await llmRuntime.generate({
             systemPrompt: SYSTEM_PROMPT,
             userPrompt,
+            responseFormat: buildJsonObjectResponseFormat(),
+            reasoningMode: 'disabled',
         }, {
             userId,
             callSite: 'source_analysis',
             context: 'ai-route-extraction',
         });
 
-        // Parse JSON response
-        let parsed: any[];
         try {
-            const cleaned = response.text.trim().replace(/^```json?\s*/i, '').replace(/```\s*$/i, '').trim();
-            parsed = JSON.parse(cleaned);
+            const parsed = parseStructuredJsonResponse<any[]>(response, { label: 'AI route extraction response' });
+            if (!Array.isArray(parsed)) return [];
+
+            // Convert to EndpointSummary and deduplicate against existing
+            const existingKeys = new Set(existingRoutes.map(r => `${r.method}:${r.path}`));
+            const results: EndpointSummary[] = [];
+
+            for (const ep of parsed) {
+                if (!ep.method || !ep.path) continue;
+                const key = `${String(ep.method).toUpperCase()}:${ep.path}`;
+                if (existingKeys.has(key)) continue; // skip duplicates (vs static AND vs self)
+                existingKeys.add(key); // track to prevent self-duplicates
+
+                results.push({
+                    method: String(ep.method).toUpperCase(),
+                    path: String(ep.path),
+                    handler: String(ep.handler || 'ai-detected'),
+                    authRequired: Boolean(ep.authRequired),
+                    description: String(ep.description || ''),
+                    userInputs: Array.isArray(ep.userInputs) ? ep.userInputs.map(String) : [],
+                });
+            }
+
+            logger.info(`AI Route Extractor: Discovered ${results.length} additional dynamic routes`);
+            return results;
         } catch {
             logger.warn('AI Route Extractor: Failed to parse LLM response as JSON', {
                 responseLength: response.text.length,
@@ -142,31 +166,6 @@ export async function extractRoutesWithAI(sourcePath: string, existingRoutes: En
             });
             return [];
         }
-
-        if (!Array.isArray(parsed)) return [];
-
-        // Convert to EndpointSummary and deduplicate against existing
-        const existingKeys = new Set(existingRoutes.map(r => `${r.method}:${r.path}`));
-        const results: EndpointSummary[] = [];
-
-        for (const ep of parsed) {
-            if (!ep.method || !ep.path) continue;
-            const key = `${String(ep.method).toUpperCase()}:${ep.path}`;
-            if (existingKeys.has(key)) continue; // skip duplicates (vs static AND vs self)
-            existingKeys.add(key); // track to prevent self-duplicates
-
-            results.push({
-                method: String(ep.method).toUpperCase(),
-                path: String(ep.path),
-                handler: String(ep.handler || 'ai-detected'),
-                authRequired: Boolean(ep.authRequired),
-                description: String(ep.description || ''),
-                userInputs: Array.isArray(ep.userInputs) ? ep.userInputs.map(String) : [],
-            });
-        }
-
-        logger.info(`AI Route Extractor: Discovered ${results.length} additional dynamic routes`);
-        return results;
 
     } catch (err: any) {
         logger.error('AI Route Extractor failed', { error: err.message });

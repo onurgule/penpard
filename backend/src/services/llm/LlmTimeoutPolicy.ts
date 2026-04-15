@@ -37,8 +37,63 @@ function resolveMaxAttempts(callSite: LlmCallSite, criticality: LlmCriticality):
 }
 
 export function computePromptMetrics(request: GenerationRequest): LlmPromptMetrics {
-    const systemPromptChars = request.systemPrompt.length;
-    const userPromptChars = request.userPrompt.length;
+    if (request.messages?.length) {
+        let totalPromptChars = 0;
+        let systemPromptChars = 0;
+        let userPromptChars = 0;
+        let imageCount = 0;
+
+        for (const message of request.messages) {
+            const content = Array.isArray(message.content) ? message.content : [message.content];
+            let messageChars = 0;
+
+            for (const block of content) {
+                if (typeof block === 'string') {
+                    messageChars += block.length;
+                    continue;
+                }
+                if (!block || typeof block !== 'object') {
+                    continue;
+                }
+                if (typeof block.text === 'string') {
+                    messageChars += block.text.length;
+                }
+                if ((block as any).image_url?.url) {
+                    imageCount += 1;
+                }
+            }
+
+            totalPromptChars += messageChars;
+            if (message.role === 'system') {
+                systemPromptChars += messageChars;
+            }
+            if (message.role === 'user') {
+                userPromptChars += messageChars;
+            }
+
+            if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+                for (const toolCall of message.tool_calls) {
+                    totalPromptChars += toolCall.function?.name?.length || 0;
+                    totalPromptChars += toolCall.function?.arguments?.length || 0;
+                }
+            }
+
+            if (message.role === 'tool') {
+                totalPromptChars += message.tool_call_id?.length || 0;
+                totalPromptChars += message.name?.length || 0;
+            }
+        }
+
+        return {
+            systemPromptChars,
+            userPromptChars,
+            totalPromptChars,
+            imageCount,
+        };
+    }
+
+    const systemPromptChars = request.systemPrompt?.length || 0;
+    const userPromptChars = request.userPrompt?.length || 0;
 
     return {
         systemPromptChars,

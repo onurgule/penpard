@@ -7,7 +7,14 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import { githubIntegration } from './GitHubIntegrationService';
 import { GITHUB_COPILOT_PROVIDER, LEGACY_GITHUB_MODELS_PROVIDER } from './github/config';
+import { callOpenAiCompatibleLocalModel, type LocalOpenAiResponseSummary } from './llm/OpenAiCompatibleLocalAdapter';
 import { computePromptMetrics } from './llm/LlmTimeoutPolicy';
+import type {
+    GenerationImage,
+    GenerationRequest,
+    GenerationResponse,
+    NormalizedUsage,
+} from './llm/LlmProviderTypes';
 import {
     LlmCallOptions,
     LlmExecutionError,
@@ -26,8 +33,8 @@ let logTokenStmt: any = null;
 function getLogTokenStmt() {
     if (!logTokenStmt) {
         logTokenStmt = db.prepare(`
-            INSERT INTO token_usage (provider, model, input_tokens, output_tokens, total_tokens, scan_id, report_export_id, context)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO token_usage (provider, model, input_tokens, output_tokens, total_tokens, reasoning_tokens, scan_id, report_export_id, context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
     }
     return logTokenStmt;
@@ -50,26 +57,6 @@ export interface LLMConfigSummary extends Omit<LLMConfig, 'api_key'> {
     has_api_key: boolean;
 }
 
-export interface GenerationImage {
-    data: string;        // base64 encoded image data (no prefix)
-    mimeType: string;    // 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
-}
-
-export interface GenerationRequest {
-    systemPrompt: string;
-    userPrompt: string;
-    images?: GenerationImage[];  // Optional images for vision-capable models
-    temperature?: number;
-}
-
-export interface GenerationResponse {
-    text: string;
-    usage?: {
-        input_tokens: number;
-        output_tokens: number;
-    };
-}
-
 export interface GenerationMetadata {
     scanId?: string;
     userId?: number;
@@ -84,7 +71,16 @@ export interface GenerationMetadata {
 
 interface ProviderBackedGenerationResponse extends GenerationResponse {
     diagnostics?: Partial<ProviderAttemptDiagnostics>;
+    resolvedModel?: string | null;
+    responseSummary?: LocalOpenAiResponseSummary;
 }
+
+export type {
+    GenerationImage,
+    GenerationRequest,
+    GenerationResponse,
+    NormalizedUsage,
+} from './llm/LlmProviderTypes';
 
 function isSupportedProvider(provider: string): provider is SupportedLlmProvider {
     return SUPPORTED_LLM_PROVIDER_SET.has(provider);
@@ -289,6 +285,9 @@ class LLMProviderService {
         const result = await this.executeAttempt(request, normalizedMetadata);
         return {
             text: result.text,
+            reasoning: result.reasoning,
+            toolCalls: result.toolCalls,
+            finishReason: result.finishReason,
             usage: result.usage,
         };
     }
@@ -312,9 +311,12 @@ class LLMProviderService {
 
         return {
             text: result.text,
+            reasoning: result.reasoning,
+            toolCalls: result.toolCalls,
+            finishReason: result.finishReason,
             usage: result.usage,
             provider: config.provider,
-            model: config.model,
+            model: result.resolvedModel || config.model,
             executionMs: Date.now() - startedAtMs,
             promptMetrics,
             diagnostics: {
@@ -338,6 +340,10 @@ class LLMProviderService {
                 livenessCategory: null,
                 warningCategory: null,
                 rawProviderError: null,
+                finishReason: result.finishReason ?? null,
+                toolCallCount: result.toolCalls?.length || 0,
+                reasoningContentLength: result.reasoning?.length || 0,
+                visibleContentLength: result.text.length,
                 ...(result.diagnostics || {}),
             },
         };
@@ -405,20 +411,23 @@ class LLMProviderService {
     private logTokenUsage(
         provider: string,
         model: string,
-        usage?: { input_tokens: number; output_tokens: number },
+        usage?: NormalizedUsage,
         scanId?: string,
         context?: string,
         reportExportId?: string,
     ) {
         if (!usage) return;
         try {
-            const total = usage.input_tokens + usage.output_tokens;
+            const total = typeof usage.total_tokens === 'number'
+                ? usage.total_tokens
+                : usage.input_tokens + usage.output_tokens;
             getLogTokenStmt().run(
                 provider,
                 model,
                 usage.input_tokens,
                 usage.output_tokens,
                 total,
+                usage.reasoning_tokens ?? 0,
                 scanId || null,
                 reportExportId || null,
                 context || null
@@ -469,7 +478,7 @@ class LLMProviderService {
                 result = await this.callOllama(config, req, temperature);
                 break;
             case 'local_llm':
-                result = await this.callLocalLlm(config, req, temperature);
+                result = await this.callLocalLlm(config, req, temperature, executionOptions);
                 break;
             case GITHUB_COPILOT_PROVIDER:
                 result = await this.callGitHubCopilot(config, req, metadata.userId, executionOptions);
@@ -478,17 +487,24 @@ class LLMProviderService {
                 throw new Error(`Unsupported provider: ${config.provider}`);
         }
 
-        if (!result.text || !result.text.trim()) {
+        if (!result.text.trim() && !(result.toolCalls && result.toolCalls.length > 0)) {
             throw new LlmExecutionError({
                 failureCategory: 'malformed_provider_result',
-                message: `${config.provider} (${config.model}) returned an empty response.`,
+                message: `${config.provider} (${result.resolvedModel || config.model}) returned no visible assistant content.`,
+                diagnostics: {
+                    ...(result.diagnostics || {}),
+                    finishReason: result.finishReason ?? result.diagnostics?.finishReason ?? null,
+                    toolCallCount: result.toolCalls?.length || 0,
+                    reasoningContentLength: result.reasoning?.length || 0,
+                    visibleContentLength: result.text.length,
+                },
             });
         }
 
         // Log token usage after every successful call
         this.logTokenUsage(
             config.provider,
-            config.model,
+            result.resolvedModel || config.model,
             result.usage,
             metadata.scanId,
             metadata.context || context,
@@ -532,18 +548,21 @@ class LLMProviderService {
 
         const completion = await openai.chat.completions.create({
             messages: [
-                { role: 'system', content: req.systemPrompt },
+                { role: 'system', content: req.systemPrompt || '' },
                 { role: 'user', content: userContent }
             ],
             model: config.model,
             temperature: temp,
+            ...(req.maxTokens ? { max_tokens: req.maxTokens } : {}),
         });
 
         return {
             text: completion.choices[0].message.content || '',
+            finishReason: completion.choices[0].finish_reason || null,
             usage: completion.usage ? {
                 input_tokens: completion.usage.prompt_tokens,
-                output_tokens: completion.usage.completion_tokens
+                output_tokens: completion.usage.completion_tokens,
+                total_tokens: completion.usage.total_tokens,
             } : undefined
         };
     }
@@ -573,9 +592,9 @@ class LLMProviderService {
 
         const message = await anthropic.messages.create({
             model: config.model,
-            max_tokens: 4096,
+            max_tokens: req.maxTokens ?? 4096,
             temperature: temp,
-            system: req.systemPrompt,
+            system: req.systemPrompt || '',
             messages: [
                 { role: 'user', content: userContent }
             ]
@@ -590,7 +609,8 @@ class LLMProviderService {
             text: text,
             usage: {
                 input_tokens: message.usage.input_tokens,
-                output_tokens: message.usage.output_tokens
+                output_tokens: message.usage.output_tokens,
+                total_tokens: message.usage.input_tokens + message.usage.output_tokens,
             }
         };
     }
@@ -648,17 +668,20 @@ class LLMProviderService {
         });
         const completion = await openai.chat.completions.create({
             messages: [
-                { role: 'system', content: req.systemPrompt },
-                { role: 'user', content: req.userPrompt }
+                { role: 'system', content: req.systemPrompt || '' },
+                { role: 'user', content: req.userPrompt || '' }
             ],
             model: config.model,
             temperature: temp,
+            ...(req.maxTokens ? { max_tokens: req.maxTokens } : {}),
         });
         return {
             text: completion.choices[0].message.content || '',
+            finishReason: completion.choices[0].finish_reason || null,
             usage: completion.usage ? {
                 input_tokens: completion.usage.prompt_tokens,
-                output_tokens: completion.usage.completion_tokens
+                output_tokens: completion.usage.completion_tokens,
+                total_tokens: completion.usage.total_tokens,
             } : undefined
         };
     }
@@ -669,9 +692,12 @@ class LLMProviderService {
 
         const response = await axios.post(`${baseUrl}/api/generate`, {
             model: config.model,
-            prompt: `${req.systemPrompt}\n\n${req.userPrompt}`,
+            prompt: `${req.systemPrompt || ''}\n\n${req.userPrompt || ''}`,
             stream: false,
-            options: { temperature: temp }
+            options: {
+                temperature: temp,
+                ...(req.maxTokens ? { num_predict: req.maxTokens } : {}),
+            }
         });
 
         // Ollama returns prompt_eval_count and eval_count for token metrics
@@ -681,6 +707,7 @@ class LLMProviderService {
             usage: (data.prompt_eval_count || data.eval_count) ? {
                 input_tokens: data.prompt_eval_count || 0,
                 output_tokens: data.eval_count || 0,
+                total_tokens: (data.prompt_eval_count || 0) + (data.eval_count || 0),
             } : undefined
         };
     }
@@ -740,7 +767,12 @@ class LLMProviderService {
      * Call a local OpenAI-compatible LLM endpoint.
      * Uses raw axios to avoid OpenAI SDK API-key validation.
      */
-    private async callLocalLlm(config: LLMConfig, req: GenerationRequest, temp: number) {
+    private async callLocalLlm(
+        config: LLMConfig,
+        req: GenerationRequest,
+        temp: number,
+        executionOptions: ProviderExecutionOptions = {},
+    ) {
         const settings = JSON.parse(config.settings_json || '{}');
         const baseUrl = settings.baseUrl;
 
@@ -748,73 +780,31 @@ class LLMProviderService {
             throw new Error('Local LLM base URL is not configured. Please set host and port in settings.');
         }
 
-        const url = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
+        const result = await callOpenAiCompatibleLocalModel({
+            baseUrl,
+            configuredModel: config.model,
+            defaultMaxTokens: settings.maxTokens || 4096,
+            temperature: temp,
+            timeoutMs: settings.timeout || 120_000,
+            request: req,
+            executionOptions,
+        });
 
-        let response: any;
-        try {
-            response = await axios.post(url, {
-                model: config.model,
-                messages: [
-                    { role: 'system', content: req.systemPrompt },
-                    { role: 'user', content: req.userPrompt },
-                ],
-                max_tokens: settings.maxTokens || 4096,
-                temperature: temp,
-            }, {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: settings.timeout || 120_000,
-                validateStatus: () => true,
-            });
-        } catch (e: any) {
-            if (e.code === 'ECONNREFUSED' || e.code === 'ENOTFOUND') {
-                throw new Error(`Local LLM endpoint unreachable at ${baseUrl}. Ensure the server is running and the host/port are correct.`);
-            }
-            if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') {
-                throw new Error(`Local LLM request timed out connecting to ${baseUrl}. The server may be overloaded or unresponsive.`);
-            }
-            throw new Error(`Local LLM request failed: ${e.message || e}`);
-        }
+        logger.info('local_llm.response.summary', {
+            provider: 'local_llm',
+            configuredModel: config.model,
+            resolvedModel: result.resolvedModel || null,
+            streamed: result.responseSummary.streamed,
+            finishReason: result.responseSummary.finishReason,
+            hasContent: result.responseSummary.hasContent,
+            contentLength: result.responseSummary.contentLength,
+            hasReasoning: result.responseSummary.hasReasoning,
+            reasoningLength: result.responseSummary.reasoningLength,
+            toolCallCount: result.responseSummary.toolCallCount,
+            usageFields: result.responseSummary.usageFields,
+        });
 
-        const data = response.data;
-
-        // Handle HTTP error status codes
-        if (response.status !== 200) {
-            const errorMsg = data?.error?.message || data?.error || data?.message || JSON.stringify(data);
-            if (response.status === 404) {
-                throw new Error(`Local LLM model '${config.model}' not found. Check the model name and ensure it is loaded on the server.`);
-            }
-            throw new Error(`Local LLM returned HTTP ${response.status}: ${errorMsg}`);
-        }
-
-        // Diagnostic: log a short preview of the response body for debugging
-        try {
-            const preview = JSON.stringify(data).slice(0, 512);
-            logger.info('local_llm.response.preview', { provider: 'local_llm', model: config.model, preview });
-        } catch { /* best-effort diagnostic — never block on logging failures */ }
-
-        // Validate OpenAI-compatible response shape
-        if (!data || !data.choices || !Array.isArray(data.choices) || data.choices.length === 0) {
-            throw new Error('Local LLM returned an invalid response format. Expected OpenAI-compatible choices array.');
-        }
-
-        const text = this.extractLocalLlmText(data.choices[0]);
-        if (!text) {
-            const bodyPreview = JSON.stringify(data).slice(0, 300);
-            throw new Error(
-                `Local LLM returned a response with no extractable text. `
-                + `Checked message.content, message.reasoning_content, message.reasoning, `
-                + `choice.reasoning_content, and choice.reasoning. `
-                + `Body preview: ${bodyPreview}`,
-            );
-        }
-
-        return {
-            text,
-            usage: data.usage ? {
-                input_tokens: data.usage.prompt_tokens || 0,
-                output_tokens: data.usage.completion_tokens || 0,
-            } : undefined,
-        };
+        return result;
     }
 
     private async callGitHubCopilot(
@@ -824,8 +814,8 @@ class LLMProviderService {
         executionOptions: ProviderExecutionOptions,
     ) {
         return githubIntegration.generateCopilotResponse(userId ?? GITHUB_RUNTIME_USER_ID, config.model, {
-            systemPrompt: req.systemPrompt,
-            userPrompt: req.userPrompt,
+            systemPrompt: req.systemPrompt || '',
+            userPrompt: req.userPrompt || '',
             images: req.images,
         }, executionOptions);
     }

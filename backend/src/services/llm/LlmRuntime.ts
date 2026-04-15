@@ -132,6 +132,10 @@ function createAttemptTrace(
         completionSignal: diagnostics?.completionSignal ?? null,
         livenessCategory: diagnostics?.livenessCategory ?? normalizedError?.livenessCategory ?? null,
         warningCategory: diagnostics?.warningCategory ?? null,
+        finishReason: diagnostics?.finishReason ?? result?.finishReason ?? null,
+        toolCallCount: diagnostics?.toolCallCount ?? result?.toolCalls?.length ?? 0,
+        reasoningContentLength: diagnostics?.reasoningContentLength ?? result?.reasoning?.length ?? 0,
+        visibleContentLength: diagnostics?.visibleContentLength ?? result?.text.length ?? 0,
         failureCategory,
         rawError: rawError ?? diagnostics?.rawProviderError ?? null,
         retryDecision: undefined,
@@ -284,6 +288,7 @@ class LlmRuntime {
         startedAtMs: number,
         queueSignal?: AbortSignal,
     ): Promise<GenerationResponse> {
+        let lastRetryableFailure: LlmExecutionError | undefined;
         for (let attempt = 1; attempt <= resolved.maxAttempts; attempt += 1) {
             if (resolved.signal?.aborted || queueSignal?.aborted) {
                 throw new LlmExecutionError({
@@ -300,7 +305,7 @@ class LlmRuntime {
                 ? null
                 : resolved.retryBudgetMs - elapsedMs;
             if (remainingBudgetMs !== null && remainingBudgetMs <= 0) {
-                throw this.buildRetryBudgetError(resolved.retryBudgetMs);
+                throw this.buildRetryBudgetError(resolved.retryBudgetMs, lastRetryableFailure);
             }
 
             const signalBundle = combineAbortSignals([resolved.signal, queueSignal]);
@@ -341,6 +346,9 @@ class LlmRuntime {
 
                 return {
                     text: result.text,
+                    reasoning: result.reasoning,
+                    toolCalls: result.toolCalls,
+                    finishReason: result.finishReason,
                     usage: result.usage,
                 };
             } catch (error) {
@@ -367,6 +375,7 @@ class LlmRuntime {
                 logLlmAttemptFailed(resolved, attemptTrace);
 
                 if (retryDecision.decision === 'retry') {
+                    lastRetryableFailure = normalized;
                     await sleep(Math.min(1500 * attempt, 3000));
                     continue;
                 }
@@ -385,7 +394,7 @@ class LlmRuntime {
             }
         }
 
-        throw this.buildRetryBudgetError(resolved.retryBudgetMs);
+        throw this.buildRetryBudgetError(resolved.retryBudgetMs, lastRetryableFailure);
     }
 
     private normalizeError(

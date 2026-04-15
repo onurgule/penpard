@@ -1,5 +1,6 @@
 import { llmRuntime } from '../llm/LlmRuntime';
 import { llmProvider } from '../LLMProviderService';
+import { buildJsonSchemaResponseFormat, parseStructuredJsonResponse } from '../llm/LlmStructuredOutput';
 import { logger } from '../../utils/logger';
 import { applyNarrativePatch } from './reporting-model';
 import { reportNarrativePatchSchema } from './types';
@@ -17,6 +18,30 @@ interface EnrichmentResult {
     llmStatus: ReportLlmStatus;
     errorMessage: string | null;
 }
+
+const REPORT_NARRATIVE_PATCH_JSON_SCHEMA = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        executiveSummary: { type: 'string', minLength: 1, maxLength: 2500 },
+        remediationOverview: { type: 'string', minLength: 1, maxLength: 2500 },
+        findings: {
+            type: 'array',
+            maxItems: 250,
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                    findingId: { type: 'integer', minimum: 1 },
+                    description: { type: 'string', minLength: 1, maxLength: 3000 },
+                    impact: { type: 'string', minLength: 1, maxLength: 2000 },
+                    remediation: { type: 'string', minLength: 1, maxLength: 2500 },
+                },
+                required: ['findingId'],
+            },
+        },
+    },
+};
 
 export class ReportEnrichmentService {
     public async enrichReport(baseReport: CanonicalReportModel, options: EnrichmentOptions): Promise<EnrichmentResult> {
@@ -80,6 +105,8 @@ export class ReportEnrichmentService {
                 stableJson(promptPayload),
             ].join('\n'),
             temperature: 0,
+            responseFormat: buildJsonSchemaResponseFormat('report_narrative_patch', REPORT_NARRATIVE_PATCH_JSON_SCHEMA),
+            reasoningMode: 'disabled',
         }, {
             scanId: options.scanId,
             userId: options.userId,
@@ -96,7 +123,10 @@ export class ReportEnrichmentService {
         });
 
         try {
-            const parsed = parsePatch(response.text);
+            const parsed = parseStructuredJsonResponse(response, {
+                label: 'Report narrative patch',
+                schema: reportNarrativePatchSchema,
+            });
             return {
                 report: applyNarrativePatch(baseReport, parsed, 'llm'),
                 llmStatus: 'completed',
@@ -124,14 +154,6 @@ export class ReportEnrichmentService {
             };
         }
     }
-}
-
-function parsePatch(rawText: string) {
-    const trimmed = rawText.trim();
-    const objectMatch = trimmed.match(/\{[\s\S]*\}/);
-    const candidate = objectMatch ? objectMatch[0] : trimmed;
-    const parsed = JSON.parse(candidate);
-    return reportNarrativePatchSchema.parse(parsed);
 }
 
 function stableJson(value: unknown): string {

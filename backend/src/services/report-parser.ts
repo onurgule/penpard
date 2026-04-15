@@ -6,6 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { llmRuntime } from './llm/LlmRuntime';
+import { buildJsonObjectResponseFormat, parseStructuredJsonResponse } from './llm/LlmStructuredOutput';
 import { logger } from '../utils/logger';
 import { saveAnalysisLog } from '../db/init';
 
@@ -143,30 +144,8 @@ function chunkText(text: string, maxChunkSize: number = 25000): string[] {
     return chunks;
 }
 
-function parseJSONResponse(text: string): any {
-    // Try direct parse
-    try {
-        return JSON.parse(text);
-    } catch { }
-
-    // Try extracting JSON from markdown code block
-    const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-    if (jsonMatch) {
-        try {
-            return JSON.parse(jsonMatch[1].trim());
-        } catch { }
-    }
-
-    // Try finding first { and last }
-    const firstBrace = text.indexOf('{');
-    const lastBrace = text.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-        try {
-            return JSON.parse(text.substring(firstBrace, lastBrace + 1));
-        } catch { }
-    }
-
-    throw new Error('Failed to parse LLM JSON response');
+function parseJSONResponse(response: { text: string; finishReason?: string | null }): any {
+    return parseStructuredJsonResponse<any>(response, { label: 'Report parser response' });
 }
 
 // ── Main Parser ──
@@ -213,6 +192,8 @@ export class ReportParserService {
                 const response = await llmRuntime.generate({
                     systemPrompt: EXTRACTION_PROMPT,
                     userPrompt: `${chunks[i]}${chunkInstruction}`,
+                    responseFormat: buildJsonObjectResponseFormat(),
+                    reasoningMode: 'disabled',
                 }, {
                     analysisId,
                     userId,
@@ -220,7 +201,7 @@ export class ReportParserService {
                     context: 'report-parser-extraction',
                 });
 
-                const parsed = parseJSONResponse(response.text);
+                const parsed = parseJSONResponse(response);
 
                 if (parsed.findings && Array.isArray(parsed.findings)) {
                     allFindings.push(...parsed.findings);

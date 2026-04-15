@@ -196,6 +196,7 @@ export async function initDatabase(): Promise<void> {
       input_tokens INTEGER NOT NULL DEFAULT 0,
       output_tokens INTEGER NOT NULL DEFAULT 0,
       total_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0,
       scan_id TEXT,
       report_export_id TEXT,
       context TEXT,
@@ -551,6 +552,10 @@ if (!scanCols.some((c) => c.name === 'runtime_checkpoint_json')) {
   if (!tokenUsageCols.some((c) => c.name === 'report_export_id')) {
     db.exec('ALTER TABLE token_usage ADD COLUMN report_export_id TEXT');
     logger.info('Added token_usage.report_export_id column');
+  }
+  if (!tokenUsageCols.some((c) => c.name === 'reasoning_tokens')) {
+    db.exec('ALTER TABLE token_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0');
+    logger.info('Added token_usage.reasoning_tokens column');
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_token_usage_report_export_id ON token_usage(report_export_id)');
 

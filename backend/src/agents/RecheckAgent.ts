@@ -6,6 +6,7 @@
 
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmRuntime } from '../services/llm/LlmRuntime';
+import { buildJsonObjectResponseFormat, parseStructuredJsonResponse } from '../services/llm/LlmStructuredOutput';
 import { SharedContext, SharedVulnerability } from './SharedContext';
 import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
@@ -193,7 +194,9 @@ export class RecheckAgent {
             // Ask LLM to analyze (use queue for rate limiting)
             const response = await llmRuntime.generate({
                 systemPrompt: `You are a security expert verifying vulnerability reports. Be thorough but avoid false positives. Only confirm if you have strong evidence.`,
-                userPrompt: `${prompt}\n\nAdditional test results:\n${JSON.stringify(additionalTests, null, 2)}`
+                userPrompt: `${prompt}\n\nAdditional test results:\n${JSON.stringify(additionalTests, null, 2)}`,
+                responseFormat: buildJsonObjectResponseFormat(),
+                reasoningMode: 'disabled',
             }, {
                 scanId: this.scanId,
                 callSite: 'step_execution_reasoning',
@@ -201,7 +204,7 @@ export class RecheckAgent {
             });
 
             // Parse response
-            const result = this.parseRecheckResult(response.text);
+            const result = this.parseRecheckResult(response);
 
             if (result.confirmed && result.confidence >= 70) {
                 // Get vulnerability details
@@ -396,27 +399,24 @@ export class RecheckAgent {
         return sqlErrors.some(err => lower.includes(err.toLowerCase()));
     }
 
-    private parseRecheckResult(text: string): { confirmed: boolean; confidence: number; evidence: string; severity: string } {
+    private parseRecheckResult(response: { text: string; finishReason?: string | null }): { confirmed: boolean; confidence: number; evidence: string; severity: string } {
         try {
-            const jsonMatch = text.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                const parsed = JSON.parse(jsonMatch[0]);
-                return {
-                    confirmed: !!parsed.confirmed,
-                    confidence: parsed.confidence || 50,
-                    evidence: parsed.evidence || '',
-                    severity: parsed.severity || 'medium'
-                };
-            }
+            const parsed = parseStructuredJsonResponse<any>(response, { label: 'Recheck verification response' });
+            return {
+                confirmed: !!parsed.confirmed,
+                confidence: parsed.confidence || 50,
+                evidence: parsed.evidence || '',
+                severity: parsed.severity || 'medium'
+            };
         } catch {
-            // Parse from text
+            // Fall back to text heuristics when the provider ignores structured mode.
         }
 
         // Default: uncertain
         return {
-            confirmed: text.toLowerCase().includes('confirmed'),
+            confirmed: response.text.toLowerCase().includes('confirmed'),
             confidence: 50,
-            evidence: text.substring(0, 500),
+            evidence: response.text.substring(0, 500),
             severity: 'medium'
         };
     }

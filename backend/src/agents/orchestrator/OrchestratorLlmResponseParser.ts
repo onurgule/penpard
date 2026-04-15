@@ -1,6 +1,7 @@
 import { AgentReflection, LLMResponse, ToolCall } from './types';
 import type { OrchestratorToolRegistry } from './OrchestratorToolRegistry';
 import { summarizeLlmResponseForLog } from './OrchestratorSafeLogging';
+import { extractStructuredJsonValue } from '../../services/llm/LlmStructuredOutput';
 
 type LogFn = (channel: 'debug' | 'error', message: string) => void;
 
@@ -66,62 +67,8 @@ export class OrchestratorLlmResponseParser {
     }
 
     public extractJsonObject(text: string): any | null {
-        const cleaned = this.stripMarkdownCodeFences(text).trim();
-        if (!cleaned) return null;
-
-        const direct = this.parseJsonCandidate(cleaned);
-        if (direct !== null) {
-            return direct;
-        }
-
-        for (let start = 0; start < cleaned.length; start++) {
-            const opener = cleaned[start];
-            if (opener !== '{' && opener !== '[') continue;
-
-            const stack: string[] = [];
-            let inString = false;
-            let escaped = false;
-
-            for (let end = start; end < cleaned.length; end++) {
-                const char = cleaned[end];
-
-                if (escaped) {
-                    escaped = false;
-                    continue;
-                }
-                if (char === '\\') {
-                    escaped = true;
-                    continue;
-                }
-                if (char === '"' && !escaped) {
-                    inString = !inString;
-                    continue;
-                }
-                if (inString) continue;
-
-                if (char === '{' || char === '[') {
-                    stack.push(char);
-                    continue;
-                }
-
-                if (char === '}' || char === ']') {
-                    const expected = char === '}' ? '{' : '[';
-                    if (stack[stack.length - 1] !== expected) {
-                        break;
-                    }
-                    stack.pop();
-                    if (stack.length === 0) {
-                        const candidate = this.parseJsonCandidate(cleaned.substring(start, end + 1));
-                        if (candidate !== null) {
-                            return candidate;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        return null;
+        const extracted = extractStructuredJsonValue(text);
+        return extracted === null ? null : this.unwrapJsonValue(extracted);
     }
 
     private stripMarkdownCodeFences(text: string): string {

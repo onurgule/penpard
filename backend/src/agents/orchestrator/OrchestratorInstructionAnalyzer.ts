@@ -3,6 +3,7 @@ import {
     buildInstructionAnalysisUserPrompt,
     INSTRUCTION_ANALYSIS_SYSTEM_PROMPT,
 } from '../../prompts/orchestratorPrompts';
+import { buildJsonObjectResponseFormat, parseStructuredJsonResponse } from '../../services/llm/LlmStructuredOutput';
 import { InstructionAnalysis } from './types';
 import { OrchestratorLlmResponseParser } from './OrchestratorLlmResponseParser';
 
@@ -21,6 +22,8 @@ export class OrchestratorInstructionAnalyzer {
             const response = await llmRuntime.generate({
                 systemPrompt: INSTRUCTION_ANALYSIS_SYSTEM_PROMPT,
                 userPrompt: buildInstructionAnalysisUserPrompt(instructions, targetUrl),
+                responseFormat: buildJsonObjectResponseFormat(),
+                reasoningMode: 'disabled',
             }, {
                 scanId,
                 userId,
@@ -28,7 +31,7 @@ export class OrchestratorInstructionAnalyzer {
                 context: 'orchestrator-instruction-analysis',
             });
 
-            const parsed = this.parser.extractJsonObject(response.text);
+            const parsed = parseStructuredJsonResponse<any>(response, { label: 'Instruction analysis response' });
             if (!parsed || typeof parsed.is_focused !== 'boolean') {
                 return null;
             }

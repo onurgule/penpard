@@ -20,6 +20,7 @@ import {
     getActiveTTPs,
 } from '../db/init';
 import { mindsetService } from '../services/mindset-service';
+import { buildJsonObjectResponseFormat, parseStructuredJsonResponse } from '../services/llm/LlmStructuredOutput';
 import type { ParsedReport, ParsedFinding } from '../services/report-parser';
 
 // ── Prompts ──
@@ -65,16 +66,6 @@ Respond with ONLY valid JSON:
 }`;
 
 // ── Helper ──
-
-function parseJSONSafe(text: string): any {
-    try { return JSON.parse(text); } catch { }
-    const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-    if (jsonMatch) { try { return JSON.parse(jsonMatch[1].trim()); } catch { } }
-    const first = text.indexOf('{');
-    const last = text.lastIndexOf('}');
-    if (first !== -1 && last > first) { try { return JSON.parse(text.substring(first, last + 1)); } catch { } }
-    return null;
-}
 
 // ── Agent ──
 
@@ -153,6 +144,8 @@ export class ReportLearningAgent {
         const response = await llmRuntime.generate({
             systemPrompt: TTP_EXTRACTION_PROMPT,
             userPrompt: context,
+            responseFormat: buildJsonObjectResponseFormat(),
+            reasoningMode: 'disabled',
         }, {
             analysisId: this.analysisId,
             userId: this.userId,
@@ -160,7 +153,7 @@ export class ReportLearningAgent {
             context: 'red-team-ttp-derivation',
         });
 
-        const result = parseJSONSafe(response.text);
+        const result = parseStructuredJsonResponse<any>(response, { label: `TTP derivation for ${dbFinding.title}` });
         if (!result || !result.vulnerability_class) {
             this.log(`  ⚠️ Could not derive TTP for "${dbFinding.title}"`);
             return;

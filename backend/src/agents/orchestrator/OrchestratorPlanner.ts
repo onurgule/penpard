@@ -6,6 +6,7 @@ import {
     PLAN_PROMPT,
     REPLAN_PROMPT,
 } from '../../prompts/orchestratorPrompts';
+import { buildJsonObjectResponseFormat, parseStructuredJsonResponse } from '../../services/llm/LlmStructuredOutput';
 import { AttackPlan, ConversationMessage, LLMResponse, PlanStep, StepExecutionResult } from './types';
 import { OrchestratorLlmResponseParser } from './OrchestratorLlmResponseParser';
 
@@ -91,6 +92,8 @@ export class OrchestratorPlanner {
             const response = await llmRuntime.generate({
                 systemPrompt: input.systemPrompt,
                 userPrompt: `${contextBlock}${planPrompt}\n\nIMPORTANT: Respond with ONLY a valid JSON object. No markdown code fences, no explanation, no text before or after the JSON.`,
+                responseFormat: buildJsonObjectResponseFormat(),
+                reasoningMode: 'disabled',
             }, {
                 scanId: input.scanId,
                 userId: input.userId,
@@ -100,7 +103,12 @@ export class OrchestratorPlanner {
 
             input.conversationHistory.push({ role: 'assistant', content: response.text });
 
-            let parsed = this.deps.parser.extractJsonObject(response.text);
+            let parsed: any = null;
+            try {
+                parsed = parseStructuredJsonResponse<any>(response, { label: 'Plan response' });
+            } catch {
+                parsed = null;
+            }
             if (!parsed) {
                 this.deps.log?.('warn', `Plan JSON parse failed for response (${response.text.length} chars)`);
 
@@ -109,13 +117,15 @@ export class OrchestratorPlanner {
                     const retryResponse = await llmRuntime.generate({
                         systemPrompt: 'You are a JSON repair assistant. The user will give you text that should be JSON. Extract or fix the JSON and return ONLY a valid JSON object. No markdown, no explanation, no code fences.',
                         userPrompt: `Fix or extract the JSON from this text. Return ONLY valid JSON:\n\n${response.text.substring(0, 2000)}`,
+                        responseFormat: buildJsonObjectResponseFormat(),
+                        reasoningMode: 'disabled',
                     }, {
                         scanId: input.scanId,
                         userId: input.userId,
                         callSite: 'plan_json_repair',
                         context: 'orchestrator-plan-json-repair',
                     });
-                    parsed = this.deps.parser.extractJsonObject(retryResponse.text);
+                    parsed = parseStructuredJsonResponse<any>(retryResponse, { label: 'Plan repair response' });
                 } catch {
                     // Ignore repair errors and let the caller decide on fallback planning.
                 }
@@ -187,6 +197,8 @@ export class OrchestratorPlanner {
             const response = await llmRuntime.generate({
                 systemPrompt: input.systemPrompt,
                 userPrompt: `${contextBlock}${stepPrompt}\n\nRespond with ONLY a valid JSON object.`,
+                responseFormat: buildJsonObjectResponseFormat(),
+                reasoningMode: 'disabled',
             }, {
                 scanId: input.scanId,
                 userId: input.userId,
@@ -224,6 +236,8 @@ export class OrchestratorPlanner {
             const response = await llmRuntime.generate({
                 systemPrompt: input.systemPrompt,
                 userPrompt: `${contextBlock}${replanPrompt}\n\nRespond with ONLY a valid JSON object.`,
+                responseFormat: buildJsonObjectResponseFormat(),
+                reasoningMode: 'disabled',
             }, {
                 scanId: input.scanId,
                 userId: input.userId,
@@ -233,7 +247,7 @@ export class OrchestratorPlanner {
 
             input.conversationHistory.push({ role: 'assistant', content: response.text });
 
-            const parsed = this.deps.parser.extractJsonObject(response.text);
+            const parsed = parseStructuredJsonResponse<any>(response, { label: 'Replan response' });
             if (parsed?.answer && String(parsed.answer).toLowerCase().includes('complete')) {
                 return false;
             }

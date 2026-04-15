@@ -5,6 +5,7 @@
 
 import { BurpMCPClient } from '../services/burp-mcp';
 import { llmRuntime } from '../services/llm/LlmRuntime';
+import { buildJsonObjectResponseFormat, parseStructuredJsonResponse } from '../services/llm/LlmStructuredOutput';
 import { SharedContext, DiscoveredEndpoint, SharedVulnerability, AgentMessage } from './SharedContext';
 import { logger, formatLogTimestamp } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
@@ -254,7 +255,9 @@ Now execute your task and respond in the specified JSON format.`;
         try {
             const response = await llmRuntime.generate({
                 systemPrompt: `You are a specialized ${this.role} agent in a security testing team. Be precise and output valid JSON.`,
-                userPrompt: prompt
+                userPrompt: prompt,
+                responseFormat: buildJsonObjectResponseFormat(),
+                reasoningMode: 'disabled',
             }, {
                 scanId: this.context.scanId,
                 callSite: 'step_execution_reasoning',
@@ -262,24 +265,19 @@ Now execute your task and respond in the specified JSON format.`;
             });
 
             // Parse JSON from response
-            return this.parseResponse(response.text);
+            return this.parseResponse(response);
         } catch (error: any) {
             this.log(`LLM error: ${error.message}`);
             return null;
         }
     }
 
-    private parseResponse(text: string): any {
+    private parseResponse(response: { text: string; finishReason?: string | null }): any {
         try {
-            // Find JSON in response
-            const jsonMatch = text.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                return JSON.parse(jsonMatch[0]);
-            }
+            return parseStructuredJsonResponse<any>(response, { label: `Worker agent ${this.role} response` });
         } catch {
-            // Try to extract data from text
+            return null;
         }
-        return null;
     }
 
     private async processResponse(response: any, workData: any): Promise<void> {

@@ -10,6 +10,7 @@ process.env.JWT_SECRET = 'local-llm-provider-test-secret';
 
 const dbModule = require('../src/db/init') as typeof import('../src/db/init');
 const { llmProvider } = require('../src/services/LLMProviderService') as typeof import('../src/services/LLMProviderService');
+const { logger } = require('../src/utils/logger') as typeof import('../src/utils/logger');
 
 async function resetState() {
     await dbModule.initDatabase();
@@ -31,7 +32,24 @@ function insertLocalLlmConfig(overrides: Record<string, any> = {}) {
     return config;
 }
 
-// ── Config Normalization ──
+function mockFetchSequence(responses: Array<{ body: any; status?: number; headers?: Record<string, string> }>) {
+    const originalFetch = globalThis.fetch;
+    let index = 0;
+
+    (globalThis as any).fetch = async () => {
+        const current = responses[Math.min(index, responses.length - 1)];
+        index += 1;
+        const bodyText = typeof current.body === 'string' ? current.body : JSON.stringify(current.body);
+        return new Response(bodyText, {
+            status: current.status ?? 200,
+            headers: current.headers ?? { 'content-type': 'application/json' },
+        });
+    };
+
+    return () => {
+        (globalThis as any).fetch = originalFetch;
+    };
+}
 
 test('local_llm config normalization builds baseUrl from host and port', async () => {
     await resetState();
@@ -85,11 +103,7 @@ test('local_llm config normalization defaults host to 127.0.0.1 and port to 8080
     const configs = llmProvider.getAllConfigs(1);
     const localConfig = configs.find(c => c.provider === 'local_llm');
     assert.ok(localConfig);
-    // When no host/port provided, no baseUrl normalization
-    // The runtime will detect missing baseUrl and throw
 });
-
-// ── Provider Validation ──
 
 test('local_llm is accepted as a valid provider', async () => {
     await resetState();
@@ -114,8 +128,6 @@ test('local_llm appears in getAllConfigs', async () => {
     assert.equal(localConfig!.model, 'llama3.2');
 });
 
-// ── No API Key Requirement ──
-
 test('local_llm config persists with empty api_key', async () => {
     await resetState();
 
@@ -134,12 +146,9 @@ test('local_llm config persists with empty api_key', async () => {
     assert.equal(localConfig!.api_key, '');
 });
 
-// ── Provider Activation ──
-
 test('activating local_llm deactivates other providers', async () => {
     await resetState();
 
-    // Insert an openai config as active
     llmProvider.updateConfig({
         provider: 'openai' as any,
         api_key: 'sk-test',
@@ -149,7 +158,6 @@ test('activating local_llm deactivates other providers', async () => {
         settings_json: '{}',
     }, 1);
 
-    // Activate local_llm
     llmProvider.updateConfig({
         provider: 'local_llm' as any,
         api_key: '',
@@ -163,8 +171,8 @@ test('activating local_llm deactivates other providers', async () => {
     const openai = configs.find(c => c.provider === 'openai');
     const local = configs.find(c => c.provider === 'local_llm');
 
-    assert.equal(openai?.is_active, 0, 'openai should be deactivated');
-    assert.equal(local?.is_active, 1, 'local_llm should be active');
+    assert.equal(openai?.is_active, 0);
+    assert.equal(local?.is_active, 1);
 });
 
 test('getActiveConfig returns local_llm when it is the active provider', async () => {
@@ -176,24 +184,15 @@ test('getActiveConfig returns local_llm when it is the active provider', async (
     assert.equal(config.model, 'llama3.2');
 });
 
-// ── Connection Check ──
-
 test('checkConnection does not reject local_llm for missing API key', async () => {
     await resetState();
     insertLocalLlmConfig();
 
-    // The actual call will fail (no server running), but it should NOT fail with
-    // "API key is empty" — it should attempt the generation and fail on network.
     const result = await llmProvider.checkConnection('local_llm', 1);
-
-    // It will be success: false because no server is running, but the error
-    // should NOT mention API key
     if (!result.success) {
         assert.ok(!result.error?.includes('API key'), `Error should not mention API key: ${result.error}`);
     }
 });
-
-// ── Config Summaries ──
 
 test('getAllConfigSummaries masks api_key for local_llm', async () => {
     await resetState();
@@ -206,8 +205,6 @@ test('getAllConfigSummaries masks api_key for local_llm', async () => {
     assert.equal(localSummary!.has_api_key, false);
 });
 
-// ── Vision Support ──
-
 test('checkVisionSupport returns false for local_llm', async () => {
     await resetState();
     insertLocalLlmConfig({ is_active: 1 });
@@ -216,8 +213,6 @@ test('checkVisionSupport returns false for local_llm', async () => {
     assert.equal(result.supported, false);
     assert.equal(result.provider, 'local_llm');
 });
-
-// ── Model Required ──
 
 test('local_llm config requires a model name', async () => {
     await resetState();
@@ -235,15 +230,10 @@ test('local_llm config requires a model name', async () => {
     );
 });
 
-// ── Existing Provider Regression ──
-
 test('existing providers still work alongside local_llm', async () => {
     await resetState();
 
-    // Insert local_llm
     insertLocalLlmConfig({ is_active: 0 });
-
-    // Insert openai
     llmProvider.updateConfig({
         provider: 'openai' as any,
         api_key: 'sk-test',
@@ -263,13 +253,10 @@ test('existing providers still work alongside local_llm', async () => {
     assert.equal(active.provider, 'openai');
 });
 
-// ── Config Update Persistence ──
-
 test('local_llm config can be updated after initial save', async () => {
     await resetState();
     insertLocalLlmConfig();
 
-    // Update model
     llmProvider.updateConfig({
         provider: 'local_llm' as any,
         api_key: '',
@@ -286,8 +273,6 @@ test('local_llm config can be updated after initial save', async () => {
     assert.equal(settings.baseUrl, 'http://10.0.0.5:11434');
 });
 
-// ── Unsupported Provider Still Rejected ──
-
 test('unsupported providers are still rejected when local_llm is present', async () => {
     await resetState();
     insertLocalLlmConfig();
@@ -302,140 +287,93 @@ test('unsupported providers are still rejected when local_llm is present', async
     }, 1), /Unsupported LLM provider/i);
 });
 
-// ── Response Parsing Tests (via extractLocalLlmText) ──
-// These tests exercise callLocalLlm by mocking axios.post at module level.
-
-const axios = require('axios') as typeof import('axios');
-
-function mockAxiosPost(responseData: any, status = 200) {
-    const original = axios.default.post;
-    (axios.default as any).post = async () => ({ status, data: responseData });
-    return () => { (axios.default as any).post = original; };
-}
-
-function makeLocalConfig() {
-    return {
-        provider: 'local_llm',
-        api_key: '',
-        model: 'qwen-2.5',
-        is_active: 1,
-        is_online: 0,
-        settings_json: JSON.stringify({ host: '127.0.0.1', port: 8080, baseUrl: 'http://127.0.0.1:8080' }),
-    };
-}
-
-test('callLocalLlm succeeds when choices[0].message.content is a string', async () => {
+test('local_llm returns visible content and normalized usage metadata', async () => {
     await resetState();
     insertLocalLlmConfig({ model: 'qwen-2.5' });
 
-    const restore = mockAxiosPost({
-        choices: [{ message: { role: 'assistant', content: 'Hello from standard content' } }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-    });
+    const restore = mockFetchSequence([{
+        body: {
+            model: 'qwen-2.5',
+            choices: [{ message: { role: 'assistant', content: 'Hello from standard content' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        },
+    }]);
 
     try {
-        const config = makeLocalConfig();
-        const result = await (llmProvider as any).callLocalLlm(config, {
-            systemPrompt: 'test', userPrompt: 'test',
-        }, 0.7);
+        const result = await llmProvider.executeAttempt({
+            systemPrompt: 'test',
+            userPrompt: 'test',
+        }, { userId: 1 });
 
         assert.equal(result.text, 'Hello from standard content');
-        assert.equal(result.usage.input_tokens, 10);
-        assert.equal(result.usage.output_tokens, 5);
+        assert.equal(result.finishReason, 'stop');
+        assert.equal(result.usage?.input_tokens, 10);
+        assert.equal(result.usage?.output_tokens, 5);
+        assert.equal(result.usage?.total_tokens, 15);
     } finally {
         restore();
     }
 });
 
-test('callLocalLlm succeeds when message.reasoning_content is present instead of content', async () => {
+test('local_llm captures reasoning separately without leaking it into text', async () => {
     await resetState();
     insertLocalLlmConfig({ model: 'qwen-2.5' });
 
-    const restore = mockAxiosPost({
-        choices: [{ message: { role: 'assistant', content: null, reasoning_content: 'Thinking step by step...' } }],
-        usage: { prompt_tokens: 15, completion_tokens: 8 },
-    });
-
-    try {
-        const config = makeLocalConfig();
-        const result = await (llmProvider as any).callLocalLlm(config, {
-            systemPrompt: 'test', userPrompt: 'test',
-        }, 0.7);
-
-        assert.equal(result.text, 'Thinking step by step...');
-    } finally {
-        restore();
-    }
-});
-
-test('callLocalLlm succeeds when choice-level reasoning_content is present', async () => {
-    await resetState();
-    insertLocalLlmConfig({ model: 'qwen-2.5' });
-
-    const restore = mockAxiosPost({
-        choices: [{ message: { role: 'assistant' }, reasoning_content: 'Top-level reasoning text' }],
-    });
-
-    try {
-        const config = makeLocalConfig();
-        const result = await (llmProvider as any).callLocalLlm(config, {
-            systemPrompt: 'test', userPrompt: 'test',
-        }, 0.7);
-
-        assert.equal(result.text, 'Top-level reasoning text');
-        assert.equal(result.usage, undefined); // no usage block
-    } finally {
-        restore();
-    }
-});
-
-test('callLocalLlm succeeds when content is an array of text blocks', async () => {
-    await resetState();
-    insertLocalLlmConfig({ model: 'qwen-2.5' });
-
-    const restore = mockAxiosPost({
-        choices: [{
-            message: {
-                role: 'assistant',
-                content: [
-                    { type: 'text', text: 'First part. ' },
-                    { type: 'text', text: 'Second part.' },
-                ],
+    const restore = mockFetchSequence([{
+        body: {
+            model: 'qwen-2.5',
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: 'Final answer',
+                    reasoning: 'Thinking step by step...',
+                },
+                finish_reason: 'stop',
+            }],
+            usage: {
+                prompt_tokens: 15,
+                completion_tokens: 8,
+                total_tokens: 23,
+                completion_tokens_details: { reasoning_tokens: 0 },
             },
-        }],
-        usage: { prompt_tokens: 12, completion_tokens: 6 },
-    });
+        },
+    }]);
 
     try {
-        const config = makeLocalConfig();
-        const result = await (llmProvider as any).callLocalLlm(config, {
-            systemPrompt: 'test', userPrompt: 'test',
-        }, 0.7);
+        const result = await llmProvider.executeAttempt({
+            systemPrompt: 'test',
+            userPrompt: 'test',
+        }, { userId: 1 });
 
-        assert.equal(result.text, 'First part. Second part.');
+        assert.equal(result.text, 'Final answer');
+        assert.equal(result.reasoning, 'Thinking step by step...');
+        assert.equal(result.usage?.reasoning_tokens, 0);
     } finally {
         restore();
     }
 });
 
-test('callLocalLlm fails with diagnostic body preview when no text is extractable', async () => {
+test('local_llm rejects reasoning-only responses instead of surfacing hidden reasoning as text', async () => {
     await resetState();
     insertLocalLlmConfig({ model: 'qwen-2.5' });
 
-    const restore = mockAxiosPost({
-        choices: [{ message: { role: 'assistant', content: null }, finish_reason: 'stop' }],
-    });
+    const restore = mockFetchSequence([{
+        body: {
+            model: 'qwen-2.5',
+            choices: [{ message: { role: 'assistant', content: null, reasoning_content: 'Top-level reasoning text' }, finish_reason: 'stop' }],
+        },
+    }]);
 
     try {
-        const config = makeLocalConfig();
         await assert.rejects(
-            () => (llmProvider as any).callLocalLlm(config, {
-                systemPrompt: 'test', userPrompt: 'test',
-            }, 0.7),
-            (err: any) => {
-                assert.ok(err.message.includes('no extractable text'));
-                assert.ok(err.message.includes('Body preview:'));
-                assert.ok(err.message.includes('message.reasoning_content'));
+            () => llmProvider.executeAttempt({
+                systemPrompt: 'test',
+                userPrompt: 'test',
+            }, { userId: 1 }),
+            (error: any) => {
+                assert.match(error.message, /no visible assistant content/i);
+                assert.ok(!error.message.includes('Body preview:'));
+                assert.ok(!error.message.includes('Top-level reasoning text'));
                 return true;
             },
         );
@@ -444,50 +382,154 @@ test('callLocalLlm fails with diagnostic body preview when no text is extractabl
     }
 });
 
-test('callLocalLlm parses token usage correctly with reasoning response', async () => {
+test('local_llm succeeds when content is an array of visible text blocks', async () => {
     await resetState();
     insertLocalLlmConfig({ model: 'qwen-2.5' });
 
-    const restore = mockAxiosPost({
-        choices: [{ message: { role: 'assistant', reasoning_content: 'Deep thought' } }],
-        usage: { prompt_tokens: 100, completion_tokens: 50 },
-    });
+    const restore = mockFetchSequence([{
+        body: {
+            model: 'qwen-2.5',
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: [
+                        { type: 'text', text: 'First part. ' },
+                        { type: 'reasoning', text: 'private reasoning' },
+                        { type: 'text', text: 'Second part.' },
+                    ],
+                },
+                finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 12, completion_tokens: 6, total_tokens: 18 },
+        },
+    }]);
 
     try {
-        const config = makeLocalConfig();
-        const result = await (llmProvider as any).callLocalLlm(config, {
-            systemPrompt: 'test', userPrompt: 'test',
-        }, 0.7);
+        const result = await llmProvider.executeAttempt({
+            systemPrompt: 'test',
+            userPrompt: 'test',
+        }, { userId: 1 });
 
-        assert.equal(result.text, 'Deep thought');
-        assert.equal(result.usage.input_tokens, 100);
-        assert.equal(result.usage.output_tokens, 50);
+        assert.equal(result.text, 'First part. Second part.');
     } finally {
         restore();
     }
 });
 
-test('callLocalLlm prefers message.content over reasoning fields when both present', async () => {
+test('local_llm allows successful tool-call-only responses with empty visible text', async () => {
     await resetState();
     insertLocalLlmConfig({ model: 'qwen-2.5' });
 
-    const restore = mockAxiosPost({
-        choices: [{
-            message: {
-                role: 'assistant',
-                content: 'Final answer',
-                reasoning_content: 'Internal reasoning',
-            },
-        }],
-    });
+    const restore = mockFetchSequence([{
+        body: {
+            model: 'qwen-2.5',
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: null,
+                    tool_calls: [{
+                        id: 'call_123',
+                        type: 'function',
+                        function: {
+                            name: 'lookup_asset',
+                            arguments: '{"asset":"token"}',
+                        },
+                    }],
+                },
+                finish_reason: 'tool_calls',
+            }],
+            usage: { prompt_tokens: 22, completion_tokens: 11, total_tokens: 33 },
+        },
+    }]);
 
     try {
-        const config = makeLocalConfig();
-        const result = await (llmProvider as any).callLocalLlm(config, {
-            systemPrompt: 'test', userPrompt: 'test',
-        }, 0.7);
+        const result = await llmProvider.executeAttempt({
+            systemPrompt: 'test',
+            userPrompt: 'test',
+        }, { userId: 1 });
+
+        assert.equal(result.text, '');
+        assert.equal(result.finishReason, 'tool_calls');
+        assert.equal(result.toolCalls?.length, 1);
+        assert.equal(result.toolCalls?.[0]?.function.name, 'lookup_asset');
+        assert.deepEqual(result.toolCalls?.[0]?.function.parsedArguments, { asset: 'token' });
+    } finally {
+        restore();
+    }
+});
+
+test('local_llm logs a sanitized response summary instead of a raw preview', async () => {
+    await resetState();
+    insertLocalLlmConfig({ model: 'qwen-2.5' });
+
+    const originalInfo = logger.info.bind(logger);
+    const infoCalls: Array<{ message: string; meta: any }> = [];
+    (logger as any).info = (message: string, meta: any) => {
+        infoCalls.push({ message, meta });
+    };
+
+    const restore = mockFetchSequence([{
+        body: {
+            model: 'qwen-2.5',
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: 'Visible answer',
+                    reasoning: 'Hidden reasoning',
+                },
+                finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+        },
+    }]);
+
+    try {
+        const result = await llmProvider.executeAttempt({
+            systemPrompt: 'test',
+            userPrompt: 'test',
+        }, { userId: 1 });
+
+        assert.equal(result.text, 'Visible answer');
+
+        const summary = infoCalls.find((entry) => entry.message === 'local_llm.response.summary');
+        assert.ok(summary);
+        assert.equal(summary?.meta.hasContent, true);
+        assert.equal(summary?.meta.hasReasoning, true);
+        assert.equal(summary?.meta.toolCallCount, 0);
+        assert.ok(!Object.hasOwn(summary?.meta || {}, 'preview'));
+    } finally {
+        (logger as any).info = originalInfo;
+        restore();
+    }
+});
+
+test('local_llm prefers message.content over reasoning fields when both are present', async () => {
+    await resetState();
+    insertLocalLlmConfig({ model: 'qwen-2.5' });
+
+    const restore = mockFetchSequence([{
+        body: {
+            model: 'qwen-2.5',
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: 'Final answer',
+                    reasoning_content: 'Internal reasoning',
+                },
+                finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 20, completion_tokens: 9, total_tokens: 29 },
+        },
+    }]);
+
+    try {
+        const result = await llmProvider.executeAttempt({
+            systemPrompt: 'test',
+            userPrompt: 'test',
+        }, { userId: 1 });
 
         assert.equal(result.text, 'Final answer');
+        assert.equal(result.reasoning, 'Internal reasoning');
     } finally {
         restore();
     }
