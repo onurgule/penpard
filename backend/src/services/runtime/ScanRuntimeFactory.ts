@@ -7,17 +7,23 @@ import { BurpMCPClient } from '../burp-mcp';
 import { defaultAuthStartupConfig } from '../web-auth-startup-config';
 import { buildFocusedScanPrompt, FocusedScanSuggestion, resolveFocusedScanTarget } from '../FocusedScanPresetCatalog';
 import { ScanRuntimeCheckpointService, scanRuntimeCheckpointService } from './ScanRuntimeCheckpointService';
+import type { FocusedTestObjective, ScopeEnvelope, ScanMode, StructuredSecurityTestRequest } from './ScopedScanTypes';
+import { normalizeScanMode } from './ScopedScanTypes';
+import { ScopedMissionPolicy } from './ScopedMissionPolicy';
+import type { OrchestratorScanStatusOverrides } from '../../agents/orchestrator/OrchestratorScanStatus';
 
 export interface ScanRecord {
     id: string;
     target: string;
     status: string;
     user_id: number;
+    scan_mode?: ScanMode | null;
     initial_request?: string | null;
     [key: string]: any;
 }
 
 export interface WebScanRuntimeConfig {
+    scanMode?: ScanMode;
     userId?: number;
     rateLimit?: number;
     maxIterations?: number;
@@ -33,6 +39,11 @@ export interface WebScanRuntimeConfig {
     sourcePackagePath?: string;
     sourceAnalysisMode?: string;
     authStartup?: AuthStartupConfig;
+    focusedTestObjective?: FocusedTestObjective;
+    scopeEnvelope?: ScopeEnvelope;
+    structuredSecurityTestRequest?: StructuredSecurityTestRequest;
+    scopedMissionPolicy?: ScopedMissionPolicy;
+    statusOverrides?: OrchestratorScanStatusOverrides;
 }
 
 export interface ContinueCompletedScanOptions {
@@ -49,6 +60,7 @@ export interface PreparedContinuationOptions extends ContinueCompletedScanOption
 export interface PreparedAgentRuntime {
     kind: 'agent';
     scanId: string;
+    scanMode: ScanMode;
     executionMode: 'single-agent';
     burp: BurpMCPClient;
     agent: OrchestratorAgent;
@@ -57,6 +69,7 @@ export interface PreparedAgentRuntime {
 export interface PreparedPoolRuntime {
     kind: 'pool';
     scanId: string;
+    scanMode: ScanMode;
     executionMode: 'dormant-multi-agent';
     burp: BurpMCPClient;
     pool: AgentPool;
@@ -88,7 +101,27 @@ export class ScanRuntimeFactory {
             });
         }
 
-        return this.createSingleAgentRuntime(scanId, targetUrl, config, burp);
+        return this.createSingleAgentRuntime(scanId, targetUrl, config, burp, normalizeScanMode(config.scanMode));
+    }
+
+    public async createScopedWebRuntime(
+        scanId: string,
+        targetUrl: string,
+        config: WebScanRuntimeConfig = {},
+    ): Promise<PreparedScanRuntime> {
+        const burp = await this.createConnectedBurpClient(
+            scanId,
+            'Burp MCP connection check failed for scoped scan',
+            'Burp Suite is not connected. Cannot start scoped scan without Burp MCP. Please ensure Burp Suite is running with the PenPard extension loaded (port 9876).',
+        );
+
+        return this.createSingleAgentRuntime(
+            scanId,
+            targetUrl,
+            this.buildScopedAgentConfig(targetUrl, config),
+            burp,
+            'scoped',
+        );
     }
 
     public async createContinuationRuntime(
@@ -106,6 +139,7 @@ export class ScanRuntimeFactory {
             : undefined;
         const existingFindings = getVulnerabilitiesByScan(scan.id);
         const runtime = this.createSingleAgentRuntime(scan.id, scan.target, {
+            scanMode: normalizeScanMode(scan.scan_mode),
             userId: scan.user_id,
             rateLimit: 5,
             useNuclei: false,
@@ -115,7 +149,7 @@ export class ScanRuntimeFactory {
             customSystemPrompt: options.instruction,
             initialRequest,
             authStartup: defaultAuthStartupConfig(),
-        }, burp);
+        }, burp, normalizeScanMode(scan.scan_mode));
 
         return {
             runtime,
@@ -140,6 +174,7 @@ export class ScanRuntimeFactory {
             scanId,
             resolveFocusedScanTarget(suggestion),
             {
+                scanMode: 'exploratory',
                 rateLimit: 5,
                 useNuclei: false,
                 useFfuf: false,
@@ -150,6 +185,7 @@ export class ScanRuntimeFactory {
                 authStartup: defaultAuthStartupConfig(),
             },
             burp,
+            'exploratory',
         );
     }
 
@@ -158,6 +194,7 @@ export class ScanRuntimeFactory {
         targetUrl: string,
         config: WebScanRuntimeConfig,
         burp: BurpMCPClient,
+        scanMode: ScanMode,
     ): PreparedAgentRuntime {
         const agent = new OrchestratorAgent(scanId, targetUrl, {
             userId: config.userId,
@@ -174,6 +211,8 @@ export class ScanRuntimeFactory {
             sourceAnalysisMode: config.sourceAnalysisMode,
             authStartup: config.authStartup || defaultAuthStartupConfig(),
             customSystemPrompt: config.customSystemPrompt,
+            scopedMissionPolicy: config.scopedMissionPolicy,
+            statusOverrides: config.statusOverrides,
         }, burp, {
             checkpoint: (checkpoint) => this.checkpointService.saveCheckpoint(scanId, checkpoint),
         });
@@ -181,9 +220,52 @@ export class ScanRuntimeFactory {
         return {
             kind: 'agent',
             scanId,
+            scanMode,
             executionMode: 'single-agent',
             burp,
             agent,
+        };
+    }
+
+    private buildScopedAgentConfig(
+        targetUrl: string,
+        config: WebScanRuntimeConfig,
+    ): WebScanRuntimeConfig {
+        const scopedRequest = config.structuredSecurityTestRequest;
+        const scopePolicy = config.scopedMissionPolicy
+            || (config.focusedTestObjective && config.scopeEnvelope && scopedRequest
+                ? new ScopedMissionPolicy({
+                    objective: config.focusedTestObjective,
+                    envelope: config.scopeEnvelope,
+                    request: scopedRequest,
+                    targetUrl,
+                })
+                : undefined);
+
+        const scopedMissionPrompt = config.focusedTestObjective && config.scopeEnvelope && scopedRequest
+            ? buildScopedMissionPrompt({
+                targetUrl,
+                objective: config.focusedTestObjective,
+                envelope: config.scopeEnvelope,
+                request: scopedRequest,
+            })
+            : undefined;
+        const customSystemPrompt = [scopedMissionPrompt, config.customSystemPrompt]
+            .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+            .join('\n\n');
+
+        return {
+            ...config,
+            scanMode: 'scoped',
+            customSystemPrompt: customSystemPrompt || undefined,
+            scopedMissionPolicy: scopePolicy,
+            statusOverrides: {
+                planning: 'scoped_executing',
+                testing: 'scoped_executing',
+                reporting: 'scoped_executing',
+                completed: 'scoped_executed',
+                ...(config.statusOverrides || {}),
+            },
         };
     }
 
@@ -239,3 +321,54 @@ export class ScanRuntimeFactory {
 }
 
 export const scanRuntimeFactory = new ScanRuntimeFactory();
+
+function buildScopedMissionPrompt(input: {
+    targetUrl: string;
+    objective: FocusedTestObjective;
+    envelope: ScopeEnvelope;
+    request: StructuredSecurityTestRequest;
+}): string {
+    const allowedRoutes = input.envelope.allowedRoutes.length > 0
+        ? input.envelope.allowedRoutes.join(', ')
+        : 'discovered feature anchors only';
+    const boundaryHints = input.envelope.boundaryHints.length > 0
+        ? input.envelope.boundaryHints.join(' | ')
+        : 'Stay within the requested feature area only.';
+    const outOfScope = input.envelope.outOfScopeNotes.length > 0
+        ? input.envelope.outOfScopeNotes.join(' | ')
+        : 'Do not broaden to unrelated routes, endpoints, or origin changes.';
+    const authHints = input.request.authMechanismHints.length > 0
+        ? input.request.authMechanismHints.join(', ')
+        : 'Use the current authenticated context when present.';
+    const contextLines = [
+        input.request.environment ? `Environment: ${input.request.environment}` : null,
+        input.request.serviceName ? `Service: ${input.request.serviceName}` : null,
+        input.request.testData.length > 0 ? `Test data: ${input.request.testData.join(', ')}` : null,
+        input.request.testUsers.length > 0 ? `Named users: ${input.request.testUsers.join(', ')}` : null,
+        input.request.operatorNotes ? `Operator notes: ${input.request.operatorNotes}` : null,
+    ].filter((entry): entry is string => !!entry);
+
+    return [
+        'SCOPED EXPLORATORY MISSION',
+        'Operate with the same live request-driven style as exploratory mode, but stay strictly inside the scoped battlefield below.',
+        `Mission title: ${input.objective.title}`,
+        `Start URL: ${input.request.targetUrl || input.targetUrl}`,
+        `Mission goal: ${input.objective.goal || input.request.description}`,
+        `Requested feature description: ${input.request.description}`,
+        `Allowed hosts: ${input.envelope.allowedHosts.join(', ') || new URL(input.targetUrl).host}`,
+        `Allowed routes: ${allowedRoutes}`,
+        `Boundary hints: ${boundaryHints}`,
+        `Out of scope: ${outOfScope}`,
+        `Authentication guidance: ${authHints}`,
+        contextLines.length > 0 ? `Mission context:\n- ${contextLines.join('\n- ')}` : null,
+        'Execution rules:',
+        '- Start working immediately after anchors are ready. Do not wait for manual case approval.',
+        '- Use live request-driven reasoning: observe traffic, mutate meaningful in-scope inputs, compare responses, and follow suspicious signals.',
+        '- Keep the request rail first-class when request-backed evidence exists. Correlate live actions with visible requests and responses.',
+        '- You may be aggressive inside the allowed hosts/routes, but you must not broaden the battlefield.',
+        '- Do not spider broadly, enumerate unrelated endpoints, or pivot to other origins.',
+        '- If a possible next action would leave scope, explain the boundary reason and choose a different in-scope next step.',
+        '- Emit findings as they strengthen or weaken during execution; do not wait until the end to acknowledge them.',
+        '- Summaries should stay readable: observation, action, response change, finding update, and stop reason.',
+    ].filter((entry): entry is string => !!entry).join('\n');
+}

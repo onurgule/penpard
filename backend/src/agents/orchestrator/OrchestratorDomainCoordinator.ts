@@ -18,6 +18,7 @@ import { normalizeSendHttpResponse } from '../../services/burp-tool-result';
 import { AuthStateManager } from '../../services/auth';
 import { resolveAuthIdentityId } from './OrchestratorToolPolicy';
 import { ToolCall } from './types';
+import { ScopedMissionPolicy } from '../../services/runtime/ScopedMissionPolicy';
 
 interface BurpToolClient {
     callTool(tool: string, args: Record<string, any>): Promise<any>;
@@ -30,6 +31,7 @@ export interface OrchestratorDomainCoordinatorOptions {
     burp: BurpToolClient;
     authManager: AuthStateManager;
     log: LogFn;
+    scopePolicy?: ScopedMissionPolicy;
     onEndpointDiscovered?: (path: string, method: string, source: string) => void;
     onCheckpoint?: (reason: string) => Promise<void>;
     onHypothesisConfirmed?: (finding: any) => void;
@@ -41,7 +43,14 @@ export class OrchestratorDomainCoordinator {
     public readonly coverageTracker: CoverageTracker;
 
     constructor(private readonly options: OrchestratorDomainCoordinatorOptions) {
-        this.harvester = new RequestHarvester();
+        this.harvester = new RequestHarvester({
+            allowRequest: this.options.scopePolicy
+                ? (request) => this.options.scopePolicy!.evaluateHarvestedRequest(request)
+                : undefined,
+            onPolicyBlock: (request, reason) => {
+                this.options.log('tool', `[scope] Filtered harvested request outside scoped boundary: ${request.method} ${request.path} - ${reason}`);
+            },
+        });
         this.hypothesisEngine = new HypothesisEngine();
         this.coverageTracker = new CoverageTracker();
     }
@@ -207,6 +216,24 @@ export class OrchestratorDomainCoordinator {
                     preserveExplicitAuth,
                 );
 
+                const scopeDecision = this.options.scopePolicy?.evaluateTool({
+                    toolName: 'repeater_test',
+                    method: request.method,
+                    url: mutatedUrl,
+                    useInitialRequestBaseline: false,
+                });
+                if (scopeDecision && !scopeDecision.allowed) {
+                    results.push({
+                        mutation: mutation.description,
+                        parameter: mutation.parameter,
+                        originalValue: mutation.originalValue,
+                        newValue: mutation.newValue,
+                        blocked: true,
+                        reason: scopeDecision.reason || 'Mutation fell outside the scoped mission boundary.',
+                    });
+                    continue;
+                }
+
                 const response = await this.options.burp.callTool('send_http_request', {
                     method: request.method,
                     url: mutatedUrl,
@@ -222,6 +249,14 @@ export class OrchestratorDomainCoordinator {
                 };
 
                 const normalizedResponse = normalizeSendHttpResponse(response);
+                this.options.scopePolicy?.recordExecutedRequest({
+                    url: mutatedUrl,
+                    method: request.method,
+                    statusCode: normalizedResponse.statusCode,
+                    identityId: mutationIdentityId,
+                    requestIntent: 'authenticated',
+                    result: normalizedResponse,
+                });
                 const mutatedSnapshot: ResponseSnapshot = {
                     statusCode: normalizedResponse.statusCode,
                     headers: normalizedResponse.headers as Record<string, string>,

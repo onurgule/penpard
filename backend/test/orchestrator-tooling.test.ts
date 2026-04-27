@@ -9,6 +9,7 @@ const {
     resolveAuthIdentityId,
     resolveRequestAuthIntent,
 } = require('../src/agents/orchestrator/OrchestratorToolPolicy') as typeof import('../src/agents/orchestrator/OrchestratorToolPolicy');
+const { ScopedMissionPolicy } = require('../src/services/runtime/ScopedMissionPolicy') as typeof import('../src/services/runtime/ScopedMissionPolicy');
 
 test('dispatcher executes through the extracted handler registry and reports unknown tools cleanly', async () => {
     const logs: string[] = [];
@@ -46,6 +47,102 @@ test('tool policy blocks focused-scope enumeration and active rate limits', () =
     assert.equal(focusedBlock.response.blocked, true);
     assert.equal(rateLimited.allowed, false);
     assert.equal(rateLimited.response.skipped, true);
+});
+
+test('tool policy enforces scoped request boundaries and records operator-visible boundary reasons', () => {
+    const scopePolicy = new ScopedMissionPolicy({
+        targetUrl: 'https://app.example.com/api/orders/1',
+        objective: {
+            id: 'objective-1',
+            scanId: 'scan-1',
+            title: 'Orders scoped mission',
+            scopeType: 'endpoint_scoped',
+            goal: 'Stay inside order detail routes.',
+            featureDescription: null,
+            operatorNotes: null,
+            riskTags: ['idor'],
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        },
+        envelope: {
+            id: 'scope-1',
+            scanId: 'scan-1',
+            version: 1,
+            allowedHosts: ['app.example.com'],
+            allowedRoutes: ['/api/orders/:id'],
+            selectedEndpoints: [{ method: 'GET', path: '/api/orders/1', host: 'app.example.com' }],
+            baselineRequestRefs: [],
+            discoveredRequestRefs: [],
+            requestBundleRefs: [],
+            browserAnchors: [],
+            authContext: null,
+            boundaryHints: ['Stay inside order detail lookups.'],
+            outOfScopeNotes: ['Do not pivot into admin endpoints.'],
+            explorationBudget: {
+                maxRequests: 4,
+                maxRouteVariants: 1,
+            },
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        },
+        request: {
+            id: 'request-1',
+            scanId: 'scan-1',
+            targetUrl: 'https://app.example.com/api/orders/1',
+            description: 'Validate access control around order detail reads.',
+            environment: null,
+            serviceName: 'orders',
+            testData: [],
+            testUsers: [],
+            loginPresent: true,
+            authMechanismHints: [],
+            hasScreenshotOrAttachment: false,
+            attachmentMetadata: [],
+            attachmentSummary: null,
+            newScreenCount: 0,
+            newInputCount: 0,
+            operatorNotes: null,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        },
+    });
+
+    const allowedVariant = evaluateToolExecutionGuard({
+        toolName: 'send_http_request',
+        toolArgs: {
+            method: 'GET',
+            url: 'https://app.example.com/api/orders/2',
+        },
+        isFocusedScope: false,
+        scopePolicy,
+        rateLimitPauseUntil: null,
+    });
+    const blockedVariant = evaluateToolExecutionGuard({
+        toolName: 'send_http_request',
+        toolArgs: {
+            method: 'GET',
+            url: 'https://app.example.com/api/orders/3',
+        },
+        isFocusedScope: false,
+        scopePolicy,
+        rateLimitPauseUntil: null,
+    });
+    const blockedHost = evaluateToolExecutionGuard({
+        toolName: 'browser_navigate',
+        toolArgs: {
+            url: 'https://admin.example.com/api/orders/1',
+        },
+        isFocusedScope: false,
+        scopePolicy,
+        rateLimitPauseUntil: null,
+    });
+
+    assert.equal(allowedVariant.allowed, true);
+    assert.equal(blockedVariant.allowed, false);
+    assert.match(String(blockedVariant.response?.boundaryReason), /route-variant budget/i);
+    assert.equal(blockedHost.allowed, false);
+    assert.match(String(blockedHost.response?.boundaryReason), /outside the scoped mission boundary/i);
+    assert.match(String(scopePolicy.buildBoundarySummary().blockedActionReason), /outside the scoped mission boundary/i);
 });
 
 test('auth helpers preserve explicit control over identity and intent resolution', () => {

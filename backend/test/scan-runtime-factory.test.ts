@@ -31,9 +31,47 @@ test('createWebRuntime keeps the active web path on the composed single-agent ru
         });
 
         assert.equal(runtime.kind, 'agent');
+        assert.equal(runtime.scanMode, 'exploratory');
         assert.equal(runtime.executionMode, 'single-agent');
         assert.equal(typeof runtime.agent.start, 'function');
         assert.equal(runtime.agent.getState().isRunning, false);
+        runtime.burp.disconnect();
+    });
+});
+
+test('createScopedWebRuntime keeps scoped launches on the hardened single-agent runtime path', async () => {
+    await initDatabase();
+
+    await withAvailableBurp(async () => {
+        const factory = new ScanRuntimeFactory();
+        const runtime = await factory.createScopedWebRuntime('scan-runtime-factory-scoped', 'https://app.example.com', {
+            scanMode: 'scoped',
+            focusedTestObjective: {
+                id: 'objective-1',
+                scanId: 'scan-runtime-factory-scoped',
+                title: 'Scoped checkout test',
+                scopeType: 'endpoint_scoped',
+                riskTags: ['idor'],
+            },
+            scopeEnvelope: {
+                id: 'envelope-1',
+                scanId: 'scan-runtime-factory-scoped',
+                version: 1,
+                allowedHosts: ['app.example.com'],
+                allowedRoutes: ['/api/checkout'],
+                selectedEndpoints: [{ method: 'POST', path: '/api/checkout' }],
+                baselineRequestRefs: [],
+                requestBundleRefs: [],
+                authContext: null,
+                outOfScopeNotes: [],
+                boundaryHints: [],
+                explorationBudget: null,
+            },
+        });
+
+        assert.equal(runtime.kind, 'agent');
+        assert.equal(runtime.scanMode, 'scoped');
+        assert.equal(runtime.executionMode, 'single-agent');
         runtime.burp.disconnect();
     });
 });

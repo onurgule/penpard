@@ -33,6 +33,91 @@ import { MarkdownRenderer } from '@/components/MarkdownRenderer';
 import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
 import { buildEndpointDisplayRows, EndpointInventorySnapshot } from './endpoint-intel';
+import {
+    MissionControlExploratoryFindings,
+    MissionControlScopedSupportStrip,
+    type MissionControlVulnerability,
+} from './MissionControlPanels';
+import { deriveMissionControlPolicy } from './mission-control-policy';
+import {
+    buildFocusedCaseRows,
+    buildFocusedEvidenceEmptyState,
+    buildFocusedReasoningTracePreview,
+    buildFocusedScanFindingRows,
+    buildFocusedTracePreview,
+    buildScopedAnchorSummary,
+    formatFocusedPriority,
+    formatFocusedReviewState,
+    formatFocusedBlockerRecurrence,
+    formatFocusedCaseCompareStatus,
+    formatScopedFeatureDiscoveryOutcome,
+    formatScopedFeatureDiscoveryPhase,
+    formatScopedWorkflowStage,
+    formatFocusedEvidenceDriftClassification,
+    formatFocusedInvestigationImpact,
+    formatFocusedInvestigationStatus,
+    formatFocusedInvestigationType,
+    formatFocusedBrowserEvidenceCount,
+    formatFocusedEvidenceCount,
+    formatFocusedEvidenceSufficiencyState,
+    formatFocusedExecutionPresentationState,
+    formatFocusedExecutionRail,
+    formatFocusedConfirmationKind,
+    formatFocusedFindingConfidenceBand,
+    formatFocusedFindingFamily,
+    formatFocusedFindingStatus,
+    formatFocusedFindingThreadStatus,
+    formatFocusedHypothesisStatus,
+    formatFocusedReasoningEntryType,
+    formatFocusedReasoningRail,
+    formatFocusedReasoningStage,
+    formatFocusedRequestContextField,
+    formatFocusedSuspicionProofStatus,
+    formatFocusedExecutionState,
+    formatFocusedExecutionTraceActionType,
+    formatFocusedHistoricalCompareStatus,
+    formatFocusedHistoricalOutcome,
+    formatFocusedOverallChangeClassification,
+    formatFocusedRailSummary,
+    formatFocusedRequestEvidenceRef,
+    formatFocusedSupportProvenanceRail,
+    formatFocusedSupportProvenanceSummary,
+    formatFocusedVerdictState,
+    formatFocusedVerdictTransition,
+    getScopedRecommendedAction,
+    summarizeScopedPlanReviewCounts,
+    type EvidenceBundle,
+    type FocusedCaseFinding,
+    type FocusedCaseHistoricalCompare,
+    type FocusedContextInfluenceSummary,
+    type FocusedEvidenceReasoningLink,
+    type FocusedFindingThread,
+    type FocusedInvestigationIssue,
+    type FocusedHistoricalCompareState,
+    type FocusedHistoricalCompareSummary,
+    type FocusedHypothesisVisibility,
+    type FocusedScanBlockerSummary,
+    type FocusedCaseVerdict,
+    type FocusedReasoningTraceEntry,
+    type FocusedExecutionTraceEntry,
+    type FocusedRailUsageSummary,
+    type FocusedScanFindingSummary,
+    type FocusedStorySummary,
+    type FocusedScanVerdictSummary,
+    type FocusedSuspicionExplanation,
+    type MissionControlLiveRuntimeSummary,
+    type FocusedTestCaseExecution,
+    isScopedReviewStage,
+    isScopedExecutionStage,
+    type FocusedPlanSummary,
+    type FocusedTestCase,
+    type FocusedTestObjectiveSummary,
+    projectFocusedFindingThread,
+    type ScopedFeatureDiscoveryStateSummary,
+    type ScanMode,
+    type ScopeEnvelopeSummary,
+    type StructuredSecurityTestRequestSummary,
+} from './focused-plan';
 
 interface LogEntry {
     timestamp: string;
@@ -40,19 +125,7 @@ interface LogEntry {
     message: string;
 }
 
-interface Vulnerability {
-    id: number;
-    name: string;
-    severity: string;
-    description: string;
-    // New fields
-    cwe?: string;
-    cve?: string;
-    cvssScore?: number;
-    request?: string;
-    response?: string;
-    remediation?: string;
-}
+interface Vulnerability extends MissionControlVulnerability {}
 
 export default function MissionControlClient() {
     const params = useParams();
@@ -115,6 +188,8 @@ export default function MissionControlClient() {
     const [browserTransitioning, setBrowserTransitioning] = useState(false);
     const [browserLifecycleState, setBrowserLifecycleState] = useState<string | null>(null);
     const [browserIsLive, setBrowserIsLive] = useState(false);
+    const [supportsPause, setSupportsPause] = useState(true);
+    const [supportsBrowserVisibility, setSupportsBrowserVisibility] = useState(true);
 
     // Pentester Loop v2 state
     const [hypothesisCount, setHypothesisCount] = useState<Record<string, number>>({ new: 0, testing: 0, escalated: 0, confirmed: 0, discarded: 0 });
@@ -122,6 +197,47 @@ export default function MissionControlClient() {
     const [harvestedCount, setHarvestedCount] = useState(0);
     const [promotedCount, setPromotedCount] = useState(0);
     const [endpointInventory, setEndpointInventory] = useState<EndpointInventorySnapshot | null>(null);
+    const [scanMode, setScanMode] = useState<ScanMode>('exploratory');
+    const [focusedTestObjective, setFocusedTestObjective] = useState<FocusedTestObjectiveSummary | null>(null);
+    const [scopeEnvelope, setScopeEnvelope] = useState<ScopeEnvelopeSummary | null>(null);
+    const [scopedTestRequest, setScopedTestRequest] = useState<StructuredSecurityTestRequestSummary | null>(null);
+    const [featureDiscoveryState, setFeatureDiscoveryState] = useState<ScopedFeatureDiscoveryStateSummary | null>(null);
+    const [focusedTestCases, setFocusedTestCases] = useState<FocusedTestCase[]>([]);
+    const [focusedFindings, setFocusedFindings] = useState<FocusedCaseFinding[]>([]);
+    const [focusedFindingThreads, setFocusedFindingThreads] = useState<FocusedFindingThread[]>([]);
+    const [focusedFindingSummary, setFocusedFindingSummary] = useState<FocusedScanFindingSummary | null>(null);
+    const [focusedStorySummary, setFocusedStorySummary] = useState<FocusedStorySummary | null>(null);
+    const [focusedPlanSummary, setFocusedPlanSummary] = useState<FocusedPlanSummary | null>(null);
+    const [focusedVerdictSummary, setFocusedVerdictSummary] = useState<FocusedScanVerdictSummary | null>(null);
+    const [focusedBlockerSummary, setFocusedBlockerSummary] = useState<FocusedScanBlockerSummary | null>(null);
+    const [focusedHistoricalCompareState, setFocusedHistoricalCompareState] = useState<FocusedHistoricalCompareState | null>(null);
+    const [focusedHistoricalCompareSummary, setFocusedHistoricalCompareSummary] = useState<FocusedHistoricalCompareSummary | null>(null);
+    const [focusedAgentTrace, setFocusedAgentTrace] = useState<FocusedReasoningTraceEntry[]>([]);
+    const [focusedRequestContextUsage, setFocusedRequestContextUsage] = useState<FocusedContextInfluenceSummary | null>(null);
+    const [liveRuntimeSummary, setLiveRuntimeSummary] = useState<MissionControlLiveRuntimeSummary | null>(null);
+    const [planActionCaseId, setPlanActionCaseId] = useState<string | null>(null);
+    const [planRefreshPending, setPlanRefreshPending] = useState(false);
+    const [executePending, setExecutePending] = useState(false);
+    const [verdictRefreshPending, setVerdictRefreshPending] = useState(false);
+    const [showLegacyRecovery, setShowLegacyRecovery] = useState(false);
+    const [evidenceLoadingCaseId, setEvidenceLoadingCaseId] = useState<string | null>(null);
+    const [selectedEvidenceCaseId, setSelectedEvidenceCaseId] = useState<string | null>(null);
+    const [selectedExecution, setSelectedExecution] = useState<FocusedTestCaseExecution | null>(null);
+    const [selectedCaseVerdict, setSelectedCaseVerdict] = useState<FocusedCaseVerdict | null>(null);
+    const [selectedPrimaryFinding, setSelectedPrimaryFinding] = useState<FocusedCaseFinding | null>(null);
+    const [selectedPrimaryFindingThread, setSelectedPrimaryFindingThread] = useState<FocusedFindingThread | null>(null);
+    const [selectedCaseFindings, setSelectedCaseFindings] = useState<FocusedCaseFinding[]>([]);
+    const [selectedCaseFindingThreads, setSelectedCaseFindingThreads] = useState<FocusedFindingThread[]>([]);
+    const [selectedCaseHistoricalCompare, setSelectedCaseHistoricalCompare] = useState<FocusedCaseHistoricalCompare | null>(null);
+    const [selectedHypothesisVisibility, setSelectedHypothesisVisibility] = useState<FocusedHypothesisVisibility | null>(null);
+    const [selectedSuspicionExplanation, setSelectedSuspicionExplanation] = useState<FocusedSuspicionExplanation | null>(null);
+    const [selectedContextInfluenceSummary, setSelectedContextInfluenceSummary] = useState<FocusedContextInfluenceSummary | null>(null);
+    const [selectedEvidenceReasoningLinks, setSelectedEvidenceReasoningLinks] = useState<FocusedEvidenceReasoningLink[]>([]);
+    const [selectedReasoningTrace, setSelectedReasoningTrace] = useState<FocusedReasoningTraceEntry[]>([]);
+    const [selectedEvidenceBundles, setSelectedEvidenceBundles] = useState<EvidenceBundle[]>([]);
+    const [selectedExecutionTrace, setSelectedExecutionTrace] = useState<FocusedExecutionTraceEntry[]>([]);
+    const [selectedRailSummary, setSelectedRailSummary] = useState<FocusedRailUsageSummary | null>(null);
+    const [selectedInvestigationIssues, setSelectedInvestigationIssues] = useState<FocusedInvestigationIssue[]>([]);
 
     // Initial fetch
     // Modal State
@@ -181,16 +297,51 @@ export default function MissionControlClient() {
             const data = res.data;
 
             setStatus(data.status);
+            setScanMode(data.scanMode === 'scoped' ? 'scoped' : 'exploratory');
             setVulns(data.vulnerabilities || []);
+            setFocusedTestObjective(data.focusedTestObjective || null);
+            setScopeEnvelope(data.scopeEnvelope || null);
+            setScopedTestRequest(data.scopedTestRequest || null);
+            setFeatureDiscoveryState(data.featureDiscoveryState || null);
+            setFocusedTestCases(Array.isArray(data.focusedTestCases) ? data.focusedTestCases : []);
+            setFocusedFindings(Array.isArray(data.focusedFindings) ? data.focusedFindings : []);
+            setFocusedFindingThreads(Array.isArray(data.focusedFindingThreads) ? data.focusedFindingThreads : []);
+            setFocusedFindingSummary(data.focusedFindingSummary || null);
+            setFocusedStorySummary(data.focusedStorySummary || null);
+            setFocusedPlanSummary(data.focusedPlanSummary || null);
+            setFocusedVerdictSummary(data.focusedVerdictSummary || null);
+            setFocusedBlockerSummary(data.focusedBlockerSummary || null);
+            setFocusedHistoricalCompareState(data.focusedHistoricalCompareState || null);
+            setFocusedHistoricalCompareSummary(data.focusedHistoricalCompareSummary || null);
+            setFocusedAgentTrace(Array.isArray(data.focusedAgentTrace) ? data.focusedAgentTrace : []);
+            setFocusedRequestContextUsage(data.focusedRequestContextUsage || null);
+            setLiveRuntimeSummary(data.liveRuntimeSummary || data.scopedLiveRuntime || null);
             if (data.endpointInventory !== undefined) {
                 setEndpointInventory(data.endpointInventory || null);
+            }
+            if (selectedEvidenceCaseId) {
+                const refreshedCase = Array.isArray(data.focusedTestCases)
+                    ? data.focusedTestCases.find((entry: FocusedTestCase) => entry.id === selectedEvidenceCaseId)
+                    : null;
+                setSelectedPrimaryFinding(refreshedCase?.primaryFinding || null);
+                setSelectedPrimaryFindingThread(refreshedCase?.activeFindingThread || null);
+                setSelectedCaseFindings(Array.isArray(refreshedCase?.findings) ? refreshedCase.findings : []);
+                setSelectedCaseFindingThreads(Array.isArray(refreshedCase?.findingThreads) ? refreshedCase.findingThreads : []);
+                setSelectedCaseVerdict(refreshedCase?.latestVerdict || null);
+                setSelectedCaseHistoricalCompare(refreshedCase?.historicalCompare || null);
+                setSelectedHypothesisVisibility(refreshedCase?.hypothesisVisibility || null);
+                setSelectedSuspicionExplanation(refreshedCase?.suspicionExplanation || null);
             }
 
             // Derive progress from status
             const map: Record<string, number> = {
                 'queued': 5,
                 'initializing': 10,
-                'planning': 20,
+                'scoped_discovering': 22,
+                'planning': 45,
+                'awaiting_review': 58,
+                'scoped_executing': 82,
+                'scoped_executed': 100,
                 'recon': 30,
                 'crawling': 50,
                 'testing': 60,
@@ -223,6 +374,11 @@ export default function MissionControlClient() {
             setBurpConnected(data.burpConnected);
             setActiveAgentCount(data.activeAgents || 0);
             setScanCompleted(data.scanCompleted || false);
+            setSupportsPause(data.supportsPause !== false);
+            setSupportsBrowserVisibility(data.supportsBrowserVisibility !== false);
+            if (data.liveRuntimeSummary !== undefined || data.scopedRuntime !== undefined) {
+                setLiveRuntimeSummary(data.liveRuntimeSummary || data.scopedRuntime || null);
+            }
 
             // Track browser state
             if (data.browserSessionId) {
@@ -513,8 +669,479 @@ User Question: ${userQuestion}`;
         }
     };
 
+    const handleRefreshFocusedPlan = async () => {
+        if (!scanIdRef.current) return;
+        setPlanRefreshPending(true);
+
+        try {
+            const response = await axios.post(`${API_URL}/scans/${scanIdRef.current}/plan-focused-tests`, {}, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            const data = response.data;
+
+            if (data.status) {
+                setStatus(data.status);
+                if (data.status === 'awaiting_review') {
+                    setProgress(100);
+                } else if (data.status === 'scoped_discovering') {
+                    setProgress(22);
+                } else if (data.status === 'planning') {
+                    setProgress(35);
+                }
+            }
+            if (Array.isArray(data.focusedTestCases)) {
+                setFocusedTestCases(data.focusedTestCases);
+            }
+            setFocusedFindings(Array.isArray(data.focusedFindings) ? data.focusedFindings : []);
+            setFocusedFindingThreads(Array.isArray(data.focusedFindingThreads) ? data.focusedFindingThreads : []);
+            setFocusedFindingSummary(data.focusedFindingSummary || null);
+            setFocusedStorySummary(data.focusedStorySummary || null);
+            if (data.scopedTestRequest !== undefined) {
+                setScopedTestRequest(data.scopedTestRequest || null);
+            }
+            if (data.featureDiscoveryState !== undefined) {
+                setFeatureDiscoveryState(data.featureDiscoveryState || null);
+            }
+            if (data.focusedPlanSummary) {
+                setFocusedPlanSummary(data.focusedPlanSummary);
+            }
+            setFocusedVerdictSummary(data.focusedVerdictSummary || null);
+            setFocusedBlockerSummary(data.focusedBlockerSummary || null);
+            setFocusedHistoricalCompareState(data.focusedHistoricalCompareState || null);
+            setFocusedHistoricalCompareSummary(data.focusedHistoricalCompareSummary || null);
+            setFocusedAgentTrace(Array.isArray(data.focusedAgentTrace) ? data.focusedAgentTrace : []);
+            setFocusedRequestContextUsage(data.focusedRequestContextUsage || null);
+            if (data.liveRuntimeSummary !== undefined || data.scopedLiveRuntime !== undefined) {
+                setLiveRuntimeSummary(data.liveRuntimeSummary || data.scopedLiveRuntime || null);
+            }
+
+            toast.success(status === 'awaiting_review' ? 'Legacy scoped plan refreshed.' : 'Scoped mission hints refreshed.');
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to re-seed the scoped mission');
+        } finally {
+            setPlanRefreshPending(false);
+        }
+    };
+
+    const handleFocusedCaseUpdate = async (
+        caseId: string,
+        updates: Partial<Pick<FocusedTestCase, 'priority' | 'status' | 'reviewState'>>,
+    ) => {
+        setPlanActionCaseId(caseId);
+
+        try {
+            const response = await axios.patch(`${API_URL}/scans/${scanIdRef.current}/focused-test-cases/${caseId}`, updates, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            const data = response.data;
+
+            if (data.focusedTestCase) {
+                setFocusedTestCases((current) => current.map((testCase) => (
+                    testCase.id === caseId ? data.focusedTestCase : testCase
+                )));
+                if (selectedEvidenceCaseId === caseId) {
+                    setSelectedPrimaryFinding(data.focusedTestCase.primaryFinding || null);
+                    setSelectedPrimaryFindingThread(data.focusedTestCase.activeFindingThread || null);
+                    setSelectedCaseFindings(Array.isArray(data.focusedTestCase.findings) ? data.focusedTestCase.findings : []);
+                    setSelectedCaseFindingThreads(Array.isArray(data.focusedTestCase.findingThreads) ? data.focusedTestCase.findingThreads : []);
+                    setSelectedHypothesisVisibility(data.focusedTestCase.hypothesisVisibility || null);
+                    setSelectedSuspicionExplanation(data.focusedTestCase.suspicionExplanation || null);
+                }
+            }
+            if (data.focusedFindings !== undefined) {
+                setFocusedFindings(Array.isArray(data.focusedFindings) ? data.focusedFindings : []);
+            }
+            if (data.focusedFindingThreads !== undefined) {
+                setFocusedFindingThreads(Array.isArray(data.focusedFindingThreads) ? data.focusedFindingThreads : []);
+            }
+            if (data.focusedFindingSummary !== undefined) {
+                setFocusedFindingSummary(data.focusedFindingSummary || null);
+            }
+            if (data.focusedStorySummary !== undefined) {
+                setFocusedStorySummary(data.focusedStorySummary || null);
+            }
+            if (data.focusedPlanSummary) {
+                setFocusedPlanSummary(data.focusedPlanSummary);
+            }
+            if (data.focusedVerdictSummary !== undefined) {
+                setFocusedVerdictSummary(data.focusedVerdictSummary || null);
+            }
+            if (data.focusedBlockerSummary !== undefined) {
+                setFocusedBlockerSummary(data.focusedBlockerSummary || null);
+            }
+            if (data.focusedHistoricalCompareState !== undefined) {
+                setFocusedHistoricalCompareState(data.focusedHistoricalCompareState || null);
+            }
+            if (data.focusedHistoricalCompareSummary !== undefined) {
+                setFocusedHistoricalCompareSummary(data.focusedHistoricalCompareSummary || null);
+            }
+            if (data.focusedAgentTrace !== undefined) {
+                setFocusedAgentTrace(Array.isArray(data.focusedAgentTrace) ? data.focusedAgentTrace : []);
+            }
+            if (data.focusedRequestContextUsage !== undefined) {
+                setFocusedRequestContextUsage(data.focusedRequestContextUsage || null);
+            }
+            if (data.liveRuntimeSummary !== undefined || data.scopedLiveRuntime !== undefined) {
+                setLiveRuntimeSummary(data.liveRuntimeSummary || data.scopedLiveRuntime || null);
+            }
+
+            toast.success('Focused test case updated.');
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to update focused test case');
+        } finally {
+            setPlanActionCaseId(null);
+        }
+    };
+
+    const handleRunFocusedExecution = async (caseIds?: string[]) => {
+        if (!scanIdRef.current) return;
+        setExecutePending(true);
+
+        try {
+            const response = await axios.post(`${API_URL}/scans/${scanIdRef.current}/execute-focused-tests`, caseIds?.length ? { caseIds } : {}, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            if (response.data?.status) {
+                setStatus(response.data.status);
+                setProgress(response.data.status === 'scoped_executing' ? 85 : progress);
+            } else {
+                setStatus('scoped_executing');
+                setProgress(85);
+            }
+            setFocusedVerdictSummary(null);
+            setFocusedBlockerSummary(null);
+            setFocusedHistoricalCompareState(null);
+            setFocusedHistoricalCompareSummary(null);
+            setFocusedFindings([]);
+            setFocusedFindingThreads([]);
+            setFocusedFindingSummary(null);
+            setFocusedStorySummary(null);
+            setSelectedPrimaryFinding(null);
+            setSelectedPrimaryFindingThread(null);
+            setSelectedCaseFindings([]);
+            setSelectedCaseFindingThreads([]);
+            setSelectedHypothesisVisibility(null);
+            setSelectedSuspicionExplanation(null);
+            setSelectedContextInfluenceSummary(null);
+            setSelectedEvidenceReasoningLinks([]);
+            setSelectedReasoningTrace([]);
+            setSelectedCaseVerdict(null);
+            setSelectedPrimaryFinding(null);
+            setSelectedPrimaryFindingThread(null);
+            setSelectedCaseFindings([]);
+            setSelectedCaseFindingThreads([]);
+            setSelectedCaseHistoricalCompare(null);
+            setSelectedExecutionTrace([]);
+            setSelectedRailSummary(null);
+            setSelectedInvestigationIssues([]);
+            toast.success(caseIds?.length
+                ? 'Focused test case queued for retry.'
+                : isLegacyScopedReviewMode
+                    ? 'Approved legacy cases are now executing.'
+                    : 'Bounded live mission execution is now running.');
+            await fetchScanState();
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to launch focused execution');
+        } finally {
+            setExecutePending(false);
+        }
+    };
+
+    const handleRefreshFocusedVerdicts = async () => {
+        if (!scanIdRef.current) return;
+        setVerdictRefreshPending(true);
+
+        try {
+            const response = await axios.post(`${API_URL}/scans/${scanIdRef.current}/generate-focused-verdicts`, {}, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            const data = response.data;
+            if (Array.isArray(data.focusedTestCases)) {
+                setFocusedTestCases(data.focusedTestCases);
+            }
+            if (data.focusedFindings !== undefined) {
+                setFocusedFindings(Array.isArray(data.focusedFindings) ? data.focusedFindings : []);
+            }
+            if (data.focusedFindingThreads !== undefined) {
+                setFocusedFindingThreads(Array.isArray(data.focusedFindingThreads) ? data.focusedFindingThreads : []);
+            }
+            if (data.focusedFindingSummary !== undefined) {
+                setFocusedFindingSummary(data.focusedFindingSummary || null);
+            }
+            if (data.focusedPlanSummary) {
+                setFocusedPlanSummary(data.focusedPlanSummary);
+            }
+            if (data.focusedVerdictSummary !== undefined) {
+                setFocusedVerdictSummary(data.focusedVerdictSummary || null);
+            }
+            if (data.focusedBlockerSummary !== undefined) {
+                setFocusedBlockerSummary(data.focusedBlockerSummary || null);
+            }
+            if (data.focusedHistoricalCompareState !== undefined) {
+                setFocusedHistoricalCompareState(data.focusedHistoricalCompareState || null);
+            }
+            if (data.focusedHistoricalCompareSummary !== undefined) {
+                setFocusedHistoricalCompareSummary(data.focusedHistoricalCompareSummary || null);
+            }
+            if (data.focusedAgentTrace !== undefined) {
+                setFocusedAgentTrace(Array.isArray(data.focusedAgentTrace) ? data.focusedAgentTrace : []);
+            }
+            if (data.focusedRequestContextUsage !== undefined) {
+                setFocusedRequestContextUsage(data.focusedRequestContextUsage || null);
+            }
+            if (data.liveRuntimeSummary !== undefined || data.scopedLiveRuntime !== undefined) {
+                setLiveRuntimeSummary(data.liveRuntimeSummary || data.scopedLiveRuntime || null);
+            }
+            if (selectedEvidenceCaseId) {
+                const refreshedCase = Array.isArray(data.focusedTestCases)
+                    ? data.focusedTestCases.find((entry: FocusedTestCase) => entry.id === selectedEvidenceCaseId)
+                    : null;
+                setSelectedPrimaryFinding(refreshedCase?.primaryFinding || null);
+                setSelectedPrimaryFindingThread(refreshedCase?.activeFindingThread || null);
+                setSelectedCaseFindings(Array.isArray(refreshedCase?.findings) ? refreshedCase.findings : []);
+                setSelectedCaseFindingThreads(Array.isArray(refreshedCase?.findingThreads) ? refreshedCase.findingThreads : []);
+                setSelectedCaseVerdict(refreshedCase?.latestVerdict || null);
+                setSelectedCaseHistoricalCompare(refreshedCase?.historicalCompare || null);
+                setSelectedHypothesisVisibility(refreshedCase?.hypothesisVisibility || null);
+                setSelectedSuspicionExplanation(refreshedCase?.suspicionExplanation || null);
+            }
+            toast.success('Focused verdicts refreshed.');
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to refresh focused verdicts');
+        } finally {
+            setVerdictRefreshPending(false);
+        }
+    };
+
+    const handleInspectEvidence = async (caseId: string) => {
+        if (!scanIdRef.current) return;
+        setEvidenceLoadingCaseId(caseId);
+
+        try {
+            const response = await axios.get(`${API_URL}/scans/${scanIdRef.current}/focused-test-cases/${caseId}/evidence`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            setSelectedEvidenceCaseId(caseId);
+            setSelectedExecution(response.data?.execution || null);
+            setSelectedCaseVerdict(response.data?.caseVerdict || null);
+            setSelectedPrimaryFinding(response.data?.primaryFinding || response.data?.focusedTestCase?.primaryFinding || null);
+            setSelectedPrimaryFindingThread(response.data?.primaryFindingThread || response.data?.focusedTestCase?.activeFindingThread || null);
+            setSelectedCaseFindings(Array.isArray(response.data?.findings)
+                ? response.data.findings
+                : Array.isArray(response.data?.focusedTestCase?.findings)
+                    ? response.data.focusedTestCase.findings
+                    : []);
+            setSelectedCaseFindingThreads(Array.isArray(response.data?.findingThreads)
+                ? response.data.findingThreads
+                : Array.isArray(response.data?.focusedTestCase?.findingThreads)
+                    ? response.data.focusedTestCase.findingThreads
+                    : []);
+            setSelectedCaseHistoricalCompare(response.data?.focusedTestCase?.historicalCompare || null);
+            setSelectedHypothesisVisibility(response.data?.hypothesisVisibility || response.data?.focusedTestCase?.hypothesisVisibility || null);
+            setSelectedSuspicionExplanation(response.data?.suspicionExplanation || response.data?.focusedTestCase?.suspicionExplanation || null);
+            setSelectedContextInfluenceSummary(response.data?.contextInfluenceSummary || null);
+            setSelectedEvidenceReasoningLinks(Array.isArray(response.data?.evidenceReasoningLinks) ? response.data.evidenceReasoningLinks : []);
+            setSelectedReasoningTrace(Array.isArray(response.data?.reasoningTrace) ? response.data.reasoningTrace : []);
+            setSelectedEvidenceBundles(Array.isArray(response.data?.evidenceBundles) ? response.data.evidenceBundles : []);
+            setSelectedExecutionTrace(Array.isArray(response.data?.executionTrace) ? response.data.executionTrace : []);
+            setSelectedRailSummary(response.data?.railSummary || null);
+            setSelectedInvestigationIssues(Array.isArray(response.data?.investigationIssues) ? response.data.investigationIssues : []);
+            if (response.data?.focusedTestCase?.id === caseId) {
+                setFocusedTestCases((prev) => prev.map((entry) => (
+                    entry.id === caseId ? response.data.focusedTestCase : entry
+                )));
+            }
+            if (response.data?.focusedVerdictSummary !== undefined) {
+                setFocusedVerdictSummary(response.data.focusedVerdictSummary || null);
+            }
+            if (response.data?.focusedFindingSummary !== undefined) {
+                setFocusedFindingSummary(response.data.focusedFindingSummary || null);
+            }
+            if (response.data?.focusedStorySummary !== undefined) {
+                setFocusedStorySummary(response.data.focusedStorySummary || null);
+            }
+            if (response.data?.focusedFindings !== undefined) {
+                setFocusedFindings(Array.isArray(response.data.focusedFindings) ? response.data.focusedFindings : []);
+            }
+            if (response.data?.focusedFindingThreads !== undefined) {
+                setFocusedFindingThreads(Array.isArray(response.data.focusedFindingThreads) ? response.data.focusedFindingThreads : []);
+            }
+            if (response.data?.focusedBlockerSummary !== undefined) {
+                setFocusedBlockerSummary(response.data.focusedBlockerSummary || null);
+            }
+            if (response.data?.focusedHistoricalCompareState !== undefined) {
+                setFocusedHistoricalCompareState(response.data.focusedHistoricalCompareState || null);
+            }
+            if (response.data?.focusedHistoricalCompareSummary !== undefined) {
+                setFocusedHistoricalCompareSummary(response.data.focusedHistoricalCompareSummary || null);
+            }
+            if (response.data?.focusedAgentTrace !== undefined) {
+                setFocusedAgentTrace(Array.isArray(response.data.focusedAgentTrace) ? response.data.focusedAgentTrace : []);
+            }
+            if (response.data?.focusedRequestContextUsage !== undefined) {
+                setFocusedRequestContextUsage(response.data.focusedRequestContextUsage || null);
+            }
+        } catch (e: any) {
+            toast.error(e.response?.data?.message || 'Failed to load focused evidence');
+        } finally {
+            setEvidenceLoadingCaseId(null);
+        }
+    };
+
+    const buildScreenshotDataUrl = (screenshotRef?: EvidenceBundle['screenshotRef'] | null) => {
+        if (!screenshotRef?.value) {
+            return null;
+        }
+        const mimeType = screenshotRef.mimeType || 'image/png';
+        return `data:${mimeType};base64,${screenshotRef.value}`;
+    };
+
+    const formatExpectationSummary = (bundle: EvidenceBundle) => {
+        const expectations = bundle.browserState?.expectations || [];
+        if (expectations.length === 0) {
+            return null;
+        }
+        const matched = expectations.filter((entry) => entry.matched).length;
+        return `${matched}/${expectations.length} browser checks matched`;
+    };
+
     // Show loading until scanId is resolved from URL
     const endpointRows = buildEndpointDisplayRows(endpointInventory, 24);
+    const focusedCaseRows = buildFocusedCaseRows(focusedTestCases);
+    const focusedCaseMap = new Map(focusedTestCases.map((testCase) => [testCase.id, testCase]));
+    const focusedFindingRows = buildFocusedScanFindingRows(focusedFindings, focusedTestCases, focusedFindingThreads);
+    const visibleFocusedFindingRows = focusedFindingRows.filter((entry) => entry.finding.status !== 'not_confirmed');
+    const selectedEvidenceCase = selectedEvidenceCaseId ? focusedCaseMap.get(selectedEvidenceCaseId) || null : null;
+    const selectedEvidenceRow = selectedEvidenceCaseId
+        ? focusedCaseRows.find((row) => row.id === selectedEvidenceCaseId) || null
+        : null;
+    const effectiveSelectedFindingThread = selectedPrimaryFindingThread || selectedEvidenceCase?.activeFindingThread || null;
+    const effectiveSelectedThreadFindings = selectedCaseFindingThreads.length > 0
+        ? selectedCaseFindingThreads
+        : (Array.isArray(selectedEvidenceCase?.findingThreads) ? selectedEvidenceCase.findingThreads : []);
+    const effectiveSelectedCaseVerdict = selectedCaseVerdict || selectedEvidenceCase?.latestVerdict || null;
+    const effectiveSelectedPrimaryFinding = selectedPrimaryFinding
+        || selectedEvidenceCase?.primaryFinding
+        || (effectiveSelectedFindingThread ? projectFocusedFindingThread(effectiveSelectedFindingThread) : null);
+    const effectiveSelectedCaseFindings = selectedCaseFindings.length > 0
+        ? selectedCaseFindings
+        : (Array.isArray(selectedEvidenceCase?.findings) && selectedEvidenceCase.findings.length > 0
+            ? selectedEvidenceCase.findings
+            : effectiveSelectedThreadFindings.map((thread) => projectFocusedFindingThread(thread)));
+    const effectiveSelectedCaseHistoricalCompare = selectedCaseHistoricalCompare || selectedEvidenceCase?.historicalCompare || null;
+    const effectiveSelectedHypothesisVisibility = selectedHypothesisVisibility || selectedEvidenceCase?.hypothesisVisibility || null;
+    const effectiveSelectedSuspicionExplanation = selectedSuspicionExplanation || selectedEvidenceCase?.suspicionExplanation || null;
+    const effectiveSelectedContextInfluenceSummary = selectedContextInfluenceSummary || focusedRequestContextUsage || null;
+    const effectiveSelectedRailSummary = selectedRailSummary || selectedEvidenceCase?.executionRailSummary || null;
+    const effectiveSelectedSupportProvenance = effectiveSelectedPrimaryFinding?.supportProvenance
+        || effectiveSelectedFindingThread?.supportProvenance
+        || effectiveSelectedCaseVerdict?.supportProvenance
+        || null;
+    const effectiveSelectedRequestEvidenceStory = effectiveSelectedPrimaryFinding?.requestEvidenceStory
+        || effectiveSelectedFindingThread?.requestEvidenceStory
+        || effectiveSelectedCaseVerdict?.requestEvidenceStory
+        || null;
+    const effectiveSelectedExecutionTrace = selectedExecutionTrace.length > 0
+        ? selectedExecutionTrace
+        : (selectedEvidenceCase?.latestExecutionTracePreview || []);
+    const effectiveSelectedReasoningTrace = selectedReasoningTrace.length > 0
+        ? selectedReasoningTrace
+        : (selectedEvidenceCase?.latestReasoningTracePreview || []);
+    const selectedEvidenceEmptyState = buildFocusedEvidenceEmptyState({
+        presentationState: selectedEvidenceRow?.executionPresentationState || selectedEvidenceCase?.executionPresentationState,
+        reviewState: selectedEvidenceCase?.reviewState,
+        status: selectedEvidenceCase?.status,
+    });
+    const isScopedScan = scanMode === 'scoped';
+    const missionControlPolicy = deriveMissionControlPolicy({
+        scanMode,
+        status,
+        legacyRecoveryRequested: showLegacyRecovery,
+    });
+    const isScopedDiscoveryMode = isScopedScan && status === 'scoped_discovering';
+    const isScopedReviewMode = isScopedReviewStage(scanMode, status);
+    const isLegacyScopedReviewMode = missionControlPolicy.isLegacyScopedRecoveryState;
+    const isScopedExecutionMode = isScopedExecutionStage(scanMode, status);
+    const showLegacyRecoveryPanel = missionControlPolicy.showLegacyRecoveryTools;
+    const showScopedSecondaryContext = missionControlPolicy.showScopedSecondaryContext;
+    const showSharedLiveFindings = missionControlPolicy.showSharedLiveFindings;
+    const scopedControlMode = isScopedScan && !isAgentActive && !scanCompleted && status !== 'failed' && status !== 'completed' && status !== 'stopped';
+    const scopedReviewCounts = summarizeScopedPlanReviewCounts(focusedTestCases, focusedPlanSummary);
+    const runnableFocusedCaseCount = scopedReviewCounts.approvedCount;
+    const scopedStageLabel = formatScopedWorkflowStage(status);
+    const scopedNextAction = getScopedRecommendedAction(status, scopedReviewCounts);
+    const scopedExecutionLabel = status === 'scoped_executing'
+        ? 'Running'
+        : status === 'scoped_executed'
+            ? 'Completed'
+            : runnableFocusedCaseCount > 0
+                ? 'Ready'
+                : 'Not Started';
+    const scopedLiveRuntime = liveRuntimeSummary;
+    const scopedRuntimeBoundary = scopedLiveRuntime?.boundarySummary || null;
+    const scopedRuntimeRequest = scopedLiveRuntime?.lastRequestSummary || null;
+    const scopedActiveCaseLabel = scopedLiveRuntime?.activeCaseTitle || focusedCaseRows[0]?.title || null;
+    const scopedActiveFindingLabel = scopedLiveRuntime?.activeFindingTitle || focusedFindingRows[0]?.finding.title || null;
+    const focusedVerdictCounts = focusedVerdictSummary?.countsByVerdict || {
+        pass: 0,
+        fail: 0,
+        inconclusive: 0,
+        needs_review: 0,
+    };
+    const focusedFindingCounts = focusedFindingSummary?.countsByStatus || {
+        confirmed: 0,
+        likely: 0,
+        suspicious: 0,
+        inconclusive: 0,
+        not_confirmed: 0,
+    };
+    const scopedAgentTracePreview = buildFocusedReasoningTracePreview(focusedAgentTrace, 18);
+    const blockerImpactCounts = focusedBlockerSummary?.countsByImpact || {
+        informational: 0,
+        degrading: 0,
+        blocking: 0,
+    };
+    const focusedHistoricalCounts = focusedHistoricalCompareSummary || {
+        improvedCount: 0,
+        regressedCount: 0,
+        unchangedCount: 0,
+        weakerConfidenceCount: 0,
+        strongerConfidenceCount: 0,
+        newlyIntroducedCount: 0,
+        notComparableCount: 0,
+        removedPriorCaseCount: 0,
+        repeatedBlockerFamilies: [],
+        newBlockerFamilies: [],
+        resolvedBlockerFamilies: [],
+        stabilityNotes: [],
+        manualReviewRecommended: false,
+        overallChangeClassification: 'no_material_change' as const,
+    };
+    const focusedStoryCaseMap = new Map((focusedStorySummary?.cases || []).map((entry) => [entry.caseId, entry]));
+    const unresolvedBlockerTypes = Object.entries(focusedBlockerSummary?.unresolvedByType || {})
+        .filter(([, count]) => Number(count) > 0)
+        .sort((left, right) => Number(right[1]) - Number(left[1]));
+    const summarizeFocusedCaseInputs = (row: typeof focusedCaseRows[number]) => (
+        row.caseIntelligence?.candidateInputs
+            ?.slice(0, 3)
+            .map((entry) => `${entry.location}:${entry.name}`)
+            || focusedStoryCaseMap.get(row.id)?.targetedInputs?.slice(0, 3)
+            || []
+    );
+    const summarizeFocusedCaseStopReason = (row: typeof focusedCaseRows[number]) => (
+        row.suspicionExplanation?.boundedStopReason
+        || row.primaryFinding?.blockingConstraintSummary
+        || focusedStoryCaseMap.get(row.id)?.blockedBy?.[0]
+        || row.latestVerdict?.interpretationSummary?.followUpDecisionSummary
+        || row.investigationSummary?.latestIssueTitle
+        || null
+    );
+    const summarizeFocusedCaseNextStep = (row: typeof focusedCaseRows[number]) => (
+        row.primaryFinding?.nextStepSummary
+        || focusedStoryCaseMap.get(row.id)?.nextStep
+        || row.latestVerdict?.interpretationSummary?.nextStepSummary
+        || null
+    );
     const browserToggleAction = browserLifecycleState === 'visible_active' ? 'hide' : 'show';
     const browserStatusLabel = (() => {
         switch (browserLifecycleState) {
@@ -575,6 +1202,114 @@ User Question: ${userQuestion}`;
             || browserLifecycleState === 'closed'
             ? 'bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20'
             : 'bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:bg-purple-500/20';
+    const scopedStatusBadgeClass = (() => {
+        switch (status) {
+            case 'scoped_discovering':
+                return 'border-blue-500/30 bg-blue-500/10 text-blue-200';
+            case 'planning':
+                return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200';
+            case 'awaiting_review':
+                return 'border-violet-500/30 bg-violet-500/10 text-violet-200';
+            case 'scoped_executing':
+                return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
+            case 'scoped_executed':
+                return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
+            case 'failed':
+                return 'border-red-500/30 bg-red-500/10 text-red-200';
+            default:
+                return 'border-slate-600 bg-slate-800/60 text-slate-200';
+        }
+    })();
+    const scopedPrimaryActionDisabled = executePending
+        || status === 'scoped_discovering'
+        || status === 'planning'
+        || status === 'scoped_executing'
+        || runnableFocusedCaseCount === 0;
+
+    const getCaseCardClassName = (row: typeof focusedCaseRows[number]) => {
+        if (row.status === 'disabled') {
+            return 'border-slate-800 bg-slate-950/60 opacity-80';
+        }
+        if (row.reviewState === 'approved') {
+            return 'border-emerald-500/30 bg-emerald-500/5 shadow-[0_0_0_1px_rgba(16,185,129,0.08)]';
+        }
+        if (selectedEvidenceCaseId === row.id) {
+            return 'border-cyan-500/40 bg-cyan-500/5 shadow-[0_0_0_1px_rgba(34,211,238,0.1)]';
+        }
+        return 'border-violet-500/20 bg-black/30 hover:border-violet-500/35';
+    };
+
+    const getReviewBadgeClassName = (row: typeof focusedCaseRows[number]) => {
+        if (row.reviewState === 'approved') {
+            return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
+        }
+        if (row.reviewState === 'rejected') {
+            return 'border-red-500/30 bg-red-500/10 text-red-200';
+        }
+        return 'border-violet-500/30 bg-violet-500/10 text-violet-200';
+    };
+
+    const getPriorityBadgeClassName = (priority: typeof focusedCaseRows[number]['priority']) => {
+        switch (priority) {
+            case 'high':
+                return 'border-red-500/30 bg-red-500/10 text-red-200';
+            case 'low':
+                return 'border-slate-600 bg-slate-800/60 text-slate-300';
+            default:
+                return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
+        }
+    };
+
+    const getExecutionBadgeClassName = (presentationState: typeof focusedCaseRows[number]['executionPresentationState']) => {
+        switch (presentationState) {
+            case 'completed_with_evidence':
+                return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
+            case 'completed_without_evidence':
+                return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200';
+            case 'running':
+                return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200';
+            case 'failed_to_execute':
+                return 'border-red-500/30 bg-red-500/10 text-red-200';
+            case 'blocked':
+                return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
+            case 'awaiting_approval':
+                return 'border-violet-500/30 bg-violet-500/10 text-violet-200';
+            case 'skipped_not_approved':
+            case 'skipped_disabled':
+            case 'not_run_yet':
+                return 'border-slate-600 bg-slate-800/60 text-slate-300';
+            default:
+                return 'border-slate-600 bg-slate-800/60 text-slate-200';
+        }
+    };
+
+    const getVerdictBadgeClassName = (verdictState: string | null | undefined) => {
+        switch (verdictState) {
+            case 'pass':
+                return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
+            case 'fail':
+                return 'border-red-500/30 bg-red-500/10 text-red-200';
+            case 'needs_review':
+                return 'border-violet-500/30 bg-violet-500/10 text-violet-200';
+            case 'inconclusive':
+                return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
+            default:
+                return 'border-slate-600 bg-slate-800/60 text-slate-300';
+        }
+    };
+
+    const getSupportProvenanceBadgeClassName = (rail: string | null | undefined) => {
+        switch (rail) {
+            case 'request':
+                return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-100';
+            case 'browser':
+                return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100';
+            case 'hybrid':
+                return 'border-violet-500/30 bg-violet-500/10 text-violet-100';
+            default:
+                return 'border-slate-600 bg-slate-800/60 text-slate-300';
+        }
+    };
 
     if (!scanId) {
         return (
@@ -583,6 +1318,1674 @@ User Question: ${userQuestion}`;
                     <div className="w-12 h-12 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin mx-auto" />
                     <p className="text-slate-400">Loading Mission Control...</p>
                 </div>
+            </div>
+        );
+    }
+
+    if (isScopedScan && !showSharedLiveFindings) {
+        return (
+            <div className="min-h-screen bg-black text-slate-200 font-sans selection:bg-cyan-500/30">
+                <header className="border-b border-white/10 bg-black/50 backdrop-blur fixed top-10 w-full z-50">
+                    <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+                        <div className="flex items-center gap-4">
+                            <Link href="/dashboard" className="p-2 hover:bg-white/5 rounded-lg transition-colors">
+                                <ArrowLeft className="w-5 h-5 text-slate-400" />
+                            </Link>
+                            <div>
+                                <h1 className="font-bold text-white flex items-center gap-2">
+                                    <Activity className="w-4 h-4 text-cyan-400 animate-pulse" />
+                                    Mission Control
+                                </h1>
+                                <div className="text-xs text-slate-500 font-mono">ID: {scanId.substring(0, 8)}...</div>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            {isAgentActive && supportsBrowserVisibility && browserSessionId && status !== 'completed' && status !== 'failed' && status !== 'stopped' && (
+                                <button
+                                    onClick={async () => {
+                                        if (browserTransitioning) return;
+                                        setBrowserTransitioning(true);
+                                        try {
+                                            const endpoint = browserToggleAction;
+                                            const response = await axios.post(`${API_URL}/scans/${scanIdRef.current}/browser/${endpoint}`, {}, {
+                                                headers: { Authorization: `Bearer ${token}` },
+                                            });
+                                            const visibility = response.data || {};
+                                            setBrowserIsHeadless(visibility.isHeadless ?? null);
+                                            setBrowserTransitioning(Boolean(visibility.transitioning));
+                                            setBrowserLifecycleState(visibility.lifecycleState ?? null);
+                                            setBrowserIsLive(Boolean(visibility.isLive));
+                                            toast.success(
+                                                visibility.message
+                                                || (endpoint === 'show' ? 'Browser window opened' : 'Browser hidden'),
+                                            );
+                                        } catch (error: any) {
+                                            toast.error(error.response?.data?.message || 'Failed to toggle browser');
+                                        } finally {
+                                            setBrowserTransitioning(false);
+                                        }
+                                    }}
+                                    disabled={browserTransitioning}
+                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${browserButtonClass} disabled:opacity-50`}
+                                >
+                                    {browserTransitioning ? (
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                    ) : browserToggleAction === 'show' ? (
+                                        <Eye className="w-3.5 h-3.5" />
+                                    ) : (
+                                        <EyeOff className="w-3.5 h-3.5" />
+                                    )}
+                                    {browserButtonLabel}
+                                </button>
+                            )}
+                            {isAgentActive && supportsPause && !isPaused && status !== 'completed' && status !== 'failed' && status !== 'stopped' && (
+                                <button
+                                    onClick={handlePause}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20 transition-colors text-xs font-medium"
+                                >
+                                    <Pause className="w-3.5 h-3.5" /> Pause
+                                </button>
+                            )}
+                            {supportsPause && isPaused && (
+                                <button
+                                    onClick={handleResume}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20 transition-colors text-xs font-medium animate-pulse"
+                                >
+                                    <Play className="w-3.5 h-3.5" /> Resume
+                                </button>
+                            )}
+                            {(status === 'completed' || status === 'stopped' || status === 'scoped_executed') && (
+                                <button
+                                    onClick={() => setReportModalOpen(true)}
+                                    className="btn-primary flex items-center gap-2 text-xs"
+                                >
+                                    <Download className="w-4 h-4" /> Export Report
+                                </button>
+                            )}
+                            <div className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
+                                isPaused ? 'bg-amber-500/20 text-amber-400' :
+                                    status === 'scoped_discovering' ? 'bg-blue-500/20 text-blue-300 animate-pulse' :
+                                        status === 'planning' ? 'bg-cyan-500/20 text-cyan-300 animate-pulse' :
+                                            status === 'awaiting_review' ? 'bg-violet-500/20 text-violet-300' :
+                                                status === 'scoped_executing' ? 'bg-emerald-500/20 text-emerald-300 animate-pulse' :
+                                                    status === 'scoped_executed' ? 'bg-emerald-500/20 text-emerald-300' :
+                                                        status === 'failed' ? 'bg-red-500/20 text-red-300' :
+                                                            'bg-slate-800 text-slate-400'
+                            }`}>
+                                {isPaused ? 'paused' : status}
+                            </div>
+                        </div>
+                    </div>
+                </header>
+
+                <main className="pt-24 pb-8 px-4 max-w-7xl mx-auto space-y-6">
+                    <section className="grid gap-6 xl:grid-cols-[1.35fr,1fr]">
+                        <motion.div
+                            initial={{ opacity: 0, y: 12 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card p-5 border-white/10"
+                        >
+                            <div className="flex items-start justify-between gap-4">
+                                <div className="space-y-3 min-w-0">
+                                    <div>
+                                        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">Request Summary</div>
+                                        <h2 className="mt-2 text-xl font-semibold text-white">Structured security test request</h2>
+                                    </div>
+                                    {scopedTestRequest ? (
+                                        <>
+                                            <div className="flex flex-wrap gap-2">
+                                                <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs break-all">
+                                                    {scopedTestRequest.targetUrl}
+                                                </span>
+                                                {scopedTestRequest.serviceName && (
+                                                    <span className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-200 text-xs">
+                                                        {scopedTestRequest.serviceName}
+                                                    </span>
+                                                )}
+                                                {scopedTestRequest.environment && (
+                                                    <span className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-300 text-xs uppercase">
+                                                        {scopedTestRequest.environment}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <p className="text-sm leading-7 text-slate-200">{scopedTestRequest.description}</p>
+                                        </>
+                                    ) : (
+                                        <p className="text-sm leading-7 text-slate-400">
+                                            Request details will appear here once the scoped run is initialized.
+                                        </p>
+                                    )}
+                                    {focusedTestObjective?.goal && (
+                                        <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Mission</div>
+                                            <p className="mt-2 text-sm leading-7 text-slate-200">{focusedTestObjective.goal}</p>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="shrink-0 hidden lg:flex">
+                                    <div className="w-16 h-16 rounded-2xl border border-cyan-500/20 bg-cyan-500/10 flex items-center justify-center">
+                                        <Crosshair className="w-7 h-7 text-cyan-300" />
+                                    </div>
+                                </div>
+                            </div>
+                            {(focusedTestObjective?.riskTags?.length || scopeEnvelope?.boundaryHints?.length) && (
+                                <div className="mt-4 flex flex-wrap gap-2">
+                                    {focusedTestObjective?.riskTags?.map((tag) => (
+                                        <span key={tag} className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-200 text-xs">
+                                            {tag}
+                                        </span>
+                                    ))}
+                                    {scopeEnvelope?.boundaryHints?.slice(0, 2).map((hint) => (
+                                        <span key={hint} className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-300 text-xs">
+                                            {hint}
+                                        </span>
+                                    ))}
+                                </div>
+                            )}
+                        </motion.div>
+
+                        <motion.div
+                            initial={{ opacity: 0, y: 12 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card p-5 border-white/10"
+                        >
+                            <div className="space-y-4">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${scopedStatusBadgeClass}`}>
+                                        {scopedStageLabel}
+                                    </span>
+                                    {featureDiscoveryState && (
+                                        <span className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-200 text-xs">
+                                            {formatScopedFeatureDiscoveryOutcome(featureDiscoveryState.outcome)}
+                                        </span>
+                                    )}
+                                </div>
+                                <div>
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Feature Discovery</div>
+                                    <h2 className="mt-2 text-lg font-semibold text-white">Bounded feature anchors</h2>
+                                </div>
+                                <p className="text-sm leading-7 text-slate-300">
+                                    {featureDiscoveryState?.errorMessage
+                                        || featureDiscoveryState?.summary
+                                        || 'PenPard is keeping discovery scoped to the submitted request and nearby feature flow.'}
+                                </p>
+                                <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-2">
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Anchors</div>
+                                    <div className="text-sm text-slate-200">{buildScopedAnchorSummary(scopeEnvelope, featureDiscoveryState)}</div>
+                                    {scopeEnvelope?.allowedRoutes?.length ? (
+                                        <div className="text-xs text-slate-400">
+                                            Scoped routes: {scopeEnvelope.allowedRoutes.slice(0, 3).join(', ')}
+                                            {scopeEnvelope.allowedRoutes.length > 3 ? ` +${scopeEnvelope.allowedRoutes.length - 3} more` : ''}
+                                        </div>
+                                    ) : null}
+                                </div>
+                            </div>
+                        </motion.div>
+                    </section>
+
+                    <motion.section
+                        initial={{ opacity: 0, y: 14 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="card p-6 border-violet-500/20 bg-gradient-to-br from-violet-500/6 via-slate-950 to-slate-950"
+                    >
+                        <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
+                            <div className="space-y-4 max-w-3xl">
+                                <div className="flex flex-wrap items-center gap-3">
+                                    <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${scopedStatusBadgeClass}`}>
+                                        {scopedStageLabel}
+                                    </span>
+                                    <span className="text-sm text-slate-400">Next action</span>
+                                    <span className="text-sm font-medium text-white">{scopedNextAction}</span>
+                                </div>
+                                <div>
+                                    <h2 className="text-2xl font-semibold text-white">{isLegacyScopedReviewMode ? 'Legacy Scoped Plan' : 'Live Scoped Mission'}</h2>
+                                    <p className="mt-2 text-sm leading-7 text-slate-300">
+                                        {isLegacyScopedReviewMode
+                                            ? 'This older scoped run still uses the manual case review flow. You can review and launch it here.'
+                                            : 'Scoped mode now uses the live exploratory-style runtime while staying pinned to the bounded feature area and route set.'}
+                                    </p>
+                                </div>
+                                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+                                    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
+                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Cases</div>
+                                        <div className="mt-2 text-2xl font-semibold text-white">{scopedReviewCounts.totalCases}</div>
+                                    </div>
+                                    {isLegacyScopedReviewMode ? (
+                                        <div className="rounded-2xl border border-violet-500/20 bg-violet-500/10 p-4">
+                                            <div className="text-[11px] uppercase tracking-[0.18em] text-violet-200">Awaiting Review</div>
+                                            <div className="mt-2 text-2xl font-semibold text-white">{scopedReviewCounts.pendingReviewCount}</div>
+                                        </div>
+                                    ) : (
+                                        <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-4">
+                                            <div className="text-[11px] uppercase tracking-[0.18em] text-cyan-200">Active Case</div>
+                                            <div className="mt-2 text-sm font-semibold text-white leading-6">{scopedActiveCaseLabel || 'Waiting for execution'}</div>
+                                        </div>
+                                    )}
+                                    <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-4">
+                                        <div className="text-[11px] uppercase tracking-[0.18em] text-emerald-200">{isLegacyScopedReviewMode ? 'Approved' : 'Finding Threads'}</div>
+                                        <div className="mt-2 text-2xl font-semibold text-white">{isLegacyScopedReviewMode ? scopedReviewCounts.approvedCount : (scopedLiveRuntime?.liveFindingCount ?? focusedFindingThreads.length)}</div>
+                                    </div>
+                                    <div className="rounded-2xl border border-slate-700 bg-slate-900/70 p-4">
+                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Disabled</div>
+                                        <div className="mt-2 text-2xl font-semibold text-white">{scopedReviewCounts.disabledCount}</div>
+                                    </div>
+                                    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
+                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{isLegacyScopedReviewMode ? 'Execution' : 'Rail'}</div>
+                                        <div className="mt-2 text-lg font-semibold text-white">{isLegacyScopedReviewMode ? scopedExecutionLabel : (scopedLiveRuntime?.currentRail ? formatFocusedExecutionRail(scopedLiveRuntime.currentRail) : 'System-only')}</div>
+                                    </div>
+                                    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
+                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Verdict</div>
+                                        <div className="mt-2 text-lg font-semibold text-white">{formatFocusedVerdictState(focusedVerdictSummary?.overallVerdict)}</div>
+                                        {focusedHistoricalCompareState && (
+                                            <div className="mt-1 text-xs text-slate-400">{formatFocusedHistoricalCompareStatus(focusedHistoricalCompareState.comparisonStatus)}</div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="w-full lg:max-w-sm rounded-2xl border border-white/10 bg-black/30 p-4 space-y-4">
+                                <div>
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Operator Controls</div>
+                                    <p className="mt-2 text-sm leading-6 text-slate-300">
+                                        {isLegacyScopedReviewMode
+                                            ? 'Review the cases you want to keep, then run only the approved set inside the current scope.'
+                                            : 'Watch the bounded mission work live. Manual controls are tucked behind recovery mode so the live runtime stays primary.'}
+                                    </p>
+                                </div>
+                                {!isLegacyScopedReviewMode && (
+                                    <button
+                                        onClick={() => setShowLegacyRecovery((current) => !current)}
+                                        className="w-full px-4 py-2 rounded-2xl border border-slate-700 bg-slate-900/70 text-slate-200 hover:bg-slate-800 text-sm font-medium"
+                                    >
+                                        {showLegacyRecoveryPanel ? 'Hide Legacy Recovery Tools' : 'Show Legacy Recovery Tools'}
+                                    </button>
+                                )}
+                                <div className="space-y-2">
+                                    {showLegacyRecoveryPanel && isLegacyScopedReviewMode && (
+                                        <button
+                                            onClick={() => handleRunFocusedExecution()}
+                                            disabled={scopedPrimaryActionDisabled}
+                                            className="w-full px-4 py-3 rounded-2xl bg-emerald-500 text-black font-semibold hover:bg-emerald-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
+                                            {executePending || status === 'scoped_executing' ? 'Running Legacy Cases...' : 'Run Approved Legacy Cases'}
+                                        </button>
+                                    )}
+                                    <div className={`grid gap-2 ${showLegacyRecoveryPanel ? 'sm:grid-cols-2' : ''}`}>
+                                        <button
+                                            onClick={handleRefreshFocusedPlan}
+                                            disabled={!showLegacyRecoveryPanel || planRefreshPending || status === 'scoped_discovering' || status === 'planning' || status === 'scoped_executing'}
+                                            className="px-3 py-2 rounded-xl border border-violet-500/30 bg-violet-500/10 text-violet-200 hover:bg-violet-500/20 text-sm font-medium disabled:opacity-50"
+                                        >
+                                            {planRefreshPending || status === 'planning' ? 'Planning...' : isLegacyScopedReviewMode ? 'Regenerate Legacy Plan' : 'Re-seed Mission'}
+                                        </button>
+                                        <button
+                                            onClick={handleRefreshFocusedVerdicts}
+                                            disabled={!showLegacyRecoveryPanel || verdictRefreshPending || status !== 'scoped_executed'}
+                                            className="px-3 py-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 text-sm font-medium disabled:opacity-50"
+                                        >
+                                            {verdictRefreshPending ? 'Refreshing...' : 'Refresh Verdicts'}
+                                        </button>
+                                    </div>
+                                </div>
+                                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Recommended next step</div>
+                                    <div className="mt-2 text-sm font-medium text-white">{scopedNextAction}</div>
+                                    <div className="mt-2 text-xs leading-6 text-slate-400">
+                                        {isLegacyScopedReviewMode
+                                            ? (scopedPrimaryActionDisabled && status === 'awaiting_review'
+                                                ? 'Approve at least one enabled case to make execution available.'
+                                                : 'Execution remains bounded to the current scoped anchors and approved cases only.')
+                                            : showLegacyRecoveryPanel
+                                                ? 'Recovery actions stay secondary. The normal operator path is still the live bounded mission.'
+                                                : 'The mission stays bounded to the current scoped anchors, route set, and feature description even while it follows live suspicious signals.'}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </motion.section>
+
+                    <section className="grid gap-6 xl:grid-cols-[minmax(0,1.7fr),380px] items-start">
+                        <motion.section
+                            initial={{ opacity: 0, y: 16 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card border-white/10 overflow-hidden"
+                        >
+                            <div className="p-5 border-b border-white/10 bg-white/5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                <div>
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{isLegacyScopedReviewMode ? 'Case Review' : 'Live Casebook'}</div>
+                                    <h2 className="mt-2 text-xl font-semibold text-white">
+                                        {focusedTestObjective?.title || (isLegacyScopedReviewMode ? 'Focused plan ready for operator review' : 'Bounded mission activity and case state')}
+                                    </h2>
+                                    <p className="mt-1 text-sm text-slate-400">
+                                        {isLegacyScopedReviewMode
+                                            ? 'Review each case, confirm what should run, and inspect evidence once execution starts.'
+                                            : 'Inspect live case reasoning, bounded follow-up decisions, and evidence as the mission progresses.'}
+                                    </p>
+                                </div>
+                                <div className="flex flex-wrap gap-2 text-xs text-slate-400">
+                                    {isLegacyScopedReviewMode && (
+                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20">Awaiting review: <span className="text-white">{scopedReviewCounts.pendingReviewCount}</span></span>
+                                    )}
+                                    <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20">{isLegacyScopedReviewMode ? 'Approved' : 'Live threads'}: <span className="text-white">{isLegacyScopedReviewMode ? scopedReviewCounts.approvedCount : (scopedLiveRuntime?.liveFindingCount ?? focusedFindingThreads.length)}</span></span>
+                                    <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20">Enabled: <span className="text-white">{scopedReviewCounts.enabledCount}</span></span>
+                                </div>
+                            </div>
+
+                            <div className="p-5 space-y-4">
+                                {focusedStorySummary && (
+                                    <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-3">
+                                        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                            <div className="min-w-0">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200">Live Scoped Story</div>
+                                                <div className="mt-2 text-sm leading-7 text-amber-50">{focusedStorySummary.headline}</div>
+                                            </div>
+                                            <div className="flex flex-wrap gap-2 text-xs">
+                                                <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-black/20 text-amber-100">
+                                                    Suspicious cases {focusedStorySummary.suspiciousCaseCount}
+                                                </span>
+                                                <span className="px-2.5 py-1 rounded-full border border-red-500/20 bg-black/20 text-red-100">
+                                                    Blocked {focusedStorySummary.blockedCaseCount}
+                                                </span>
+                                                <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-black/20 text-violet-100">
+                                                    Provisional findings {focusedStorySummary.provisionalFindingCount}
+                                                </span>
+                                            </div>
+                                        </div>
+                                        {focusedStorySummary.currentBeliefs.length > 0 && (
+                                            <div className="text-xs leading-6 text-amber-100">
+                                                Current beliefs: {focusedStorySummary.currentBeliefs.slice(0, 3).join(' | ')}
+                                            </div>
+                                        )}
+                                        <div className="grid gap-3 lg:grid-cols-2">
+                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Unresolved Questions</div>
+                                                <div className="mt-2 text-xs leading-6 text-slate-300">
+                                                    {focusedStorySummary.unresolvedQuestions.length > 0
+                                                        ? focusedStorySummary.unresolvedQuestions.slice(0, 3).join(' | ')
+                                                        : 'No material unresolved question has been preserved yet.'}
+                                                </div>
+                                            </div>
+                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Recommended Next Steps</div>
+                                                <div className="mt-2 text-xs leading-6 text-cyan-100">
+                                                    {focusedStorySummary.recommendedNextSteps.length > 0
+                                                        ? focusedStorySummary.recommendedNextSteps.slice(0, 3).join(' | ')
+                                                        : isLegacyScopedReviewMode
+                                                            ? 'Continue with the approved bounded cases or refresh verdicts after execution completes.'
+                                                            : 'Continue following the bounded mission evidence and refresh verdicts after the run completes.'}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                {focusedCaseRows.length === 0 ? (
+                                    <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 p-10 text-center">
+                                        <CheckCircle className="w-10 h-10 mx-auto text-slate-600 mb-3" />
+                                        <h3 className="text-lg font-semibold text-white">{scopedStageLabel}</h3>
+                                        <p className="mt-2 text-sm text-slate-400">
+                                            {status === 'planning' || status === 'scoped_discovering'
+                                                ? 'Focused cases will appear here as soon as discovery and planning finish.'
+                                                : 'No focused cases are available for this scoped run yet.'}
+                                        </p>
+                                    </div>
+                                ) : (
+                                    focusedCaseRows.map((row) => {
+                                        const caseStory = focusedStoryCaseMap.get(row.id) || null;
+                                        const candidateInputs = summarizeFocusedCaseInputs(row);
+                                        const primaryConcern = row.caseIntelligence?.securityConcerns?.[0] || null;
+                                        const followUpPolicy = row.caseIntelligence?.followUpPolicy || null;
+                                        const boundedStopReason = summarizeFocusedCaseStopReason(row);
+                                        const nextStepSummary = summarizeFocusedCaseNextStep(row);
+                                        const actionPending = planActionCaseId === row.id;
+                                        const retryLabel = row.lastRunAt ? 'Retry' : 'Run Case';
+                                        const tracePreview = buildFocusedTracePreview(row.latestExecutionTracePreview, 2);
+                                        const reasoningPreview = buildFocusedReasoningTracePreview(row.latestReasoningTracePreview, 2);
+
+                                        return (
+                                            <article
+                                                key={row.id}
+                                                className={`rounded-2xl border p-5 transition-colors ${getCaseCardClassName(row)}`}
+                                            >
+                                                <div className="flex flex-col gap-4">
+                                                    <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                                        <div className="space-y-3 min-w-0">
+                                                            <div className="flex flex-wrap gap-2">
+                                                                <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${getPriorityBadgeClassName(row.priority)}`}>
+                                                                    {formatFocusedPriority(row.priority)}
+                                                                </span>
+                                                                <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${getReviewBadgeClassName(row)}`}>
+                                                                    {formatFocusedReviewState(row.reviewState)}
+                                                                </span>
+                                                                <span className={`px-2.5 py-1 rounded-full border text-xs ${getExecutionBadgeClassName(row.executionPresentationState)}`}>
+                                                                    {formatFocusedExecutionPresentationState(row.executionPresentationState)}
+                                                                </span>
+                                                                {row.executionRailSummary && (
+                                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs">
+                                                                        {formatFocusedExecutionRail(row.executionRailSummary.rail)}
+                                                                    </span>
+                                                                )}
+                                                                {row.latestVerdict && (
+                                                                    <span className={`px-2.5 py-1 rounded-full border text-xs ${getVerdictBadgeClassName(row.latestVerdict.verdictState)}`}>
+                                                                        {formatFocusedVerdictState(row.latestVerdict.verdictState)}
+                                                                    </span>
+                                                                )}
+                                                                {row.historicalCompare && (
+                                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs">
+                                                                        {formatFocusedHistoricalOutcome(row.historicalCompare.historicalOutcome)}
+                                                                    </span>
+                                                                )}
+                                                                {row.status === 'disabled' && (
+                                                                    <span className="px-2.5 py-1 rounded-full border border-slate-600 bg-slate-900/80 text-slate-300 text-xs">
+                                                                        Disabled
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            <div>
+                                                                <h3 className="text-lg font-semibold text-white">{row.title}</h3>
+                                                                <p className="mt-1 text-sm text-cyan-100 break-all">{row.targetLabel}</p>
+                                                                {row.primaryFinding && (
+                                                                    <div className="mt-3 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-3 space-y-2">
+                                                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                                                            <div className="min-w-0">
+                                                                                <div className="text-sm font-semibold text-white truncate">{row.primaryFinding.title}</div>
+                                                                                <div className="text-[10px] text-slate-400">
+                                                                                    {formatFocusedFindingFamily(row.primaryFinding.family)} · {formatFocusedFindingConfidenceBand(row.primaryFinding.confidenceBand)}
+                                                                                </div>
+                                                                            </div>
+                                                                            <div className="flex flex-wrap gap-2">
+                                                                                <span className={`px-2 py-0.5 rounded-full border text-[10px] font-semibold uppercase ${
+                                                                                    row.primaryFinding.status === 'confirmed'
+                                                                                        ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                                        : row.primaryFinding.status === 'likely'
+                                                                                            ? 'border-orange-500/30 bg-orange-500/10 text-orange-300'
+                                                                                            : row.primaryFinding.status === 'suspicious'
+                                                                                                ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                                                                : row.primaryFinding.status === 'inconclusive'
+                                                                                                    ? 'border-slate-500/30 bg-slate-500/10 text-slate-300'
+                                                                                                    : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                                                                }`}>
+                                                                                    {formatFocusedFindingStatus(row.primaryFinding.status)}
+                                                                                </span>
+                                                                                {row.secondaryFindingsCount > 0 && (
+                                                                                    <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-[10px] text-slate-300">
+                                                                                        +{row.secondaryFindingsCount} secondary finding{row.secondaryFindingsCount === 1 ? '' : 's'}
+                                                                                    </span>
+                                                                                )}
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="grid gap-2 sm:grid-cols-2 text-[10px] text-slate-300">
+                                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
+                                                                                Suspicion {row.primaryFinding.suspicionScore}%
+                                                                            </div>
+                                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
+                                                                                Confirmation {row.primaryFinding.confirmationProgress}%
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="text-[11px] text-slate-200 leading-relaxed">
+                                                                            Strongest signal: {row.primaryFinding.strongestSupportSummary}
+                                                                        </div>
+                                                                        {row.primaryFinding.blockingConstraintSummary && (
+                                                                            <div className="text-[10px] text-red-200 leading-relaxed">
+                                                                                Blocker: {row.primaryFinding.blockingConstraintSummary}
+                                                                            </div>
+                                                                        )}
+                                                                        {row.primaryFinding.nextStepSummary && (
+                                                                            <div className="text-[10px] text-cyan-100 leading-relaxed">
+                                                                                Next step: {row.primaryFinding.nextStepSummary}
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                        <div className="text-xs text-slate-500 lg:text-right shrink-0">
+                                                            {row.lastRunAt
+                                                                ? `Last run ${new Date(row.lastRunAt).toLocaleString()}`
+                                                                : 'Not executed yet'}
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="grid gap-3 md:grid-cols-2">
+                                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Hypothesis</div>
+                                                            <p className="mt-2 text-sm leading-7 text-slate-200">{row.hypothesis}</p>
+                                                            {row.hypothesisVisibility && (
+                                                                <div className="mt-3 space-y-2">
+                                                                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                                        <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
+                                                                            {formatFocusedHypothesisStatus(row.hypothesisVisibility.currentStatus)}
+                                                                        </span>
+                                                                        <span className="text-slate-500">
+                                                                            {row.hypothesisVisibility.caseFamily.replace(/_/g, ' ')}
+                                                                        </span>
+                                                                    </div>
+                                                                    {row.hypothesisVisibility.latestConfidenceSummary && (
+                                                                        <div className="text-xs leading-6 text-cyan-100">
+                                                                            {row.hypothesisVisibility.latestConfidenceSummary}
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Planner rationale</div>
+                                                            <p className="mt-2 text-sm leading-7 text-slate-300">{row.rationale}</p>
+                                                            {row.suspicionExplanation && (
+                                                                <div className="mt-3 space-y-2">
+                                                                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                                        <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
+                                                                            {formatFocusedSuspicionProofStatus(row.suspicionExplanation.proofStatus)}
+                                                                        </span>
+                                                                        <span className="text-slate-500">
+                                                                            Suspiciousness {row.suspicionExplanation.suspiciousness}
+                                                                        </span>
+                                                                    </div>
+                                                                    <div className="text-xs leading-6 text-violet-100">
+                                                                        {row.suspicionExplanation.whySuspicious}
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                    {(row.caseIntelligence || caseStory) && (
+                                                        <div className="grid gap-3 xl:grid-cols-3">
+                                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Why This Case Exists</div>
+                                                                <div className="mt-2 text-sm leading-7 text-slate-200">
+                                                                    {row.caseIntelligence?.selectionSummary || caseStory?.currentBelief || row.rationale}
+                                                                </div>
+                                                                {row.caseIntelligence?.anchorSummary && (
+                                                                    <div className="mt-3 text-xs leading-6 text-slate-400">
+                                                                        Anchor: {row.caseIntelligence.anchorSummary}
+                                                                    </div>
+                                                                )}
+                                                                {caseStory?.whatWasObserved && (
+                                                                    <div className="mt-3 text-xs leading-6 text-violet-100">
+                                                                        Observed: {caseStory.whatWasObserved}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Targeted Inputs</div>
+                                                                {candidateInputs.length > 0 ? (
+                                                                    <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                                                        {candidateInputs.map((inputLabel) => (
+                                                                            <span key={`${row.id}-${inputLabel}`} className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
+                                                                                {inputLabel}
+                                                                            </span>
+                                                                        ))}
+                                                                    </div>
+                                                                ) : (
+                                                                    <div className="mt-2 text-xs leading-6 text-slate-500">No concrete observed input has been preserved yet.</div>
+                                                                )}
+                                                                <div className="mt-3 text-xs leading-6 text-slate-300">
+                                                                    {primaryConcern?.whyRelevant || caseStory?.whyItMatters || 'The runtime kept this case because it remained plausible inside the persisted anchors.'}
+                                                                </div>
+                                                                {caseStory?.whatWasTested && (
+                                                                    <div className="mt-3 text-xs leading-6 text-cyan-100">
+                                                                        Tested: {caseStory.whatWasTested}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Bounded Follow-Up</div>
+                                                                {nextStepSummary ? (
+                                                                    <div className="mt-2 text-xs leading-6 text-cyan-100">Next step: {nextStepSummary}</div>
+                                                                ) : (
+                                                                    <div className="mt-2 text-xs leading-6 text-slate-500">No additional same-scope step is currently queued.</div>
+                                                                )}
+                                                                {boundedStopReason && (
+                                                                    <div className="mt-3 text-xs leading-6 text-red-200">Bounded stop: {boundedStopReason}</div>
+                                                                )}
+                                                                {(row.latestVerdict?.interpretationSummary?.uncertaintyReasons?.length || 0) > 0 && (
+                                                                    <div className="mt-3 text-xs leading-6 text-amber-200">
+                                                                        Uncertainty: {row.latestVerdict?.interpretationSummary?.uncertaintyReasons?.slice(0, 2).join(' | ')}
+                                                                    </div>
+                                                                )}
+                                                                {followUpPolicy && (
+                                                                    <div className="mt-3 text-[10px] leading-6 text-slate-400">
+                                                                        Follow-up budget {followUpPolicy.maxAdaptiveFollowUps} | queue threshold {followUpPolicy.queueThresholdScore}
+                                                                        {followUpPolicy.allowedConfirmationKinds.length > 0
+                                                                            ? ` | allowed: ${followUpPolicy.allowedConfirmationKinds.slice(0, 3).map((kind) => formatFocusedConfirmationKind(kind)).join(', ')}`
+                                                                            : ''}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    )}
+
+                                                    <div className="flex flex-wrap gap-2 text-xs">
+                                                        {row.primaryFinding && (
+                                                            <>
+                                                                <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-200">
+                                                                    Suspicion {row.primaryFinding.suspicionScore}%
+                                                                </span>
+                                                                <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
+                                                                    Confirmation {row.primaryFinding.confirmationProgress}%
+                                                                </span>
+                                                            </>
+                                                        )}
+                                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
+                                                            {formatFocusedEvidenceCount(row.evidenceCount, row.scopeViolationCount)}
+                                                        </span>
+                                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
+                                                            {formatFocusedBrowserEvidenceCount(row.browserEvidenceCount, row.browserActionsUsed)}
+                                                        </span>
+                                                        {row.investigationSummary && (
+                                                            <span className={`px-2.5 py-1 rounded-full border text-xs ${
+                                                                row.investigationSummary.blockingCount > 0
+                                                                    ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                                                                    : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                                                            }`}>
+                                                                {row.investigationSummary.unresolvedCount > 0
+                                                                    ? `${row.investigationSummary.unresolvedCount} investigation issue${row.investigationSummary.unresolvedCount === 1 ? '' : 's'}`
+                                                                    : 'No open investigation issues'}
+                                                            </span>
+                                                        )}
+                                                        {row.latestVerdict && (
+                                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
+                                                                {formatFocusedEvidenceSufficiencyState(row.latestVerdict.evidenceSufficiency.state)}
+                                                            </span>
+                                                        )}
+                                                        {row.executionRailSummary && (
+                                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
+                                                                {formatFocusedExecutionRail(row.executionRailSummary.rail)}
+                                                            </span>
+                                                        )}
+                                                    </div>
+
+                                                    {(row.latestVerdict || row.executionNotesSummary || row.executionError || row.historicalCompare || row.investigationSummary?.latestIssueTitle) && (
+                                                        <div className="space-y-2">
+                                                            {row.latestVerdict && (
+                                                                <div className="text-sm text-slate-200 leading-7">{row.latestVerdict.verdictReason}</div>
+                                                            )}
+                                                            {row.historicalCompare && (
+                                                                <div className="text-xs text-cyan-100 leading-6">
+                                                                    {row.historicalCompare.compareNarrative
+                                                                        || formatFocusedBlockerRecurrence(row.historicalCompare)
+                                                                        || formatFocusedVerdictTransition(row.historicalCompare.verdictTransition)}
+                                                                </div>
+                                                            )}
+                                                            {(row.executionError || row.executionNotesSummary) && (
+                                                                <div className={`text-xs leading-6 ${row.executionError ? 'text-red-200' : 'text-slate-400'}`}>
+                                                                    {row.executionError || row.executionNotesSummary}
+                                                                </div>
+                                                            )}
+                                                            {row.executionRailSummary && (
+                                                                <div className="text-xs text-slate-500 leading-6">
+                                                                    {formatFocusedRailSummary(row.executionRailSummary)}
+                                                                </div>
+                                                            )}
+                                                            {tracePreview.length > 0 && (
+                                                                <div className="text-xs text-cyan-100 leading-6">
+                                                                    {tracePreview.map((entry) => `${formatFocusedExecutionTraceActionType(entry.actionType)}: ${entry.actionSummary}`).join(' | ')}
+                                                                </div>
+                                                            )}
+                                                            {reasoningPreview.length > 0 && (
+                                                                <div className="text-xs text-violet-100 leading-6">
+                                                                    {reasoningPreview.map((entry) => `${formatFocusedReasoningStage(entry.stage)} ${formatFocusedReasoningEntryType(entry.entryType)}: ${entry.summary}`).join(' | ')}
+                                                                </div>
+                                                            )}
+                                                            {row.investigationSummary?.latestIssueTitle && row.investigationSummary.unresolvedCount > 0 && (
+                                                                <div className={`text-xs leading-6 ${
+                                                                    row.investigationSummary.blockingCount > 0 ? 'text-red-200' : 'text-amber-200'
+                                                                }`}>
+                                                                    {row.investigationSummary.latestIssueTitle}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
+
+                                                    <div className="border-t border-white/10 pt-4 flex flex-wrap gap-2">
+                                                        {isLegacyScopedReviewMode && (
+                                                            <button
+                                                                onClick={() => handleFocusedCaseUpdate(row.id, {
+                                                                    reviewState: row.reviewState === 'approved' ? 'pending_review' : 'approved',
+                                                                })}
+                                                                disabled={actionPending}
+                                                                className="px-3 py-2 rounded-xl bg-emerald-500 text-black text-sm font-semibold hover:bg-emerald-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                            >
+                                                                {actionPending
+                                                                    ? 'Saving...'
+                                                                    : row.reviewState === 'approved'
+                                                                        ? 'Re-open'
+                                                                        : 'Approve'}
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            onClick={() => handleFocusedCaseUpdate(row.id, {
+                                                                status: row.status === 'disabled' ? 'planned' : 'disabled',
+                                                            })}
+                                                            disabled={actionPending}
+                                                            className="px-3 py-2 rounded-xl border border-slate-600 bg-slate-900/70 text-slate-100 text-sm font-medium hover:bg-slate-800 transition-colors disabled:opacity-50"
+                                                        >
+                                                            {row.status === 'disabled' ? 'Enable' : 'Disable'}
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleInspectEvidence(row.id)}
+                                                            disabled={evidenceLoadingCaseId === row.id}
+                                                            className="px-3 py-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 text-cyan-100 text-sm font-medium hover:bg-cyan-500/20 transition-colors disabled:opacity-50"
+                                                        >
+                                                            {evidenceLoadingCaseId === row.id ? 'Loading...' : 'Inspect Evidence'}
+                                                        </button>
+                                                        <div className="flex-1" />
+                                                        <select
+                                                            value={row.priority}
+                                                            onChange={(event) => handleFocusedCaseUpdate(row.id, {
+                                                                priority: event.target.value as FocusedTestCase['priority'],
+                                                            })}
+                                                            disabled={actionPending}
+                                                            className="min-w-[150px] px-3 py-2 rounded-xl border border-violet-500/20 bg-slate-950 text-sm text-slate-200 disabled:opacity-50"
+                                                        >
+                                                            <option value="high">High priority</option>
+                                                            <option value="medium">Medium priority</option>
+                                                            <option value="low">Low priority</option>
+                                                        </select>
+                                                        <button
+                                                            onClick={() => handleRunFocusedExecution([row.id])}
+                                                            disabled={executePending || row.status === 'disabled' || (isLegacyScopedReviewMode && row.reviewState !== 'approved') || status === 'scoped_executing'}
+                                                            className="px-3 py-2 rounded-xl border border-violet-500/30 bg-violet-500/10 text-violet-100 text-sm font-medium hover:bg-violet-500/20 transition-colors disabled:opacity-50"
+                                                        >
+                                                            {retryLabel}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </article>
+                                        );
+                                    })
+                                )}
+                            </div>
+                        </motion.section>
+
+                        <motion.aside
+                            initial={{ opacity: 0, y: 16 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card border-white/10 overflow-hidden xl:sticky xl:top-24"
+                        >
+                            <div className="p-5 border-b border-white/10 bg-white/5 flex items-start justify-between gap-3">
+                                <div>
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Supporting Detail</div>
+                                    <h2 className="mt-2 text-lg font-semibold text-white">
+                                        {selectedEvidenceCase ? 'Case evidence and outcomes' : 'Evidence, verdicts, and follow-up'}
+                                    </h2>
+                                    <p className="mt-1 text-sm text-slate-400">
+                                        {selectedEvidenceCase
+                                            ? 'Details for the selected focused case.'
+                                            : 'Select a case to inspect evidence, verdict history, and troubleshooting detail.'}
+                                    </p>
+                                </div>
+                                {selectedEvidenceCase && (
+                                    <button
+                                        onClick={() => {
+                                            setSelectedEvidenceCaseId(null);
+                                            setSelectedExecution(null);
+                                            setSelectedCaseVerdict(null);
+                                            setSelectedPrimaryFinding(null);
+                                            setSelectedPrimaryFindingThread(null);
+                                            setSelectedCaseFindings([]);
+                                            setSelectedCaseFindingThreads([]);
+                                            setSelectedCaseHistoricalCompare(null);
+                                            setSelectedHypothesisVisibility(null);
+                                            setSelectedSuspicionExplanation(null);
+                                            setSelectedContextInfluenceSummary(null);
+                                            setSelectedEvidenceReasoningLinks([]);
+                                            setSelectedReasoningTrace([]);
+                                            setSelectedEvidenceBundles([]);
+                                            setSelectedExecutionTrace([]);
+                                            setSelectedRailSummary(null);
+                                            setSelectedInvestigationIssues([]);
+                                        }}
+                                        className="text-xs text-slate-400 hover:text-white"
+                                    >
+                                        Close
+                                    </button>
+                                )}
+                            </div>
+
+                            <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700">
+                                {selectedEvidenceCase ? (
+                                    <>
+                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
+                                            <div>
+                                                <h3 className="text-base font-semibold text-white">{selectedEvidenceCase.title}</h3>
+                                                <p className="mt-1 text-sm text-cyan-100 break-all">{selectedEvidenceRow?.targetLabel || selectedEvidenceCase.title}</p>
+                                            </div>
+                                            <div className="flex flex-wrap gap-2 text-xs">
+                                                {selectedEvidenceRow && (
+                                                    <>
+                                                        <span className={`px-2.5 py-1 rounded-full border ${getReviewBadgeClassName(selectedEvidenceRow)}`}>
+                                                            {formatFocusedReviewState(selectedEvidenceRow.reviewState)}
+                                                        </span>
+                                                        <span className={`px-2.5 py-1 rounded-full border ${getExecutionBadgeClassName(selectedEvidenceRow.executionPresentationState)}`}>
+                                                            {formatFocusedExecutionPresentationState(selectedEvidenceRow.executionPresentationState)}
+                                                        </span>
+                                                    </>
+                                                )}
+                                                {effectiveSelectedCaseVerdict && (
+                                                    <span className={`px-2.5 py-1 rounded-full border ${getVerdictBadgeClassName(effectiveSelectedCaseVerdict.verdictState)}`}>
+                                                        {formatFocusedVerdictState(effectiveSelectedCaseVerdict.verdictState)}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {selectedExecution?.notesSummary ? (
+                                                <div className="text-sm leading-7 text-slate-300">{selectedExecution.notesSummary}</div>
+                                            ) : (
+                                                <div className="text-sm leading-7 text-slate-400">
+                                                    Review the evidence captured for this case and decide whether follow-up work is needed.
+                                                </div>
+                                            )}
+                                            {selectedExecution && (
+                                                <div className="text-xs text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
+                                                    <span>Request actions: {selectedExecution.requestActionsUsed}</span>
+                                                    <span>Browser actions: {selectedExecution.browserActionsUsed}</span>
+                                                    {selectedExecution.browserSessionId && (
+                                                        <span>Browser session: {selectedExecution.browserSessionId}</span>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {effectiveSelectedCaseFindings.length > 0 && (
+                                            <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-3">
+                                                <div className="flex items-start justify-between gap-3">
+                                                    <div>
+                                                        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200">Findings</div>
+                                                        <div className="mt-1 text-sm leading-7 text-slate-300">
+                                                            What this case currently suggests, including support, blockers, and the next bounded confirmation step.
+                                                        </div>
+                                                    </div>
+                                                    {effectiveSelectedPrimaryFinding && (
+                                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-xs text-slate-300">
+                                                            Primary + {Math.max(effectiveSelectedCaseFindings.length - 1, 0)} secondary
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                {effectiveSelectedFindingThread && (
+                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2 text-xs text-slate-300">
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {effectiveSelectedFindingThread.status !== 'published' && (
+                                                                <span className="px-2 py-0.5 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-200">
+                                                                    Provisional
+                                                                </span>
+                                                            )}
+                                                            <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-slate-300">
+                                                                {formatFocusedFindingThreadStatus(effectiveSelectedFindingThread.status)}
+                                                            </span>
+                                                            <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-slate-300">
+                                                                Suspicion {effectiveSelectedFindingThread.suspicionScore}%
+                                                            </span>
+                                                            <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-slate-300">
+                                                                Confirmation {effectiveSelectedFindingThread.confirmationProgress}%
+                                                            </span>
+                                                            {effectiveSelectedFindingThread.supportProvenance && (
+                                                                <span className={`px-2 py-0.5 rounded-full border ${getSupportProvenanceBadgeClassName(effectiveSelectedFindingThread.supportProvenance.rail)}`}>
+                                                                    {formatFocusedSupportProvenanceRail(effectiveSelectedFindingThread.supportProvenance.rail)}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <div className="text-[11px] text-slate-200 leading-relaxed">
+                                                            Strongest signal: {effectiveSelectedFindingThread.strongestSuspiciousSignal || effectiveSelectedFindingThread.strongestSupportSummary || 'Signal still forming.'}
+                                                        </div>
+                                                        {effectiveSelectedFindingThread.supportProvenance && (
+                                                            <div className="text-[11px] text-slate-400 leading-relaxed">
+                                                                {formatFocusedSupportProvenanceSummary(effectiveSelectedFindingThread.supportProvenance)}
+                                                            </div>
+                                                        )}
+                                                        {effectiveSelectedFindingThread.strongestBlockerSummary && (
+                                                            <div className="text-[11px] text-red-200 leading-relaxed">
+                                                                Strongest blocker: {effectiveSelectedFindingThread.strongestBlockerSummary}
+                                                            </div>
+                                                        )}
+                                                        {effectiveSelectedFindingThread.confirmationState.nextKind && (
+                                                            <div className="text-[11px] text-cyan-100 leading-relaxed">
+                                                                Next bounded confirmation: {formatFocusedConfirmationKind(effectiveSelectedFindingThread.confirmationState.nextKind)}
+                                                            </div>
+                                                        )}
+                                                        {(effectiveSelectedFindingThread.nextStepSummary || effectiveSelectedFindingThread.confirmationState.stopReason) && (
+                                                            <div className="text-[11px] text-slate-400 leading-relaxed">
+                                                                {effectiveSelectedFindingThread.confirmationState.stopReason
+                                                                    ? `Stopped because ${effectiveSelectedFindingThread.confirmationState.stopReason}`
+                                                                    : `Next step: ${effectiveSelectedFindingThread.nextStepSummary}`}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedCaseFindings.map((finding) => (
+                                                    <div
+                                                        key={finding.id}
+                                                        className={`rounded-2xl border p-3 space-y-2 ${
+                                                            finding.isPrimary
+                                                                ? 'border-amber-500/20 bg-black/20'
+                                                                : 'border-white/10 bg-black/10'
+                                                        }`}
+                                                    >
+                                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                                            <div className="min-w-0">
+                                                                <div className="text-sm font-semibold text-white">{finding.title}</div>
+                                                                <div className="text-[10px] text-slate-400">
+                                                                    {formatFocusedFindingFamily(finding.family)} · {formatFocusedFindingConfidenceBand(finding.confidenceBand)}
+                                                                </div>
+                                                            </div>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {finding.isPrimary && (
+                                                                    <span className="px-2 py-0.5 rounded-full border border-amber-500/20 bg-amber-500/10 text-[10px] text-amber-200">
+                                                                        Primary
+                                                                    </span>
+                                                                )}
+                                                                <span className={`px-2 py-0.5 rounded-full border text-[10px] font-semibold uppercase ${
+                                                                    finding.status === 'confirmed'
+                                                                        ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                        : finding.status === 'likely'
+                                                                            ? 'border-orange-500/30 bg-orange-500/10 text-orange-300'
+                                                                            : finding.status === 'suspicious'
+                                                                                ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                                                : finding.status === 'inconclusive'
+                                                                                    ? 'border-slate-500/30 bg-slate-500/10 text-slate-300'
+                                                                                    : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                                                }`}>
+                                                                    {formatFocusedFindingStatus(finding.status)}
+                                                                </span>
+                                                                {finding.supportProvenance && (
+                                                                    <span className={`px-2 py-0.5 rounded-full border text-[10px] ${getSupportProvenanceBadgeClassName(finding.supportProvenance.rail)}`}>
+                                                                        {formatFocusedSupportProvenanceRail(finding.supportProvenance.rail)}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                        <div className="grid gap-2 sm:grid-cols-2 text-xs text-slate-300">
+                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
+                                                                Suspicion {finding.suspicionScore}%
+                                                            </div>
+                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
+                                                                Confirmation {finding.confirmationProgress}%
+                                                            </div>
+                                                        </div>
+                                                        <div className="text-sm leading-7 text-slate-200">
+                                                            Strongest signal: {finding.strongestSupportSummary}
+                                                        </div>
+                                                        {finding.supportProvenance && (
+                                                            <div className="text-xs leading-6 text-slate-400">
+                                                                {formatFocusedSupportProvenanceSummary(finding.supportProvenance)}
+                                                            </div>
+                                                        )}
+                                                        {finding.blockingConstraintSummary && (
+                                                            <div className="text-xs leading-6 text-red-200">
+                                                                Blocker: {finding.blockingConstraintSummary}
+                                                            </div>
+                                                        )}
+                                                        {finding.nextStepSummary && (
+                                                            <div className="text-xs leading-6 text-cyan-100">
+                                                                Next step: {finding.nextStepSummary}
+                                                            </div>
+                                                        )}
+                                                        <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                            Evidence refs: {finding.supportingEvidenceRefs.length} · Verdict refs: {finding.linkedVerdictIds.length} · Investigation refs: {finding.linkedInvestigationIds.length}
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {effectiveSelectedHypothesisVisibility && (
+                                            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200">Hypothesis</div>
+                                                <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
+                                                        {formatFocusedHypothesisStatus(effectiveSelectedHypothesisVisibility.currentStatus)}
+                                                    </span>
+                                                    <span className="text-slate-400">
+                                                        {effectiveSelectedHypothesisVisibility.caseFamily.replace(/_/g, ' ')}
+                                                    </span>
+                                                </div>
+                                                {effectiveSelectedHypothesisVisibility.initialSupport.length > 0 && (
+                                                    <div className="text-xs leading-6 text-slate-300">
+                                                        Initial support: {effectiveSelectedHypothesisVisibility.initialSupport.slice(0, 2).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedHypothesisVisibility.strengtheningSignals.length > 0 && (
+                                                    <div className="text-xs leading-6 text-emerald-200">
+                                                        Strengthened by: {effectiveSelectedHypothesisVisibility.strengtheningSignals.slice(0, 2).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedHypothesisVisibility.weakeningSignals.length > 0 && (
+                                                    <div className="text-xs leading-6 text-amber-200">
+                                                        Weakened by: {effectiveSelectedHypothesisVisibility.weakeningSignals.slice(0, 2).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedHypothesisVisibility.blockingConstraints.length > 0 && (
+                                                    <div className="text-xs leading-6 text-red-200">
+                                                        Bounded by: {effectiveSelectedHypothesisVisibility.blockingConstraints.slice(0, 2).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedHypothesisVisibility.latestConfidenceSummary && (
+                                                    <div className="text-xs leading-6 text-cyan-100">
+                                                        {effectiveSelectedHypothesisVisibility.latestConfidenceSummary}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {effectiveSelectedSuspicionExplanation && (
+                                            <div className="rounded-2xl border border-violet-500/20 bg-violet-950/10 p-4 space-y-3">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-violet-200">Why Suspicious?</div>
+                                                <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                    <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
+                                                        {formatFocusedSuspicionProofStatus(effectiveSelectedSuspicionExplanation.proofStatus)}
+                                                    </span>
+                                                    <span className="text-slate-400">
+                                                        Suspiciousness {effectiveSelectedSuspicionExplanation.suspiciousness}
+                                                    </span>
+                                                </div>
+                                                <div className="text-sm leading-7 text-slate-200">
+                                                    {effectiveSelectedSuspicionExplanation.whySuspicious}
+                                                </div>
+                                                {effectiveSelectedSuspicionExplanation.supportingSignals.length > 0 && (
+                                                    <div className="text-xs leading-6 text-violet-100">
+                                                        Supporting signals: {effectiveSelectedSuspicionExplanation.supportingSignals.slice(0, 3).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedSuspicionExplanation.weakeningSignals.length > 0 && (
+                                                    <div className="text-xs leading-6 text-amber-200">
+                                                        Weakening signals: {effectiveSelectedSuspicionExplanation.weakeningSignals.slice(0, 2).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedSuspicionExplanation.contradictorySignals.length > 0 && (
+                                                    <div className="text-xs leading-6 text-red-200">
+                                                        Contradictory signals: {effectiveSelectedSuspicionExplanation.contradictorySignals.slice(0, 2).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedSuspicionExplanation.boundedStopReason && (
+                                                    <div className="text-xs leading-6 text-red-100">
+                                                        Bounded stop: {effectiveSelectedSuspicionExplanation.boundedStopReason}
+                                                    </div>
+                                                )}
+                                                {(effectiveSelectedSuspicionExplanation.missingEvidence?.length || 0) > 0 && (
+                                                    <div className="text-xs leading-6 text-slate-400">
+                                                        Missing evidence: {effectiveSelectedSuspicionExplanation.missingEvidence?.slice(0, 3).join(', ')}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {effectiveSelectedContextInfluenceSummary && (
+                                            <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-3">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200">Request Context Used</div>
+                                                <div className="text-sm leading-7 text-slate-300">
+                                                    {effectiveSelectedContextInfluenceSummary.summary}
+                                                </div>
+                                                {effectiveSelectedContextInfluenceSummary.usedFields.length > 0 && (
+                                                    <div className="text-xs leading-6 text-amber-100">
+                                                        Used: {effectiveSelectedContextInfluenceSummary.usedFields.slice(0, 3).map((entry) => `${formatFocusedRequestContextField(entry.field)} - ${entry.summary}`).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedContextInfluenceSummary.insufficientFields.length > 0 && (
+                                                    <div className="text-xs leading-6 text-red-100">
+                                                        Insufficient: {effectiveSelectedContextInfluenceSummary.insufficientFields.slice(0, 2).map((entry) => `${formatFocusedRequestContextField(entry.field)} - ${entry.summary}`).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedContextInfluenceSummary.ignoredFields.length > 0 && (
+                                                    <div className="text-xs leading-6 text-slate-400">
+                                                        Not used: {effectiveSelectedContextInfluenceSummary.ignoredFields.slice(0, 3).map((entry) => formatFocusedRequestContextField(entry.field)).join(', ')}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {effectiveSelectedCaseVerdict && (
+                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${getVerdictBadgeClassName(effectiveSelectedCaseVerdict.verdictState)}`}>
+                                                        {formatFocusedVerdictState(effectiveSelectedCaseVerdict.verdictState)}
+                                                    </span>
+                                                    <span className="text-xs text-slate-400">
+                                                        {formatFocusedEvidenceSufficiencyState(effectiveSelectedCaseVerdict.evidenceSufficiency.state)}
+                                                    </span>
+                                                    {effectiveSelectedCaseVerdict.supportProvenance && (
+                                                        <span className={`px-2.5 py-1 rounded-full border text-xs ${getSupportProvenanceBadgeClassName(effectiveSelectedCaseVerdict.supportProvenance.rail)}`}>
+                                                            {formatFocusedSupportProvenanceRail(effectiveSelectedCaseVerdict.supportProvenance.rail)}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <div className="text-sm leading-7 text-slate-200">{effectiveSelectedCaseVerdict.verdictReason}</div>
+                                                <div className="text-xs leading-6 text-slate-400">
+                                                    {effectiveSelectedCaseVerdict.evidenceSufficiency.summary}
+                                                </div>
+                                                {effectiveSelectedCaseVerdict.supportProvenance && (
+                                                    <div className="text-xs leading-6 text-cyan-100">
+                                                        {formatFocusedSupportProvenanceSummary(effectiveSelectedCaseVerdict.supportProvenance)}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedCaseVerdict.scopeViolationImpact.reasons.length > 0 && (
+                                                    <div className="text-xs leading-6 text-red-200">
+                                                        {effectiveSelectedCaseVerdict.scopeViolationImpact.reasons[0]}
+                                                    </div>
+                                                )}
+                                                {effectiveSelectedCaseVerdict.assistanceNarrative && (
+                                                    <div className="text-xs leading-6 text-cyan-100">
+                                                        {effectiveSelectedCaseVerdict.assistanceNarrative}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {effectiveSelectedCaseHistoricalCompare && (
+                                            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs font-semibold">
+                                                        {formatFocusedHistoricalOutcome(effectiveSelectedCaseHistoricalCompare.historicalOutcome)}
+                                                    </span>
+                                                    <span className="text-xs text-slate-400">
+                                                        {formatFocusedHistoricalCompareStatus(focusedHistoricalCompareState?.comparisonStatus)}
+                                                    </span>
+                                                    {effectiveSelectedCaseHistoricalCompare.verdictTransition && (
+                                                        <span className="text-xs text-slate-300">
+                                                            {formatFocusedVerdictTransition(effectiveSelectedCaseHistoricalCompare.verdictTransition)}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <div className="text-xs leading-6 text-slate-300">
+                                                    {effectiveSelectedCaseHistoricalCompare.compareNarrative
+                                                        || (effectiveSelectedCaseHistoricalCompare.compareStatus === 'baseline_only'
+                                                            ? 'This is the first observed case for this scoped lineage.'
+                                                            : 'Historical comparison is available for this case.')}
+                                                </div>
+                                                {effectiveSelectedCaseHistoricalCompare.evidenceDriftClassification && (
+                                                    <div className="text-xs leading-6 text-slate-400">
+                                                        Evidence drift: {formatFocusedEvidenceDriftClassification(effectiveSelectedCaseHistoricalCompare.evidenceDriftClassification)}
+                                                    </div>
+                                                )}
+                                                {formatFocusedBlockerRecurrence(effectiveSelectedCaseHistoricalCompare) && (
+                                                    <div className="text-xs leading-6 text-amber-200">
+                                                        {formatFocusedBlockerRecurrence(effectiveSelectedCaseHistoricalCompare)}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {selectedInvestigationIssues.length > 0 && (
+                                            <div className="rounded-2xl border border-red-500/20 bg-red-950/10 p-4 space-y-3">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-red-200">Investigation</div>
+                                                {selectedInvestigationIssues.map((issue) => (
+                                                    <div key={issue.id} className="rounded-2xl border border-white/10 bg-black/20 p-3 space-y-2">
+                                                        <div className="flex flex-wrap items-center gap-2">
+                                                            <span className={`px-2.5 py-1 rounded-full border text-xs ${
+                                                                issue.impact === 'blocking'
+                                                                    ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                                                                    : issue.impact === 'degrading'
+                                                                        ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                                                                        : 'border-slate-600 bg-slate-800/60 text-slate-300'
+                                                            }`}>
+                                                                {formatFocusedInvestigationImpact(issue.impact)}
+                                                            </span>
+                                                            <span className="text-xs text-slate-400">
+                                                                {formatFocusedInvestigationStatus(issue.issueStatus)} | {formatFocusedInvestigationType(issue.issueType)}
+                                                            </span>
+                                                        </div>
+                                                        <div className="text-sm text-white leading-7">{issue.issueTitle}</div>
+                                                        {issue.issueDetails && (
+                                                            <div className="text-xs leading-6 text-slate-300">{issue.issueDetails}</div>
+                                                        )}
+                                                        {issue.expertFollowupHint && (
+                                                            <div className="text-xs leading-6 text-cyan-100">
+                                                                Expert follow-up: {issue.expertFollowupHint}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {effectiveSelectedRequestEvidenceStory && (
+                                            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200">Request Evidence Story</div>
+                                                    {effectiveSelectedSupportProvenance && (
+                                                        <span className={`px-2.5 py-1 rounded-full border text-xs ${getSupportProvenanceBadgeClassName(effectiveSelectedSupportProvenance.rail)}`}>
+                                                            {formatFocusedSupportProvenanceRail(effectiveSelectedSupportProvenance.rail)}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <div className="text-sm leading-7 text-slate-200">
+                                                    {effectiveSelectedRequestEvidenceStory.summary}
+                                                </div>
+                                                {effectiveSelectedRequestEvidenceStory.lowConfidenceReason && (
+                                                    <div className="text-xs leading-6 text-amber-200">
+                                                        {effectiveSelectedRequestEvidenceStory.lowConfidenceReason}
+                                                    </div>
+                                                )}
+                                                <div className="grid gap-3 md:grid-cols-2">
+                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-1">
+                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Baseline</div>
+                                                        <div className="text-xs text-slate-200 leading-6">
+                                                            {formatFocusedRequestEvidenceRef(effectiveSelectedRequestEvidenceStory.baselineRequestRef)}
+                                                        </div>
+                                                    </div>
+                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-1">
+                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Strongest Suspicious</div>
+                                                        <div className="text-xs text-slate-200 leading-6">
+                                                            {formatFocusedRequestEvidenceRef(effectiveSelectedRequestEvidenceStory.strongestSuspiciousRequestRef)}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                <div className="grid gap-3 md:grid-cols-3">
+                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2">
+                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-emerald-300">Supporting Requests</div>
+                                                        {effectiveSelectedRequestEvidenceStory.supportingRequestRefs.length === 0 ? (
+                                                            <div className="text-xs text-slate-500 leading-6">No request replay currently strengthens the hypothesis.</div>
+                                                        ) : (
+                                                            effectiveSelectedRequestEvidenceStory.supportingRequestRefs.map((ref) => (
+                                                                <div key={`support-${ref.evidenceId}`} className="text-xs text-slate-200 leading-6">
+                                                                    {formatFocusedRequestEvidenceRef(ref)}
+                                                                </div>
+                                                            ))
+                                                        )}
+                                                    </div>
+                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2">
+                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-amber-300">Contradicting Requests</div>
+                                                        {effectiveSelectedRequestEvidenceStory.contradictingRequestRefs.length === 0 ? (
+                                                            <div className="text-xs text-slate-500 leading-6">No request replay currently weakens the hypothesis.</div>
+                                                        ) : (
+                                                            effectiveSelectedRequestEvidenceStory.contradictingRequestRefs.map((ref) => (
+                                                                <div key={`contradict-${ref.evidenceId}`} className="text-xs text-slate-200 leading-6">
+                                                                    {formatFocusedRequestEvidenceRef(ref)}
+                                                                </div>
+                                                            ))
+                                                        )}
+                                                    </div>
+                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2">
+                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-cyan-300">Adaptive Confirmation</div>
+                                                        {effectiveSelectedRequestEvidenceStory.confirmationRequestRefs.length === 0 ? (
+                                                            <div className="text-xs text-slate-500 leading-6">No adaptive confirmation replay was captured.</div>
+                                                        ) : (
+                                                            effectiveSelectedRequestEvidenceStory.confirmationRequestRefs.map((ref) => (
+                                                                <div key={`confirm-${ref.evidenceId}`} className="text-xs text-slate-200 leading-6">
+                                                                    {formatFocusedRequestEvidenceRef(ref)}
+                                                                </div>
+                                                            ))
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {(selectedEvidenceReasoningLinks.length > 0 || selectedEvidenceBundles.length > 0) && (
+                                            <div className="rounded-2xl border border-emerald-500/20 bg-emerald-950/10 p-4 space-y-3">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-200">Evidence Links</div>
+                                                {selectedEvidenceReasoningLinks.length === 0 ? (
+                                                    <div className="text-sm leading-7 text-slate-400">
+                                                        Evidence was captured, but no explicit reasoning link was persisted for this case yet.
+                                                    </div>
+                                                ) : (
+                                                    selectedEvidenceReasoningLinks.map((link) => (
+                                                        <div key={link.evidenceId} className="rounded-2xl border border-white/10 bg-black/20 p-3 space-y-2">
+                                                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                                <span className="px-2.5 py-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 text-emerald-100">
+                                                                    {link.role.replace(/_/g, ' ')}
+                                                                </span>
+                                                                <span className="text-slate-400">
+                                                                    {link.effect}
+                                                                </span>
+                                                                <span className="text-slate-500">
+                                                                    {link.reasoningEntryIds.length} trace link{link.reasoningEntryIds.length === 1 ? '' : 's'}
+                                                                </span>
+                                                            </div>
+                                                            <div className="text-sm leading-7 text-slate-200">{link.whyItMatters}</div>
+                                                        </div>
+                                                    ))
+                                                )}
+                                            </div>
+                                        )}
+
+                                        <div className="rounded-2xl border border-violet-500/20 bg-violet-950/10 p-4 space-y-3">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-violet-200">Agent Reasoning</div>
+                                                <span className="text-xs text-slate-500">
+                                                    {effectiveSelectedReasoningTrace.length} step{effectiveSelectedReasoningTrace.length === 1 ? '' : 's'}
+                                                </span>
+                                            </div>
+                                            {effectiveSelectedReasoningTrace.length === 0 ? (
+                                                <div className="text-sm leading-7 text-slate-400">
+                                                    No bounded reasoning trace has been persisted for this case yet.
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-3">
+                                                    {effectiveSelectedReasoningTrace.map((entry) => (
+                                                        <div key={entry.id} className="rounded-2xl border border-white/10 bg-black/20 p-3 space-y-2">
+                                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                                <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                                    <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
+                                                                        {formatFocusedReasoningStage(entry.stage)}
+                                                                    </span>
+                                                                    <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-slate-300">
+                                                                        {formatFocusedReasoningEntryType(entry.entryType)}
+                                                                    </span>
+                                                                    <span className="text-slate-500">
+                                                                        {formatFocusedReasoningRail(entry.rail)}
+                                                                    </span>
+                                                                </div>
+                                                                <span className="text-[11px] text-slate-500">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                                                            </div>
+                                                            <div className="text-sm leading-7 text-slate-200">{entry.summary}</div>
+                                                            {entry.observationSummary && (
+                                                                <div className="text-xs leading-6 text-slate-300">Observed: {entry.observationSummary}</div>
+                                                            )}
+                                                            {entry.hypothesisRationaleSummary && (
+                                                                <div className="text-xs leading-6 text-cyan-100">Hypothesis: {entry.hypothesisRationaleSummary}</div>
+                                                            )}
+                                                            {entry.actionSelectionRationale && (
+                                                                <div className="text-xs leading-6 text-violet-100">Why this step: {entry.actionSelectionRationale}</div>
+                                                            )}
+                                                            {entry.requestResponseImpactSummary && (
+                                                                <div className="text-xs leading-6 text-amber-100">Request/response: {entry.requestResponseImpactSummary}</div>
+                                                            )}
+                                                            {entry.browserStateImpactSummary && (
+                                                                <div className="text-xs leading-6 text-emerald-100">Browser/state: {entry.browserStateImpactSummary}</div>
+                                                            )}
+                                                            {entry.confidenceShiftSummary && (
+                                                                <div className="text-xs leading-6 text-cyan-100">Confidence: {entry.confidenceShiftSummary}</div>
+                                                            )}
+                                                            {entry.stopRetryBlockRationale && (
+                                                                <div className="text-xs leading-6 text-red-100">Constraint: {entry.stopRetryBlockRationale}</div>
+                                                            )}
+                                                            {(entry.linkedEvidenceIds.length > 0 || entry.linkedRequestContextKeys.length > 0) && (
+                                                                <div className="text-xs leading-6 text-slate-500">
+                                                                    {[
+                                                                        entry.linkedEvidenceIds.length > 0 ? `${entry.linkedEvidenceIds.length} evidence link${entry.linkedEvidenceIds.length === 1 ? '' : 's'}` : null,
+                                                                        entry.linkedRequestContextKeys.length > 0
+                                                                            ? `context: ${entry.linkedRequestContextKeys.slice(0, 3).map((field) => formatFocusedRequestContextField(field)).join(', ')}`
+                                                                            : null,
+                                                                    ].filter(Boolean).join(' | ')}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
+                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Evidence Bundles</div>
+                                            {selectedEvidenceBundles.length === 0 ? (
+                                                <div className="text-sm leading-7 text-slate-400">
+                                                    No evidence has been captured for this case yet.
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-3">
+                                                    {selectedEvidenceBundles.map((bundle) => (
+                                                        <div key={bundle.id} className="rounded-2xl border border-white/10 bg-white/5 p-3 space-y-2">
+                                                            <div className="flex items-center justify-between gap-3">
+                                                                <span className="text-xs font-semibold uppercase text-cyan-200">{bundle.source.replace(/_/g, ' ')}</span>
+                                                                <span className="text-[11px] text-slate-500">{new Date(bundle.capturedAt).toLocaleString()}</span>
+                                                            </div>
+                                                            <div className="flex flex-wrap gap-2 text-[10px]">
+                                                                <span className={`px-2 py-0.5 rounded border ${
+                                                                    bundle.requestRef || bundle.responseRef || bundle.source === 'comparison'
+                                                                        ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-100'
+                                                                        : bundle.browserState || bundle.screenshotRef
+                                                                            ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100'
+                                                                            : 'border-slate-600 bg-slate-800/60 text-slate-300'
+                                                                }`}>
+                                                                    {bundle.requestRef || bundle.responseRef || bundle.source === 'comparison'
+                                                                        ? 'Request-backed'
+                                                                        : bundle.browserState || bundle.screenshotRef
+                                                                            ? 'Browser-backed'
+                                                                            : 'System-only'}
+                                                                </span>
+                                                                {bundle.provenance?.executionPhase && (
+                                                                    <span className="px-2 py-0.5 rounded border border-white/10 bg-black/20 text-slate-300">
+                                                                        {bundle.provenance.executionPhase === 'adaptive_confirmation'
+                                                                            ? `Adaptive confirmation${typeof bundle.provenance.confirmationOrdinal === 'number' ? ` ${bundle.provenance.confirmationOrdinal}` : ''}`
+                                                                            : 'Planned execution'}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            <div className="text-sm leading-7 text-slate-200">{bundle.summary}</div>
+                                                            {(bundle.requestRef || bundle.responseRef) && (
+                                                                <div className="rounded-xl border border-cyan-500/10 bg-slate-950/60 p-3 space-y-1">
+                                                                    {bundle.requestRef && (
+                                                                        <div className="text-xs leading-6 text-cyan-100">
+                                                                            Request: {[bundle.requestRef.method, bundle.requestRef.path || bundle.requestRef.url].filter(Boolean).join(' ')}
+                                                                        </div>
+                                                                    )}
+                                                                    {bundle.responseRef && (
+                                                                        <div className="text-xs leading-6 text-slate-300">
+                                                                            Response: {typeof bundle.responseRef.statusCode === 'number' ? `HTTP ${bundle.responseRef.statusCode}` : 'Captured'}{bundle.responseRef.path ? ` · ${bundle.responseRef.path}` : ''}
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                            {bundle.executionNotes && (
+                                                                <div className="text-xs leading-6 text-slate-400">{bundle.executionNotes}</div>
+                                                            )}
+                                                            {bundle.responseDiffSummary?.summary && (
+                                                                <div className="text-xs leading-6 text-amber-200">{bundle.responseDiffSummary.summary}</div>
+                                                            )}
+                                                            {bundle.browserState && (
+                                                                <div className="rounded-xl border border-cyan-500/10 bg-slate-950/60 p-3 space-y-2">
+                                                                    <div className="text-xs leading-6 text-cyan-100">{bundle.browserState.actionSummary}</div>
+                                                                    <div className="text-xs text-slate-500">
+                                                                        {formatExpectationSummary(bundle) || 'No browser checks recorded'}
+                                                                    </div>
+                                                                    {bundle.browserState.pageTitle && (
+                                                                        <div className="text-xs text-slate-400">Title: {bundle.browserState.pageTitle}</div>
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                            {bundle.screenshotRef && buildScreenshotDataUrl(bundle.screenshotRef) && (
+                                                                <img
+                                                                    src={buildScreenshotDataUrl(bundle.screenshotRef) || undefined}
+                                                                    alt="Evidence screenshot"
+                                                                    className="rounded-xl border border-white/10 max-h-56 w-full object-contain bg-black/40"
+                                                                />
+                                                            )}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </>
+                                ) : (
+                                    <>
+                                        <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 p-5 text-center">
+                                            <Shield className="w-10 h-10 mx-auto text-slate-600 mb-3" />
+                                            <h3 className="text-lg font-semibold text-white">Inspect a case when you need detail</h3>
+                                            <p className="mt-2 text-sm leading-7 text-slate-400">
+                                                Choose <span className="text-slate-200">Inspect Evidence</span> on any focused case to open its evidence, verdict, history, and investigation notes here.
+                                            </p>
+                                        </div>
+
+                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
+                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Verdict Summary</div>
+                                            {focusedVerdictSummary ? (
+                                                <>
+                                                    <div className="flex flex-wrap gap-2 text-xs">
+                                                        <span className="px-2.5 py-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 text-emerald-200">Pass {focusedVerdictCounts.pass}</span>
+                                                        <span className="px-2.5 py-1 rounded-full border border-red-500/20 bg-red-500/10 text-red-200">Fail {focusedVerdictCounts.fail}</span>
+                                                        <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-200">Inconclusive {focusedVerdictCounts.inconclusive}</span>
+                                                        <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-200">Needs Review {focusedVerdictCounts.needs_review}</span>
+                                                    </div>
+                                                    <div className="text-sm leading-7 text-slate-300">
+                                                        Overall verdict: <span className="text-white">{formatFocusedVerdictState(focusedVerdictSummary.overallVerdict)}</span>
+                                                    </div>
+                                                    {focusedVerdictSummary.majorBlockers.length > 0 && (
+                                                        <div className="text-xs leading-6 text-slate-400">
+                                                            {focusedVerdictSummary.majorBlockers.slice(0, 2).join(' | ')}
+                                                        </div>
+                                                    )}
+                                                </>
+                                            ) : (
+                                                <div className="text-sm leading-7 text-slate-400">
+                                                    {isLegacyScopedReviewMode
+                                                        ? 'Verdicts will appear here after approved legacy cases have executed.'
+                                                        : 'Verdicts will appear here as the bounded mission finishes consolidating live findings.'}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
+                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Historical Compare</div>
+                                            {(focusedHistoricalCompareState || focusedHistoricalCompareSummary) ? (
+                                                <>
+                                                    <div className="flex flex-wrap gap-2 text-xs">
+                                                        <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
+                                                            {formatFocusedHistoricalCompareStatus(focusedHistoricalCompareState?.comparisonStatus)}
+                                                        </span>
+                                                        {focusedHistoricalCompareSummary && (
+                                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-slate-200">
+                                                                {formatFocusedOverallChangeClassification(focusedHistoricalCompareSummary.overallChangeClassification)}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <div className="text-sm leading-7 text-slate-300">
+                                                        {focusedHistoricalCompareState?.statusReason
+                                                            || focusedHistoricalCompareSummary?.compareNarrative
+                                                            || 'Comparison detail will appear here when a comparable baseline exists.'}
+                                                    </div>
+                                                </>
+                                            ) : (
+                                                <div className="text-sm leading-7 text-slate-400">
+                                                    Historical comparison will appear once PenPard has a comparable scoped baseline.
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="rounded-2xl border border-red-500/20 bg-red-950/10 p-4 space-y-3">
+                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Troubleshooting</div>
+                                            {focusedBlockerSummary ? (
+                                                <>
+                                                    <div className="flex flex-wrap gap-2 text-xs">
+                                                        <span className="px-2.5 py-1 rounded-full border border-red-500/20 bg-red-500/10 text-red-200">Blocking {blockerImpactCounts.blocking}</span>
+                                                        <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-200">Degrading {blockerImpactCounts.degrading}</span>
+                                                        <span className="px-2.5 py-1 rounded-full border border-slate-600 bg-slate-800/60 text-slate-300">Informational {blockerImpactCounts.informational}</span>
+                                                    </div>
+                                                    <div className="text-sm leading-7 text-slate-300">
+                                                        {focusedBlockerSummary.latestMajorBlockerSummary || 'No major blockers are currently summarised for this run.'}
+                                                    </div>
+                                                    {unresolvedBlockerTypes.length > 0 && (
+                                                        <div className="text-xs leading-6 text-slate-400">
+                                                            {unresolvedBlockerTypes.slice(0, 3).map(([issueType, count]) => (
+                                                                `${formatFocusedInvestigationType(issueType as any)} ${count}`
+                                                            )).join(' | ')}
+                                                        </div>
+                                                    )}
+                                                </>
+                                            ) : (
+                                                <div className="text-sm leading-7 text-slate-400">
+                                                    Any execution blockers or investigation issues will surface here.
+                                                </div>
+                                            )}
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        </motion.aside>
+                    </section>
+
+                    <motion.section
+                        initial={{ opacity: 0, y: 16 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="card border-white/10 overflow-hidden"
+                    >
+                        <div className="p-5 border-b border-white/10 bg-white/5 flex items-center justify-between gap-3">
+                            <div>
+                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Scoped Agent Trace</div>
+                                <h2 className="mt-2 text-lg font-semibold text-white">Execution reasoning</h2>
+                                <p className="mt-1 text-sm text-slate-400">
+                                    Follow the bounded observation, decision, action, and result trail for this scoped run.
+                                </p>
+                            </div>
+                            <span className="text-xs text-slate-500">{scopedAgentTracePreview.length} entries</span>
+                        </div>
+                        <div
+                            ref={systemLogsContainerRef}
+                            className="max-h-80 overflow-y-auto p-4 space-y-3 text-slate-300 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent"
+                        >
+                            {focusedRequestContextUsage && (
+                                <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-2">
+                                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                                        <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-100">
+                                            Request context
+                                        </span>
+                                        <span className="text-slate-500">
+                                            {focusedRequestContextUsage.presentFields.length} optional field{focusedRequestContextUsage.presentFields.length === 1 ? '' : 's'}
+                                        </span>
+                                    </div>
+                                    <div className="text-sm leading-7 text-slate-300">
+                                        {focusedRequestContextUsage.summary}
+                                    </div>
+                                    {focusedRequestContextUsage.usedFields.length > 0 && (
+                                        <div className="text-xs leading-6 text-amber-100">
+                                            Used: {focusedRequestContextUsage.usedFields.slice(0, 3).map((entry) => `${formatFocusedRequestContextField(entry.field)} - ${entry.summary}`).join(' | ')}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                            {scopedAgentTracePreview.length === 0 ? (
+                                <div className="text-slate-600 italic">Reasoning entries will appear here as scoped intake, planning, execution, and verdicting progress.</div>
+                            ) : scopedAgentTracePreview.map((entry) => (
+                                <div key={entry.id} className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-2">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                                            <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
+                                                {formatFocusedReasoningStage(entry.stage)}
+                                            </span>
+                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-slate-300">
+                                                {formatFocusedReasoningEntryType(entry.entryType)}
+                                            </span>
+                                            <span className="text-slate-500">{formatFocusedReasoningRail(entry.rail)}</span>
+                                            {entry.caseId && (
+                                                <span className="text-slate-500">Case {entry.caseId.slice(0, 8)}</span>
+                                            )}
+                                        </div>
+                                        <span className="text-[11px] text-slate-500">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                                    </div>
+                                    <div className="text-sm leading-7 text-slate-200">{entry.summary}</div>
+                                    {entry.observationSummary && (
+                                        <div className="text-xs leading-6 text-slate-300">Observed: {entry.observationSummary}</div>
+                                    )}
+                                    {entry.hypothesisRationaleSummary && (
+                                        <div className="text-xs leading-6 text-cyan-100">Hypothesis: {entry.hypothesisRationaleSummary}</div>
+                                    )}
+                                    {entry.actionSelectionRationale && (
+                                        <div className="text-xs leading-6 text-violet-100">Why this step: {entry.actionSelectionRationale}</div>
+                                    )}
+                                    {entry.requestResponseImpactSummary && (
+                                        <div className="text-xs leading-6 text-amber-100">Request/response: {entry.requestResponseImpactSummary}</div>
+                                    )}
+                                    {entry.browserStateImpactSummary && (
+                                        <div className="text-xs leading-6 text-emerald-100">Browser/state: {entry.browserStateImpactSummary}</div>
+                                    )}
+                                    {entry.confidenceShiftSummary && (
+                                        <div className="text-xs leading-6 text-cyan-100">Confidence: {entry.confidenceShiftSummary}</div>
+                                    )}
+                                    {entry.stopRetryBlockRationale && (
+                                        <div className="text-xs leading-6 text-red-100">Constraint: {entry.stopRetryBlockRationale}</div>
+                                    )}
+                                    {(entry.linkedEvidenceIds.length > 0 || entry.linkedRequestContextKeys.length > 0) && (
+                                        <div className="text-xs leading-6 text-slate-500">
+                                            {[
+                                                entry.linkedEvidenceIds.length > 0 ? `${entry.linkedEvidenceIds.length} evidence link${entry.linkedEvidenceIds.length === 1 ? '' : 's'}` : null,
+                                                entry.linkedRequestContextKeys.length > 0
+                                                    ? `context: ${entry.linkedRequestContextKeys.slice(0, 3).map((field) => formatFocusedRequestContextField(field)).join(', ')}`
+                                                    : null,
+                                            ].filter(Boolean).join(' | ')}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                            <div ref={systemLogsEndRef} />
+                        </div>
+                    </motion.section>
+                </main>
+
+                {scanId && (
+                    <ReportOptionsModal
+                        isOpen={reportModalOpen}
+                        onClose={() => setReportModalOpen(false)}
+                        scanId={scanId}
+                    />
+                )}
             </div>
         );
     }
@@ -662,7 +3065,7 @@ User Question: ${userQuestion}`;
                                 <Play className="w-3.5 h-3.5" /> Resume
                             </button>
                         )}
-                        {(status === 'completed' || status === 'stopped') && (
+                        {(status === 'completed' || status === 'stopped' || status === 'scoped_executed') && (
                             <button
                                 onClick={() => setReportModalOpen(true)}
                                 className="btn-primary flex items-center gap-2 text-xs"
@@ -672,8 +3075,14 @@ User Question: ${userQuestion}`;
                         )}
                         <div className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
                             isPaused ? 'bg-amber-500/20 text-amber-400' :
+                            status === 'scoped_discovering' ? 'bg-blue-500/20 text-blue-300 animate-pulse' :
+                            status === 'planning' ? 'bg-cyan-500/20 text-cyan-300 animate-pulse' :
+                            status === 'awaiting_review' ? 'bg-violet-500/20 text-violet-300' :
+                            status === 'scoped_executing' ? 'bg-emerald-500/20 text-emerald-300 animate-pulse' :
+                            status === 'scoped_executed' ? 'bg-emerald-500/20 text-emerald-300' :
                             status === 'scanning' || status === 'crawling' || status === 'testing' ? 'bg-cyan-500/20 text-cyan-400 animate-pulse' :
                             status === 'completed' ? 'bg-green-500/20 text-green-400' :
+                            status === 'failed' ? 'bg-red-500/20 text-red-300' :
                             status === 'stopped' ? 'bg-cyan-500/20 text-cyan-400' :
                             'bg-slate-800 text-slate-400'
                             }`}>
@@ -683,7 +3092,21 @@ User Question: ${userQuestion}`;
                 </div>
             </header>
 
-            <main className="pt-20 pb-8 px-4 max-w-[1600px] mx-auto min-h-[calc(100vh-theme(spacing.10))] grid grid-cols-12 gap-6">
+            <main className="pt-20 pb-8 px-4 max-w-[1600px] mx-auto space-y-4">
+                {showScopedSecondaryContext && (
+                    <MissionControlScopedSupportStrip
+                        liveRuntimeSummary={liveRuntimeSummary}
+                        focusedTestObjective={focusedTestObjective}
+                        scopeEnvelope={scopeEnvelope}
+                        scopedTestRequest={scopedTestRequest}
+                        featureDiscoveryState={featureDiscoveryState}
+                        isLegacyScopedRecoveryState={isLegacyScopedReviewMode}
+                        showLegacyRecoveryTools={showLegacyRecoveryPanel}
+                        onToggleLegacyRecovery={() => setShowLegacyRecovery((current) => !current)}
+                    />
+                )}
+
+                <div className="min-h-[calc(100vh-theme(spacing.10))] grid grid-cols-12 gap-6">
 
                 {/* Left: Agent Status & Logs */}
                 <div className="col-span-12 lg:col-span-3 flex flex-col gap-6 h-[calc(100vh-8rem)]">
@@ -691,7 +3114,7 @@ User Question: ${userQuestion}`;
                         <div className="absolute top-0 right-0 p-3 opacity-20">
                             <Eye className="w-12 h-12 text-cyan-500" />
                         </div>
-                        <h2 className="text-sm uppercase tracking-widest text-slate-400 mb-4 font-bold">Orchestrator Status</h2>
+                        <h2 className="text-sm uppercase tracking-widest text-slate-400 mb-4 font-bold">{isScopedScan ? 'Scoped Mission Status' : 'Orchestrator Status'}</h2>
                         <div className="space-y-4 relative z-10">
                             <div>
                                 <div className="flex justify-between text-xs mb-1">
@@ -706,20 +3129,40 @@ User Question: ${userQuestion}`;
                                     />
                                 </div>
                             </div>
-                            <div className="grid grid-cols-2 gap-2 text-xs">
-                                <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                                    <div className="text-slate-500 mb-1">Phase</div>
-                                    <div className="text-white font-mono capitalize">{status}</div>
-                                </div>
-                                <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                                    <div className="text-slate-500 mb-1">Agents</div>
-                                    <div className={`font-mono ${
-                                        scanCompleted ? 'text-blue-400' : isAgentActive ? 'text-green-400' : 'text-slate-500'
-                                    }`}>
+                                <div className="grid grid-cols-2 gap-2 text-xs">
+                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
+                                    <div className="text-slate-500 mb-1">{isScopedScan ? 'Mission' : 'Phase'}</div>
+                                    <div className="text-white font-mono capitalize">{isScopedScan ? scopedStageLabel : status}</div>
+                                    </div>
+                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
+                                        <div className="text-slate-500 mb-1">Agents</div>
+                                        <div className={`font-mono ${
+                                            scanCompleted ? 'text-blue-400' : isAgentActive ? 'text-green-400' : 'text-slate-500'
+                                        }`}>
                                         {scanCompleted ? 'Done' : isAgentActive ? `${activeAgentCount} Active` : 'Idle'}
+                                        </div>
                                     </div>
                                 </div>
-                            </div>
+                            {isScopedScan && (
+                                <div className="grid grid-cols-1 gap-2 text-xs">
+                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
+                                        <div className="text-slate-500 mb-1">Active Case</div>
+                                        <div className="text-white leading-relaxed">{scopedActiveCaseLabel || 'Waiting for bounded case selection'}</div>
+                                    </div>
+                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
+                                        <div className="text-slate-500 mb-1">Current Rail</div>
+                                        <div className="text-white">{scopedLiveRuntime?.currentRail ? formatFocusedExecutionRail(scopedLiveRuntime.currentRail) : 'System-only'}</div>
+                                    </div>
+                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
+                                        <div className="text-slate-500 mb-1">Last Bounded Request</div>
+                                        <div className="text-white leading-relaxed">
+                                            {scopedRuntimeRequest?.summary
+                                                ? `${scopedRuntimeRequest.summary}${typeof scopedRuntimeRequest.statusCode === 'number' ? ` · HTTP ${scopedRuntimeRequest.statusCode}` : ''}`
+                                                : 'Waiting for request-backed evidence'}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     </div>
 
@@ -727,7 +3170,7 @@ User Question: ${userQuestion}`;
                         <div className="p-3 border-b border-white/10 flex items-center justify-between bg-white/5 flex-shrink-0">
                             <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
                                 <Terminal className="w-4 h-4" />
-                                Agent Logs
+                                {isScopedScan ? 'Live Mission Log' : 'Agent Logs'}
                             </div>
                             <span className="text-[10px] text-slate-600">{logs.length} entries</span>
                         </div>
@@ -783,6 +3226,100 @@ User Question: ${userQuestion}`;
                                     </button>
                                 </div>
                             </div>
+                        ) : isScopedScan && status === 'scoped_discovering' ? (
+                            <div className="relative z-10 flex items-center gap-6">
+                                <div className="w-24 h-24 relative flex items-center justify-center">
+                                    <motion.div
+                                        animate={{ rotate: 360 }}
+                                        transition={{ duration: 10, repeat: Infinity, ease: 'linear' }}
+                                        className="absolute inset-0 border-2 border-dashed border-blue-500/30 rounded-full"
+                                    />
+                                    <motion.div
+                                        animate={{ rotate: -360 }}
+                                        transition={{ duration: 14, repeat: Infinity, ease: 'linear' }}
+                                        className="absolute inset-4 border border-cyan-500/20 rounded-full"
+                                    />
+                                    <Crosshair className="w-8 h-8 text-blue-300" />
+                                </div>
+                                <div className="text-left">
+                                    <h3 className="font-bold text-white text-lg">Anchoring Requested Feature</h3>
+                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
+                                        {featureDiscoveryState?.summary || 'PenPard is using the structured request URL and description to derive bounded feature anchors before entering the live scoped mission.'}
+                                    </p>
+                                </div>
+                            </div>
+                        ) : isScopedScan && status === 'planning' ? (
+                            <div className="relative z-10 flex items-center gap-6">
+                                <div className="w-24 h-24 relative flex items-center justify-center">
+                                    <motion.div
+                                        animate={{ rotate: 360 }}
+                                        transition={{ duration: 8, repeat: Infinity, ease: 'linear' }}
+                                        className="absolute inset-0 border-2 border-dashed border-cyan-500/30 rounded-full"
+                                    />
+                                    <motion.div
+                                        animate={{ rotate: -360 }}
+                                        transition={{ duration: 12, repeat: Infinity, ease: 'linear' }}
+                                        className="absolute inset-4 border border-violet-500/30 rounded-full"
+                                    />
+                                    <Route className="w-8 h-8 text-cyan-400" />
+                                </div>
+                                <div className="text-left">
+                                    <h3 className="font-bold text-white text-lg">Seeding Bounded Hypotheses</h3>
+                                    <p className="text-slate-400 text-xs max-w-[260px] leading-relaxed">
+                                        PenPard is turning the persisted objective and scope envelope into internal bounded test hints before immediate live execution.
+                                    </p>
+                                </div>
+                            </div>
+                        ) : isScopedScan && status === 'awaiting_review' ? (
+                            <div className="relative z-10 flex items-center gap-6">
+                                <div className="w-24 h-24 relative flex items-center justify-center">
+                                    <div className="absolute inset-0 border border-violet-500/30 rounded-full" />
+                                    <div className="absolute inset-4 border border-violet-500/20 rounded-full" />
+                                    <CheckCircle className="w-9 h-9 text-violet-300" />
+                                </div>
+                                <div className="text-left">
+                                    <h3 className="font-bold text-white text-lg">Legacy Review State</h3>
+                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
+                                        {focusedPlanSummary?.enabledCases ?? focusedTestCases.length} bounded case hint(s) are persisted for a legacy manual review flow. New scoped launches should move straight into live execution.
+                                    </p>
+                                </div>
+                            </div>
+                        ) : isScopedScan && status === 'scoped_executing' ? (
+                            <div className="relative z-10 flex items-center gap-6">
+                                <div className="w-24 h-24 relative flex items-center justify-center">
+                                    <motion.div
+                                        animate={{ rotate: 360 }}
+                                        transition={{ duration: 8, repeat: Infinity, ease: 'linear' }}
+                                        className="absolute inset-0 border-2 border-dashed border-emerald-500/30 rounded-full"
+                                    />
+                                    <motion.div
+                                        animate={{ rotate: -360 }}
+                                        transition={{ duration: 12, repeat: Infinity, ease: 'linear' }}
+                                        className="absolute inset-4 border border-cyan-500/30 rounded-full"
+                                    />
+                                    <Activity className="w-8 h-8 text-emerald-300" />
+                                </div>
+                                <div className="text-left">
+                                    <h3 className="font-bold text-white text-lg">Running Bounded Live Mission</h3>
+                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
+                                        Scoped execution is reasoning live inside the persisted mission boundary, following suspicious signals and updating findings as evidence lands.
+                                    </p>
+                                </div>
+                            </div>
+                        ) : isScopedScan && status === 'scoped_executed' ? (
+                            <div className="relative z-10 flex items-center gap-6">
+                                <div className="w-24 h-24 relative flex items-center justify-center">
+                                    <div className="absolute inset-0 border border-emerald-500/30 rounded-full" />
+                                    <div className="absolute inset-4 border border-emerald-500/20 rounded-full" />
+                                    <CheckCircle className="w-9 h-9 text-emerald-300" />
+                                </div>
+                                <div className="text-left">
+                                    <h3 className="font-bold text-white text-lg">Bounded Mission Complete</h3>
+                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
+                                        The bounded mission finished with persisted findings, verdict evidence, and request traces ready for operator review.
+                                    </p>
+                                </div>
+                            </div>
                         ) : (status === 'scanning' || status === 'crawling' || status === 'testing') ? (
                             <div className="relative z-10 flex items-center gap-6">
                                 <div className="w-24 h-24 relative">
@@ -823,8 +3360,16 @@ User Question: ${userQuestion}`;
                             {logs.filter(l => l.type === 'human' || (l.type === 'agent' && l.message.includes('[PENPARD]'))).length === 0 ? (
                                 <div className="text-center py-8 opacity-30 text-sm">
                                     <Terminal className="w-8 h-8 mx-auto mb-2" />
-                                    <p>No commands sent yet.</p>
-                                    <p className="text-xs mt-1">Type a message to ask PenPard about the scan...</p>
+                                    <p>{scopedControlMode ? (isScopedExecutionMode ? 'No scoped execution notes yet.' : isLegacyScopedReviewMode ? 'No legacy review notes yet.' : 'No scoped mission notes yet.') : 'No commands sent yet.'}</p>
+                                    <p className="text-xs mt-1">
+                                        {scopedControlMode
+                                            ? isScopedExecutionMode
+                                                ? 'Scoped execution is system-managed. Inspect live reasoning, requests, and evidence on the right.'
+                                                : isLegacyScopedReviewMode
+                                                    ? 'This scan is using the legacy manual review path. Review controls stay available on the right.'
+                                                    : 'Scoped mode now moves from discovery into live bounded execution without a review wall.'
+                                            : 'Type a message to ask PenPard about the scan...'}
+                                    </p>
                                 </div>
                             ) : (
                                 logs.filter(l => l.type === 'human' || (l.type === 'agent' && l.message.includes('[PENPARD]'))).map((log, i) => {
@@ -861,7 +3406,7 @@ User Question: ${userQuestion}`;
                         </div>
 
                         {/* Continue Scan Panel (visible when completed and toggled) */}
-                        {scanCompleted && showContinuePanel && (
+                        {scanCompleted && !isScopedScan && showContinuePanel && (
                             <div className="px-3 pt-3 bg-black/40 border-t border-cyan-500/20">
                                 <div className="flex items-center gap-3 mb-2">
                                     <div className="flex items-center gap-2">
@@ -907,6 +3452,9 @@ User Question: ${userQuestion}`;
                                     value={command}
                                     onChange={e => setCommand(e.target.value)}
                                     onKeyDown={e => {
+                                        if (scopedControlMode) {
+                                            return;
+                                        }
                                         if (e.key === 'Enter') {
                                             if (showContinuePanel && scanCompleted) {
                                                 handleContinueScan();
@@ -915,19 +3463,28 @@ User Question: ${userQuestion}`;
                                             }
                                         }
                                     }}
-                                    placeholder={showContinuePanel && scanCompleted
-                                        ? "Enter instructions to continue scanning..."
-                                        : "Type instructions for PenPard..."
+                                    disabled={scopedControlMode}
+                                    placeholder={scopedControlMode
+                                        ? isScopedExecutionMode
+                                            ? 'Scoped execution is running. Inspect evidence and per-case state on the right.'
+                                            : isLegacyScopedReviewMode
+                                                ? 'Review approved legacy cases, then start bounded execution from the panel on the right.'
+                                                : 'Scoped mission is system-managed. Inspect live reasoning, requests, and findings on the right.'
+                                        : showContinuePanel && scanCompleted
+                                            ? 'Enter instructions to continue scanning...'
+                                            : 'Type instructions for PenPard...'
                                     }
                                     className={`w-full bg-slate-800/50 border rounded-xl px-4 py-3 text-white placeholder-slate-500 text-sm focus:ring-1 outline-none transition-all ${
-                                        showContinuePanel && scanCompleted
-                                            ? 'border-cyan-500/40 focus:border-cyan-500 focus:ring-cyan-500/50 pr-28'
-                                            : 'border-slate-700 focus:border-cyan-500/50 focus:ring-cyan-500/50 pr-12'
+                                        scopedControlMode
+                                            ? 'border-slate-800 opacity-60 cursor-not-allowed pr-12'
+                                            : showContinuePanel && scanCompleted
+                                                ? 'border-cyan-500/40 focus:border-cyan-500 focus:ring-cyan-500/50 pr-28'
+                                                : 'border-slate-700 focus:border-cyan-500/50 focus:ring-cyan-500/50 pr-12'
                                     }`}
                                 />
                                 <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
                                     {/* Continue Scan button — only when completed + panel open */}
-                                    {showContinuePanel && scanCompleted && (
+                                    {showContinuePanel && scanCompleted && !isScopedScan && (
                                         <button
                                             onClick={handleContinueScan}
                                             disabled={!command.trim() || isContinuing}
@@ -938,7 +3495,7 @@ User Question: ${userQuestion}`;
                                         </button>
                                     )}
                                     {/* Regular send button */}
-                                    {(!showContinuePanel || !scanCompleted) && (
+                                    {!scopedControlMode && (!showContinuePanel || !scanCompleted) && (
                                         <button
                                             onClick={handleSendCommand}
                                             disabled={!command.trim() || isSending}
@@ -950,7 +3507,7 @@ User Question: ${userQuestion}`;
                                 </div>
                             </div>
                             {/* Toggle button for continue scan */}
-                            {scanCompleted && !showContinuePanel && (
+                            {scanCompleted && !isScopedScan && !showContinuePanel && (
                                 <button
                                     onClick={() => setShowContinuePanel(true)}
                                     className="mt-2 w-full text-center py-1.5 rounded-lg bg-cyan-500/5 hover:bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-xs font-medium transition-all flex items-center justify-center gap-1.5"
@@ -966,20 +3523,38 @@ User Question: ${userQuestion}`;
                         <div className="text-xs text-slate-500 flex gap-4">
                             <span className="flex items-center gap-1">
                                 <div className={`w-1.5 h-1.5 rounded-full ${
-                                    scanCompleted ? 'bg-blue-500' :
+                                    scanCompleted || isScopedDiscoveryMode || isScopedReviewMode || isScopedExecutionMode ? 'bg-blue-500' :
                                     isPaused ? 'bg-amber-500' : isAgentActive ? 'bg-green-500' : 'bg-slate-500'
                                 }`}></div>
-                                {scanCompleted ? 'Scan Finished' : isPaused ? 'Paused (Monitoring)' : isAgentActive ? 'Agent Online' : 'Agent Offline'}
+                                {scanCompleted
+                                    ? 'Scan Finished'
+                                    : isScopedDiscoveryMode
+                                        ? 'Feature Discovery'
+                                    : isScopedReviewMode
+                                        ? status === 'planning' ? 'Planner Running' : 'Plan Ready'
+                                        : isScopedExecutionMode
+                                            ? status === 'scoped_executing' ? 'Execution Running' : 'Execution Complete'
+                                        : isPaused
+                                            ? 'Paused (Monitoring)'
+                                            : isAgentActive ? 'Agent Online' : 'Agent Offline'}
                             </span>
                             <span className="flex items-center gap-1">
                                 <div className={`w-1.5 h-1.5 rounded-full ${
-                                    scanCompleted ? 'bg-blue-500' :
+                                    scanCompleted || isScopedDiscoveryMode || isScopedReviewMode || isScopedExecutionMode ? 'bg-blue-500' :
                                     burpConnected === true ? 'bg-green-500' : burpConnected === false ? 'bg-red-500' : 'bg-slate-500'
                                 }`}></div>
-                                {scanCompleted ? 'Burp Session Ended' : burpConnected === true ? 'Burp Connected' : 'Burp Disconnected'}
+                                {scanCompleted
+                                    ? 'Burp Session Ended'
+                                    : isScopedDiscoveryMode
+                                        ? 'Anchors Pending'
+                                    : isScopedReviewMode
+                                        ? 'Legacy Review'
+                                    : isScopedExecutionMode
+                                        ? 'Evidence Capture Active'
+                                        : burpConnected === true ? 'Burp Connected' : 'Burp Disconnected'}
                             </span>
                             {/* Browser status indicator */}
-                            {isAgentActive && browserSessionId && (
+                            {isAgentActive && supportsBrowserVisibility && browserSessionId && (
                                 <span className="flex items-center gap-1">
                                     <div className={`w-1.5 h-1.5 rounded-full ${browserStatusDotClass}`}></div>
                                     <Globe className="w-3 h-3 text-slate-500" />
@@ -1024,19 +3599,21 @@ User Question: ${userQuestion}`;
                             )}
                         </div>
                         <div className="flex items-center gap-3">
-                            {isAgentActive && !isPaused && status !== 'completed' && status !== 'failed' && (
+                            {supportsPause && isAgentActive && !isPaused && status !== 'completed' && status !== 'failed' && (
                                 <button onClick={handlePause} className="text-xs text-amber-400 hover:text-amber-300 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
                                     <Pause className="w-3 h-3" /> PAUSE
                                 </button>
                             )}
-                            {isPaused && (
+                            {supportsPause && isPaused && (
                                 <button onClick={handleResume} className="text-xs text-green-400 hover:text-green-300 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
                                     <Play className="w-3 h-3" /> RESUME
                                 </button>
                             )}
-                            <button onClick={handleStop} className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
-                                <StopCircle className="w-3 h-3" /> STOP
-                            </button>
+                            {!isScopedScan && (
+                                <button onClick={handleStop} className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
+                                    <StopCircle className="w-3 h-3" /> STOP
+                                </button>
+                            )}
                         </div>
                     </div>
                 </div>
@@ -1101,41 +3678,1002 @@ User Question: ${userQuestion}`;
                         </div>
                     </div>
 
-                    <div className="flex-1 flex flex-col bg-white/5 rounded-xl border border-white/10 overflow-hidden min-h-0">
-                        <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0">
-                            <h2 className="font-bold text-sm text-white">Live Findings</h2>
-                            <span className="bg-red-500/20 text-red-400 px-2 py-0.5 rounded text-xs border border-red-500/20">{vulns.length} Issues</span>
-                        </div>
-                        <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin scrollbar-thumb-slate-700 min-h-0">
-                            {vulns.length === 0 ? (
-                                <div className="text-center py-10 opacity-50">
-                                    <Shield className="w-10 h-10 mx-auto mb-2 text-slate-600" />
-                                    <div className="text-sm text-slate-500">No vulnerabilities found yet.</div>
+                    {isScopedScan ? (
+                        <div className="flex-1 flex flex-col bg-white/5 rounded-xl border border-violet-500/20 overflow-hidden min-h-0">
+                            <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0 gap-3">
+                                <div className="min-w-0">
+                                    <h2 className="font-bold text-sm text-white">Live Findings</h2>
+                                    <div className="text-[10px] text-slate-500 mt-1 truncate">
+                                        {scopedLiveRuntime?.currentDecisionSummary || focusedTestObjective?.title || 'Scoped findings now ride on the shared Mission Control surface.'}
+                                    </div>
                                 </div>
-                            ) : (
-                                <AnimatePresence>
-                                    {vulns.map((vuln) => (
-                                        <motion.div
-                                            key={vuln.id}
-                                            initial={{ opacity: 0, x: 20 }}
-                                            animate={{ opacity: 1, x: 0 }}
-                                            onClick={() => {
-                                                setSelectedVuln(vuln);
-                                                setVulnChatHistory([]);
-                                            }}
-                                            className={`p-3 rounded-lg border cursor-pointer hover:bg-white/5 transition-colors ${getSeverityColor(vuln.severity)}`}
+                                <div className="flex items-center gap-2 shrink-0">
+                                    <span className="bg-red-500/20 text-red-300 px-2 py-0.5 rounded text-xs border border-red-500/20">
+                                        {focusedFindingSummary?.actionableCount ?? visibleFocusedFindingRows.length} Live
+                                    </span>
+                                    {showLegacyRecoveryPanel && isLegacyScopedReviewMode && (
+                                        <button
+                                            onClick={() => handleRunFocusedExecution()}
+                                            disabled={executePending || status === 'scoped_discovering' || status === 'planning' || status === 'scoped_executing' || runnableFocusedCaseCount === 0}
+                                            className="px-2.5 py-1 rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 text-[10px] font-semibold disabled:opacity-50"
                                         >
-                                            <div className="flex justify-between items-start mb-1">
-                                                <div className="font-bold text-sm truncate pr-2">{vuln.name}</div>
-                                                <div className="text-[10px] uppercase font-bold opacity-70">{vuln.severity}</div>
-                                            </div>
-                                            <div className="text-xs opacity-80 line-clamp-2">{vuln.description}</div>
-                                        </motion.div>
-                                    ))}
-                                </AnimatePresence>
+                                            {executePending || status === 'scoped_executing' ? 'Executing...' : 'Run Legacy Cases'}
+                                        </button>
+                                    )}
+                                    {showLegacyRecoveryPanel && (
+                                        <button
+                                            onClick={handleRefreshFocusedPlan}
+                                            disabled={planRefreshPending || status === 'scoped_discovering' || status === 'planning' || status === 'scoped_executing'}
+                                            className="px-2.5 py-1 rounded-lg border border-violet-500/30 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20 text-[10px] font-semibold disabled:opacity-50"
+                                        >
+                                            {planRefreshPending || status === 'planning' ? 'Planning...' : isLegacyScopedReviewMode ? 'Regenerate Legacy Plan' : 'Re-seed Mission'}
+                                        </button>
+                                    )}
+                                    {showLegacyRecoveryPanel && status === 'scoped_executed' && (
+                                        <button
+                                            onClick={handleRefreshFocusedVerdicts}
+                                            disabled={verdictRefreshPending}
+                                            className="px-2.5 py-1 rounded-lg border border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 text-[10px] font-semibold disabled:opacity-50"
+                                        >
+                                            {verdictRefreshPending ? 'Refreshing...' : 'Refresh Verdicts'}
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="p-3 border-b border-white/10 bg-black/10 text-[10px] text-slate-400 grid grid-cols-2 gap-2 flex-shrink-0">
+                                <div>Cases: <span className="text-white">{focusedPlanSummary?.totalCases ?? focusedTestCases.length}</span></div>
+                                <div>Enabled: <span className="text-white">{focusedPlanSummary?.enabledCases ?? focusedTestCases.filter((testCase) => testCase.status === 'planned').length}</span></div>
+                                <div>{isLegacyScopedReviewMode ? 'Legacy approved' : 'Live finding threads'}: <span className="text-white">{isLegacyScopedReviewMode ? runnableFocusedCaseCount : (scopedLiveRuntime?.liveFindingCount ?? focusedFindingThreads.length)}</span></div>
+                                <div>Scoped routes: <span className="text-white">{scopeEnvelope?.allowedRoutes.length || 0}</span></div>
+                                <div>Active case: <span className="text-white">{scopedActiveCaseLabel || 'Waiting'}</span></div>
+                                <div>Rail: <span className="text-white">{scopedLiveRuntime?.currentRail ? formatFocusedExecutionRail(scopedLiveRuntime.currentRail) : scopedExecutionLabel}</span></div>
+                            </div>
+                            <div className="p-3 border-b border-white/10 bg-amber-950/10 text-[11px] text-slate-300 space-y-3 flex-shrink-0">
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-200">Findings</div>
+                                        <div className="mt-1 text-[10px] text-slate-400 leading-relaxed">
+                                            {focusedFindingSummary
+                                                ? `${focusedFindingSummary.actionableCount} actionable primary finding${focusedFindingSummary.actionableCount === 1 ? '' : 's'} currently surfaced.`
+                                                : focusedFindingThreads.length > 0
+                                                    ? `${focusedFindingThreads.length} live provisional finding thread${focusedFindingThreads.length === 1 ? '' : 's'} currently tracked during scoped execution.`
+                                                    : 'Primary findings and provisional threads will appear here as scoped execution gathers evidence.'}
+                                        </div>
+                                    </div>
+                                    {focusedFindingSummary && (
+                                        <div className="text-right shrink-0 text-[10px] text-slate-400 space-y-1">
+                                            <div>{focusedFindingSummary.primaryFindings} primary</div>
+                                            {focusedFindingSummary.hiddenNotConfirmedCount > 0 && (
+                                                <div>{focusedFindingSummary.hiddenNotConfirmedCount} hidden not confirmed</div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    <span className="px-2 py-0.5 rounded border border-red-500/20 bg-red-500/10 text-red-300 text-[10px]">
+                                        Confirmed {focusedFindingCounts.confirmed}
+                                    </span>
+                                    <span className="px-2 py-0.5 rounded border border-orange-500/20 bg-orange-500/10 text-orange-300 text-[10px]">
+                                        Likely {focusedFindingCounts.likely}
+                                    </span>
+                                    <span className="px-2 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-300 text-[10px]">
+                                        Suspicious {focusedFindingCounts.suspicious}
+                                    </span>
+                                    <span className="px-2 py-0.5 rounded border border-slate-500/20 bg-slate-500/10 text-slate-300 text-[10px]">
+                                        Inconclusive {focusedFindingCounts.inconclusive}
+                                    </span>
+                                </div>
+                                {visibleFocusedFindingRows.length === 0 ? (
+                                    <div className="text-[10px] text-slate-500 leading-relaxed">
+                                        No actionable primary finding is surfaced yet. Provisional threads, blockers, verdicts, and traces below still remain available for review.
+                                    </div>
+                                ) : (
+                                    <div className="space-y-2 max-h-64 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-700">
+                                        {visibleFocusedFindingRows.map(({ finding, thread, source, caseId, caseTitle, targetLabel }) => (
+                                            <button
+                                                key={finding.id}
+                                                type="button"
+                                                onClick={() => handleInspectEvidence(caseId)}
+                                                className="w-full text-left rounded-lg border border-white/10 bg-black/20 p-3 hover:bg-black/30 transition-colors space-y-2"
+                                            >
+                                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                                    <div className="min-w-0">
+                                                        <div className="text-[11px] font-semibold text-white truncate">{finding.title}</div>
+                                                        <div className="text-[10px] text-slate-500 truncate">{caseTitle} · {targetLabel}</div>
+                                                    </div>
+                                                    <span className={`px-2 py-0.5 rounded border text-[10px] font-semibold uppercase ${
+                                                        finding.status === 'confirmed'
+                                                            ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                            : finding.status === 'likely'
+                                                                ? 'border-orange-500/30 bg-orange-500/10 text-orange-300'
+                                                                : finding.status === 'suspicious'
+                                                                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                                    : 'border-slate-500/30 bg-slate-500/10 text-slate-300'
+                                                    }`}>
+                                                        {formatFocusedFindingStatus(finding.status)}
+                                                    </span>
+                                                </div>
+                                                <div className="flex flex-wrap gap-2 text-[10px] text-slate-400">
+                                                    {source === 'runtime_thread' && (
+                                                        <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-200">
+                                                            Provisional {thread ? formatFocusedFindingThreadStatus(thread.status) : 'Live'}
+                                                        </span>
+                                                    )}
+                                                    <span>{formatFocusedFindingFamily(finding.family)}</span>
+                                                    <span>{formatFocusedFindingConfidenceBand(finding.confidenceBand)}</span>
+                                                    <span>Suspicion {finding.suspicionScore}%</span>
+                                                    <span>Confirmation {finding.confirmationProgress}%</span>
+                                                </div>
+                                                <div className="text-[10px] text-slate-200 leading-relaxed">
+                                                    Strongest signal: {finding.strongestSupportSummary}
+                                                </div>
+                                                {finding.blockingConstraintSummary && (
+                                                    <div className="text-[10px] text-red-200 leading-relaxed">
+                                                        Blocker: {finding.blockingConstraintSummary}
+                                                    </div>
+                                                )}
+                                                {finding.nextStepSummary && (
+                                                    <div className="text-[10px] text-cyan-100 leading-relaxed">
+                                                        Next step: {finding.nextStepSummary}
+                                                    </div>
+                                                )}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            {focusedVerdictSummary && (
+                                <div className="p-3 border-b border-white/10 bg-black/10 text-[11px] text-slate-300 space-y-2 flex-shrink-0">
+                                    <div className="flex flex-wrap gap-2">
+                                        <span className="px-2 py-0.5 rounded border border-emerald-500/20 bg-emerald-500/10 text-emerald-300 text-[10px]">
+                                            Pass {focusedVerdictCounts.pass}
+                                        </span>
+                                        <span className="px-2 py-0.5 rounded border border-red-500/20 bg-red-500/10 text-red-300 text-[10px]">
+                                            Fail {focusedVerdictCounts.fail}
+                                        </span>
+                                        <span className="px-2 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-300 text-[10px]">
+                                            Inconclusive {focusedVerdictCounts.inconclusive}
+                                        </span>
+                                        <span className="px-2 py-0.5 rounded border border-violet-500/20 bg-violet-500/10 text-violet-200 text-[10px]">
+                                            Needs review {focusedVerdictCounts.needs_review}
+                                        </span>
+                                    </div>
+                                    {focusedVerdictSummary.majorBlockers.length > 0 && (
+                                        <div className="text-[10px] text-slate-500 leading-relaxed">
+                                            {focusedVerdictSummary.majorBlockers.slice(0, 2).join(' | ')}
+                                        </div>
+                                    )}
+                                </div>
                             )}
+                            {focusedBlockerSummary && (
+                                <div className="p-3 border-b border-white/10 bg-red-950/10 text-[11px] text-slate-300 space-y-2 flex-shrink-0">
+                                    <div className="flex flex-wrap gap-2">
+                                        <span className="px-2 py-0.5 rounded border border-red-500/20 bg-red-500/10 text-red-300 text-[10px]">
+                                            Blocking {blockerImpactCounts.blocking}
+                                        </span>
+                                        <span className="px-2 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-300 text-[10px]">
+                                            Degrading {blockerImpactCounts.degrading}
+                                        </span>
+                                        <span className="px-2 py-0.5 rounded border border-slate-500/20 bg-slate-500/10 text-slate-300 text-[10px]">
+                                            Informational {blockerImpactCounts.informational}
+                                        </span>
+                                    </div>
+                                    {focusedBlockerSummary.latestMajorBlockerSummary && (
+                                        <div className="text-[10px] text-slate-300 leading-relaxed">
+                                            {focusedBlockerSummary.latestMajorBlockerSummary}
+                                        </div>
+                                    )}
+                                    {unresolvedBlockerTypes.length > 0 && (
+                                        <div className="text-[10px] text-slate-500 leading-relaxed">
+                                            {unresolvedBlockerTypes.slice(0, 3).map(([issueType, count]) => (
+                                                `${formatFocusedInvestigationType(issueType as any)} ${count}`
+                                            )).join(' | ')}
+                                        </div>
+                                    )}
+                                    {focusedBlockerSummary.repeatedBlockers.length > 0 && (
+                                        <div className="text-[10px] text-slate-500 leading-relaxed">
+                                            {focusedBlockerSummary.repeatedBlockers.slice(0, 2).join(' | ')}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                            {(focusedHistoricalCompareState || focusedHistoricalCompareSummary) && (
+                                <div className="p-3 border-b border-white/10 bg-cyan-950/10 text-[11px] text-slate-300 space-y-2 flex-shrink-0">
+                                    <div className="flex flex-wrap gap-2">
+                                        <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-200 text-[10px]">
+                                            {formatFocusedHistoricalCompareStatus(focusedHistoricalCompareState?.comparisonStatus)}
+                                        </span>
+                                        {focusedHistoricalCompareSummary && (
+                                            <span className="px-2 py-0.5 rounded border border-white/10 bg-black/20 text-slate-200 text-[10px]">
+                                                {formatFocusedOverallChangeClassification(focusedHistoricalCompareSummary.overallChangeClassification)}
+                                            </span>
+                                        )}
+                                        {focusedHistoricalCompareState?.comparedAgainstScanId && (
+                                            <span className="px-2 py-0.5 rounded border border-white/10 bg-black/20 text-slate-300 text-[10px]">
+                                                Against {focusedHistoricalCompareState.comparedAgainstScanId.slice(0, 8)}
+                                            </span>
+                                        )}
+                                        {focusedHistoricalCompareState?.baselineScanId && (
+                                            <span className="px-2 py-0.5 rounded border border-white/10 bg-black/20 text-slate-300 text-[10px]">
+                                                Baseline {focusedHistoricalCompareState.baselineScanId.slice(0, 8)}
+                                            </span>
+                                        )}
+                                        {focusedHistoricalCounts.manualReviewRecommended && (
+                                            <span className="px-2 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-200 text-[10px]">
+                                                Manual review recommended
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="text-[10px] text-slate-400 leading-relaxed">
+                                        {focusedHistoricalCompareState?.statusReason
+                                            || focusedHistoricalCompareSummary?.compareNarrative
+                                            || 'Historical compare facts are persisted once scoped verdicts exist.'}
+                                    </div>
+                                    {focusedHistoricalCompareState?.comparisonStatus === 'baseline_created' ? (
+                                        <div className="text-[10px] text-cyan-100 leading-relaxed">
+                                            First observed scoped run for this lineage. Baseline created and comparison will start on the next comparable run.
+                                        </div>
+                                    ) : focusedHistoricalCompareSummary ? (
+                                        <>
+                                            <div className="flex flex-wrap gap-2">
+                                                <span className="px-2 py-0.5 rounded border border-emerald-500/20 bg-emerald-500/10 text-emerald-300 text-[10px]">
+                                                    Improved {focusedHistoricalCounts.improvedCount}
+                                                </span>
+                                                <span className="px-2 py-0.5 rounded border border-red-500/20 bg-red-500/10 text-red-300 text-[10px]">
+                                                    Regressed {focusedHistoricalCounts.regressedCount}
+                                                </span>
+                                                <span className="px-2 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-300 text-[10px]">
+                                                    Weaker {focusedHistoricalCounts.weakerConfidenceCount}
+                                                </span>
+                                                <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-200 text-[10px]">
+                                                    Stronger {focusedHistoricalCounts.strongerConfidenceCount}
+                                                </span>
+                                                {focusedHistoricalCounts.newlyIntroducedCount > 0 && (
+                                                    <span className="px-2 py-0.5 rounded border border-violet-500/20 bg-violet-500/10 text-violet-200 text-[10px]">
+                                                        New {focusedHistoricalCounts.newlyIntroducedCount}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {(focusedHistoricalCounts.repeatedBlockerFamilies.length > 0 || focusedHistoricalCounts.newBlockerFamilies.length > 0) && (
+                                                <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                    {focusedHistoricalCounts.repeatedBlockerFamilies.length > 0
+                                                        ? `Recurring blockers: ${focusedHistoricalCounts.repeatedBlockerFamilies.map((issueType) => formatFocusedInvestigationType(issueType)).join(', ')}`
+                                                        : `New blockers: ${focusedHistoricalCounts.newBlockerFamilies.map((issueType) => formatFocusedInvestigationType(issueType)).join(', ')}`}
+                                                </div>
+                                            )}
+                                            {focusedHistoricalCompareSummary.stabilityNotes.length > 0 && (
+                                                <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                    {focusedHistoricalCompareSummary.stabilityNotes.slice(0, 2).join(' | ')}
+                                                </div>
+                                            )}
+                                        </>
+                                    ) : null}
+                                </div>
+                            )}
+                            {(focusedTestObjective || scopeEnvelope || scopedTestRequest || featureDiscoveryState) && (
+                                <div className="p-3 border-b border-white/10 bg-black/5 text-[11px] text-slate-400 space-y-2 flex-shrink-0">
+                                    {scopedTestRequest && (
+                                        <div className="space-y-1.5">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-200 text-[10px]">
+                                                    {scopedTestRequest.targetUrl}
+                                                </span>
+                                                {scopedTestRequest.serviceName && (
+                                                    <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-200 text-[10px]">
+                                                        {scopedTestRequest.serviceName}
+                                                    </span>
+                                                )}
+                                                {scopedTestRequest.environment && (
+                                                    <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300 text-[10px] uppercase">
+                                                        {scopedTestRequest.environment}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <div className="text-slate-200 leading-relaxed">{scopedTestRequest.description}</div>
+                                        </div>
+                                    )}
+                                    {focusedTestObjective?.goal && (
+                                        <div className="text-slate-200 leading-relaxed">{focusedTestObjective.goal}</div>
+                                    )}
+                                    {scopedLiveRuntime?.currentDecisionSummary && !focusedTestObjective?.goal && (
+                                        <div className="text-slate-200 leading-relaxed">{scopedLiveRuntime.currentDecisionSummary}</div>
+                                    )}
+                                    {focusedTestObjective?.riskTags?.length ? (
+                                        <div className="flex flex-wrap gap-1.5">
+                                            {focusedTestObjective.riskTags.map((tag) => (
+                                                <span key={tag} className="px-2 py-0.5 rounded border border-violet-500/20 bg-violet-500/10 text-violet-200 text-[10px]">
+                                                    {tag}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    ) : null}
+                                    {scopeEnvelope?.boundaryHints?.length ? (
+                                        <div className="text-[10px] text-slate-500">
+                                            Boundary hints: {scopeEnvelope.boundaryHints.slice(0, 2).join(' | ')}
+                                        </div>
+                                    ) : null}
+                                    {(scopedRuntimeRequest?.summary || scopedActiveFindingLabel || scopedLiveRuntime?.latestSuspiciousSignal || scopedLiveRuntime?.observationSummary || scopedLiveRuntime?.boundaryReason || scopedRuntimeBoundary?.blockedActionReason) && (
+                                        <div className="space-y-1 text-[10px] text-slate-400">
+                                            {scopedRuntimeRequest?.summary && (
+                                                <div>
+                                                    Last bounded request: <span className="text-slate-200">{scopedRuntimeRequest.summary}{typeof scopedRuntimeRequest.statusCode === 'number' ? ` · HTTP ${scopedRuntimeRequest.statusCode}` : ''}</span>
+                                                </div>
+                                            )}
+                                            {scopedLiveRuntime?.observationSummary && (
+                                                <div>
+                                                    Observation: <span className="text-slate-200">{scopedLiveRuntime.observationSummary}</span>
+                                                </div>
+                                            )}
+                                            {scopedActiveFindingLabel && (
+                                                <div>
+                                                    Active finding thread: <span className="text-slate-200">{scopedActiveFindingLabel}</span>
+                                                </div>
+                                            )}
+                                            {scopedLiveRuntime?.latestSuspiciousSignal && (
+                                                <div>
+                                                    Suspicious signal: <span className="text-slate-200">{scopedLiveRuntime.latestSuspiciousSignal}</span>
+                                                </div>
+                                            )}
+                                            {(scopedLiveRuntime?.boundaryReason || scopedRuntimeBoundary?.blockedActionReason) && (
+                                                <div>
+                                                    Boundary reason: <span className="text-amber-200">{scopedLiveRuntime?.boundaryReason || scopedRuntimeBoundary?.blockedActionReason}</span>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                    {featureDiscoveryState && (
+                                        <div className="space-y-1">
+                                            <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                                                <span className="px-2 py-0.5 rounded border border-blue-500/20 bg-blue-500/10 text-blue-200">
+                                                    {formatScopedFeatureDiscoveryPhase(featureDiscoveryState.phase)}
+                                                </span>
+                                                <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-200">
+                                                    {formatScopedFeatureDiscoveryOutcome(featureDiscoveryState.outcome)}
+                                                </span>
+                                                <span className="text-slate-500">
+                                                    {buildScopedAnchorSummary(scopeEnvelope, featureDiscoveryState)}
+                                                </span>
+                                            </div>
+                                            {(featureDiscoveryState.summary || featureDiscoveryState.errorMessage) && (
+                                                <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                    {featureDiscoveryState.errorMessage || featureDiscoveryState.summary}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                            {selectedEvidenceCase && (
+                                <div className="p-3 border-b border-white/10 bg-black/20 text-[11px] text-slate-300 space-y-2 flex-shrink-0">
+                                    <div className="flex items-start justify-between gap-3">
+                                        <div className="min-w-0">
+                                            <div className="text-white font-semibold truncate">Evidence: {selectedEvidenceCase.title}</div>
+                                            <div className="text-[10px] text-slate-500 mt-1">
+                                                {selectedExecution
+                                                    ? `${formatFocusedExecutionPresentationState(selectedEvidenceRow?.executionPresentationState || selectedEvidenceCase.executionPresentationState)} | ${selectedExecution.executionProfileKey}`
+                                                    : 'No persisted execution selected yet.'}
+                                            </div>
+                                        </div>
+                                        <button
+                                            onClick={() => {
+                                                setSelectedEvidenceCaseId(null);
+                                                setSelectedExecution(null);
+                                                setSelectedCaseVerdict(null);
+                                                setSelectedPrimaryFinding(null);
+                                                setSelectedPrimaryFindingThread(null);
+                                                setSelectedCaseFindings([]);
+                                                setSelectedCaseFindingThreads([]);
+                                                setSelectedCaseHistoricalCompare(null);
+                                                setSelectedEvidenceBundles([]);
+                                                setSelectedExecutionTrace([]);
+                                                setSelectedRailSummary(null);
+                                                setSelectedInvestigationIssues([]);
+                                            }}
+                                            className="text-[10px] text-slate-400 hover:text-white"
+                                        >
+                                            Close
+                                        </button>
+                                    </div>
+                                    {selectedExecution?.notesSummary && (
+                                        <div className="text-[10px] text-slate-400 leading-relaxed">{selectedExecution.notesSummary}</div>
+                                    )}
+                                    {selectedExecution && (
+                                        <div className="text-[10px] text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
+                                            <span>{formatFocusedExecutionRail(effectiveSelectedRailSummary?.rail)}</span>
+                                            <span>Request actions: {selectedExecution.requestActionsUsed}</span>
+                                            <span>Browser actions: {selectedExecution.browserActionsUsed}</span>
+                                            {selectedExecution.browserSessionId && (
+                                                <span>Browser session: {selectedExecution.browserSessionId}</span>
+                                            )}
+                                        </div>
+                                    )}
+                                    {effectiveSelectedRailSummary && (
+                                        <div className="text-[10px] text-cyan-100 leading-relaxed">
+                                            {formatFocusedRailSummary(effectiveSelectedRailSummary)}
+                                        </div>
+                                    )}
+                                    {effectiveSelectedCaseVerdict && (
+                                        <div className="rounded-lg border border-white/10 bg-black/20 p-2 space-y-1">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className={`px-2 py-0.5 rounded border text-[10px] font-semibold uppercase ${
+                                                    effectiveSelectedCaseVerdict.verdictState === 'pass'
+                                                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                                        : effectiveSelectedCaseVerdict.verdictState === 'fail'
+                                                            ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                            : effectiveSelectedCaseVerdict.verdictState === 'needs_review'
+                                                                ? 'border-violet-500/30 bg-violet-500/10 text-violet-200'
+                                                                : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                }`}>
+                                                    {formatFocusedVerdictState(effectiveSelectedCaseVerdict.verdictState)}
+                                                </span>
+                                                <span className="text-[10px] text-slate-500">
+                                                    {formatFocusedEvidenceSufficiencyState(effectiveSelectedCaseVerdict.evidenceSufficiency.state)}
+                                                </span>
+                                            </div>
+                                            <div className="text-[11px] text-slate-200 leading-relaxed">{effectiveSelectedCaseVerdict.verdictReason}</div>
+                                            <div className="text-[10px] text-slate-400 leading-relaxed">
+                                                {effectiveSelectedCaseVerdict.evidenceSufficiency.summary}
+                                            </div>
+                                            <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                Case family: {effectiveSelectedCaseVerdict.interpretationSummary.caseFamily.replace(/_/g, ' ')} | Suspiciousness: {effectiveSelectedCaseVerdict.interpretationSummary.suspiciousness}
+                                            </div>
+                                            {effectiveSelectedCaseVerdict.interpretationSummary.summary && (
+                                                <div className="text-[10px] text-violet-200 leading-relaxed">
+                                                    {effectiveSelectedCaseVerdict.interpretationSummary.summary}
+                                                </div>
+                                            )}
+                                            {effectiveSelectedCaseVerdict.scopeViolationImpact.reasons.length > 0 && (
+                                                <div className="text-[10px] text-red-300 leading-relaxed">
+                                                    {effectiveSelectedCaseVerdict.scopeViolationImpact.reasons[0]}
+                                                </div>
+                                            )}
+                                            {effectiveSelectedCaseVerdict.assistanceNarrative && (
+                                                <div className="text-[10px] text-cyan-200 leading-relaxed">
+                                                    {effectiveSelectedCaseVerdict.assistanceNarrative}
+                                                </div>
+                                            )}
+                                            {effectiveSelectedCaseVerdict.supportingEvidenceRefs.length > 0 && (
+                                                <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                    Supporting evidence: {effectiveSelectedCaseVerdict.supportingEvidenceRefs.slice(0, 3).map((entry) => entry.role.replace(/_/g, ' ')).join(', ')}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                    {effectiveSelectedCaseHistoricalCompare && (
+                                        <div className="rounded-lg border border-cyan-500/20 bg-cyan-950/10 p-2 space-y-2">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-200 text-[10px] font-semibold uppercase">
+                                                    {formatFocusedHistoricalOutcome(effectiveSelectedCaseHistoricalCompare.historicalOutcome)}
+                                                </span>
+                                                <span className="text-[10px] text-slate-400">
+                                                    {formatFocusedCaseCompareStatus(effectiveSelectedCaseHistoricalCompare.compareStatus)}
+                                                </span>
+                                                {effectiveSelectedCaseHistoricalCompare.verdictTransition && (
+                                                    <span className="text-[10px] text-slate-300">
+                                                        {formatFocusedVerdictTransition(effectiveSelectedCaseHistoricalCompare.verdictTransition)}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <div className="text-[10px] text-slate-400 leading-relaxed">
+                                                {effectiveSelectedCaseHistoricalCompare.compareNarrative
+                                                    || (effectiveSelectedCaseHistoricalCompare.compareStatus === 'baseline_only'
+                                                        ? 'First observed case for this baseline-producing run.'
+                                                        : effectiveSelectedCaseHistoricalCompare.previousCaseId
+                                                            ? `Compared against case ${effectiveSelectedCaseHistoricalCompare.previousCaseId.slice(0, 8)} from scan ${effectiveSelectedCaseHistoricalCompare.previousScanId?.slice(0, 8) || 'unknown'}.`
+                                                            : 'No prior comparable case was available.')}
+                                            </div>
+                                            {effectiveSelectedCaseHistoricalCompare.evidenceDriftClassification && (
+                                                <div className="text-[10px] text-slate-300">
+                                                    Evidence drift: {formatFocusedEvidenceDriftClassification(effectiveSelectedCaseHistoricalCompare.evidenceDriftClassification)}
+                                                </div>
+                                            )}
+                                            {(effectiveSelectedCaseHistoricalCompare.priorVerdict || effectiveSelectedCaseHistoricalCompare.priorEvidenceSummary) && (
+                                                <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                    Prior: {formatFocusedVerdictState(effectiveSelectedCaseHistoricalCompare.priorVerdict)} · {formatFocusedEvidenceSufficiencyState(effectiveSelectedCaseHistoricalCompare.priorEvidenceSufficiency)}
+                                                    {effectiveSelectedCaseHistoricalCompare.priorEvidenceSummary ? ` · ${effectiveSelectedCaseHistoricalCompare.priorEvidenceSummary}` : ''}
+                                                </div>
+                                            )}
+                                            {formatFocusedBlockerRecurrence(effectiveSelectedCaseHistoricalCompare) && (
+                                                <div className="text-[10px] text-amber-200 leading-relaxed">
+                                                    {formatFocusedBlockerRecurrence(effectiveSelectedCaseHistoricalCompare)}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                    {selectedExecution && (
+                                        <div className="rounded-lg border border-cyan-500/20 bg-cyan-950/10 p-2 space-y-2">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200">
+                                                    Execution Trace
+                                                </span>
+                                                <span className="text-[10px] text-slate-400">
+                                                    {formatFocusedExecutionRail(effectiveSelectedRailSummary?.rail)}
+                                                </span>
+                                                <span className="text-[10px] text-slate-500">
+                                                    {effectiveSelectedExecutionTrace.length} step{effectiveSelectedExecutionTrace.length === 1 ? '' : 's'}
+                                                </span>
+                                            </div>
+                                            {effectiveSelectedExecutionTrace.length === 0 ? (
+                                                <div className="text-[10px] text-slate-500">
+                                                    Bounded execution did not persist an operator-facing trace for this execution.
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-2 max-h-52 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-700">
+                                                    {effectiveSelectedExecutionTrace.map((entry) => (
+                                                        <div key={entry.id} className="rounded-md border border-white/10 bg-black/20 p-2 space-y-1">
+                                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                                <div className="flex flex-wrap items-center gap-2">
+                                                                    <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-200 text-[10px]">
+                                                                        {formatFocusedExecutionTraceActionType(entry.actionType)}
+                                                                    </span>
+                                                                    <span className="text-[10px] text-slate-400">
+                                                                        {formatFocusedExecutionRail(entry.rail)}
+                                                                    </span>
+                                                                </div>
+                                                                <span className="text-[10px] text-slate-500">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                                                            </div>
+                                                            <div className="text-[11px] text-slate-200 leading-relaxed">{entry.actionSummary}</div>
+                                                            {entry.targetSummary && (
+                                                                <div className="text-[10px] text-slate-500 leading-relaxed">Target: {entry.targetSummary}</div>
+                                                            )}
+                                                            {entry.requestSummary && (
+                                                                <div className="text-[10px] text-slate-400 leading-relaxed">
+                                                                    Request: {[entry.requestSummary.method, entry.requestSummary.path || entry.requestSummary.url, entry.requestSummary.mutationSummary].filter(Boolean).join(' | ')}
+                                                                </div>
+                                                            )}
+                                                            {entry.responseSummary && (
+                                                                <div className="text-[10px] text-slate-400 leading-relaxed">
+                                                                    Response: {[
+                                                                        typeof entry.responseSummary.statusCode === 'number' ? `HTTP ${entry.responseSummary.statusCode}` : null,
+                                                                        entry.responseSummary.structureChanged ? 'Structure changed' : null,
+                                                                        typeof entry.responseSummary.bodyLengthDelta === 'number' ? `Body delta ${entry.responseSummary.bodyLengthDelta}` : null,
+                                                                        entry.responseSummary.keywordSignals?.length ? entry.responseSummary.keywordSignals.join(', ') : null,
+                                                                        entry.responseSummary.bodySummary,
+                                                                    ].filter(Boolean).join(' | ')}
+                                                                </div>
+                                                            )}
+                                                            {entry.reasoningNote && (
+                                                                <div className="text-[10px] text-violet-200 leading-relaxed">Why: {entry.reasoningNote}</div>
+                                                            )}
+                                                            {entry.nextStepRationale && (
+                                                                <div className="text-[10px] text-cyan-100 leading-relaxed">Next step: {entry.nextStepRationale}</div>
+                                                            )}
+                                                            {entry.stopReason && (
+                                                                <div className="text-[10px] text-red-200 leading-relaxed">Stop reason: {entry.stopReason}</div>
+                                                            )}
+                                                            {entry.retryReason && (
+                                                                <div className="text-[10px] text-amber-200 leading-relaxed">Retry context: {entry.retryReason}</div>
+                                                            )}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                    {selectedInvestigationIssues.length > 0 && (
+                                        <div className="rounded-lg border border-red-500/20 bg-red-950/10 p-2 space-y-2">
+                                            <div className="text-[10px] font-semibold uppercase tracking-wide text-red-200">
+                                                Investigation
+                                            </div>
+                                            {selectedInvestigationIssues.map((issue) => (
+                                                <div key={issue.id} className="rounded-md border border-white/10 bg-black/20 p-2 space-y-1">
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        <span className={`px-2 py-0.5 rounded border text-[10px] font-semibold uppercase ${
+                                                            issue.impact === 'blocking'
+                                                                ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                : issue.impact === 'degrading'
+                                                                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                                    : 'border-slate-500/30 bg-slate-500/10 text-slate-300'
+                                                        }`}>
+                                                            {formatFocusedInvestigationImpact(issue.impact)}
+                                                        </span>
+                                                        <span className="text-[10px] text-slate-400">
+                                                            {formatFocusedInvestigationStatus(issue.issueStatus)} · {formatFocusedInvestigationType(issue.issueType)}
+                                                        </span>
+                                                    </div>
+                                                    <div className="text-[11px] text-white leading-relaxed">{issue.issueTitle}</div>
+                                                    {issue.issueDetails && (
+                                                        <div className="text-[10px] text-slate-300 leading-relaxed">{issue.issueDetails}</div>
+                                                    )}
+                                                    {issue.assistanceSummary && (
+                                                        <div className="text-[10px] text-cyan-200 leading-relaxed">{issue.assistanceSummary}</div>
+                                                    )}
+                                                    {(issue.correlation?.caseFamily || issue.correlation?.railSummary || issue.correlation?.latestTraceSummary) && (
+                                                        <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                            {[
+                                                                issue.correlation?.caseFamily ? `Family ${issue.correlation.caseFamily.replace(/_/g, ' ')}` : null,
+                                                                issue.correlation?.railSummary || null,
+                                                                issue.correlation?.latestTraceSummary ? `Latest trace: ${issue.correlation.latestTraceSummary}` : null,
+                                                            ].filter(Boolean).join(' | ')}
+                                                        </div>
+                                                    )}
+                                                    {issue.expertFollowupHint && (
+                                                        <div className="text-[10px] text-amber-200 leading-relaxed">
+                                                            Expert follow-up: {issue.expertFollowupHint}
+                                                        </div>
+                                                    )}
+                                                    {issue.workaroundAttempts.length > 0 && (
+                                                        <div className="text-[10px] text-slate-400 leading-relaxed">
+                                                            Workaround: {issue.workaroundAttempts[issue.workaroundAttempts.length - 1]?.summary} ({issue.workaroundAttempts[issue.workaroundAttempts.length - 1]?.outcome.replace(/_/g, ' ')})
+                                                        </div>
+                                                    )}
+                                                    {(issue.linkedEvidenceIds.length > 0 || issue.linkedVerdictIds.length > 0) && (
+                                                        <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                            {issue.linkedEvidenceIds.length > 0 ? `Evidence ${issue.linkedEvidenceIds.slice(0, 3).join(', ')}` : ''}
+                                                            {issue.linkedEvidenceIds.length > 0 && issue.linkedVerdictIds.length > 0 ? ' | ' : ''}
+                                                            {issue.linkedVerdictIds.length > 0 ? `Verdicts ${issue.linkedVerdictIds.slice(0, 2).join(', ')}` : ''}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                    {selectedEvidenceBundles.length === 0 ? (
+                                        <div className="text-[10px] text-slate-500">{selectedEvidenceEmptyState}</div>
+                                    ) : (
+                                        <div className="space-y-2 max-h-40 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-700">
+                                            {selectedEvidenceBundles.map((bundle) => (
+                                                    <div key={bundle.id} className="rounded-lg border border-white/10 bg-black/20 p-2 space-y-1">
+                                                        <div className="flex items-center justify-between gap-2">
+                                                            <span className="text-[10px] font-semibold uppercase text-cyan-300">{bundle.source.replace(/_/g, ' ')}</span>
+                                                            <span className="text-[10px] text-slate-500">{new Date(bundle.capturedAt).toLocaleString()}</span>
+                                                        </div>
+                                                        <div className="text-[11px] text-slate-200 leading-relaxed">{bundle.summary}</div>
+                                                        {bundle.executionNotes && (
+                                                            <div className="text-[10px] text-slate-400 leading-relaxed">{bundle.executionNotes}</div>
+                                                        )}
+                                                        {bundle.relatedEvidenceIds && bundle.relatedEvidenceIds.length > 0 && (
+                                                            <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                                Linked evidence: {bundle.relatedEvidenceIds.slice(0, 3).join(', ')}
+                                                            </div>
+                                                        )}
+                                                        {bundle.responseDiffSummary?.summary && (
+                                                            <div className="text-[10px] text-amber-300 leading-relaxed">{bundle.responseDiffSummary.summary}</div>
+                                                        )}
+                                                        {bundle.browserState && (
+                                                            <div className="rounded-md border border-cyan-500/10 bg-slate-950/60 p-2 space-y-1">
+                                                                <div className="text-[10px] text-cyan-200 leading-relaxed">
+                                                                    {bundle.browserState.actionSummary}
+                                                                </div>
+                                                                <div className="text-[10px] text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
+                                                                    <span>Page: {bundle.browserState.finalPath || bundle.browserState.finalUrl || bundle.browserState.startUrl}</span>
+                                                                    <span>{formatExpectationSummary(bundle) || 'No browser checks recorded'}</span>
+                                                                    <span>{bundle.browserState.actionCount} action(s)</span>
+                                                                </div>
+                                                                {bundle.browserState.pageTitle && (
+                                                                    <div className="text-[10px] text-slate-400">Title: {bundle.browserState.pageTitle}</div>
+                                                                )}
+                                                                {bundle.browserState.stateNotes.length > 0 && (
+                                                                    <div className="text-[10px] text-slate-400 leading-relaxed">
+                                                                        {bundle.browserState.stateNotes.join(' | ')}
+                                                                    </div>
+                                                                )}
+                                                                {bundle.browserState.expectations.length > 0 && (
+                                                                    <div className="space-y-1">
+                                                                        {bundle.browserState.expectations.slice(0, 4).map((expectation, index) => (
+                                                                            <div
+                                                                                key={`${bundle.id}-expectation-${index}`}
+                                                                                className={`text-[10px] leading-relaxed ${expectation.matched ? 'text-emerald-300' : 'text-amber-300'}`}
+                                                                            >
+                                                                                {expectation.description}: {expectation.observedSummary}
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                        {bundle.scopeViolation?.reason && (
+                                                            <div className="text-[10px] text-red-300 leading-relaxed">{bundle.scopeViolation.reason}</div>
+                                                        )}
+                                                        {buildScreenshotDataUrl(bundle.screenshotRef) && (
+                                                            <img
+                                                                src={buildScreenshotDataUrl(bundle.screenshotRef)!}
+                                                                alt={bundle.screenshotRef?.label || 'Focused evidence screenshot'}
+                                                                className="w-full rounded-md border border-white/10"
+                                                            />
+                                                        )}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                    )}
+                                </div>
+                            )}
+                            <div className="flex-1 overflow-y-auto p-3 space-y-3 scrollbar-thin scrollbar-thumb-slate-700 min-h-0">
+                                {focusedStorySummary && (
+                                    <div className="rounded-lg border border-amber-500/20 bg-amber-950/10 p-3 space-y-2">
+                                        <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-200">Scoped Story</div>
+                                        <div className="text-[11px] leading-relaxed text-amber-50">{focusedStorySummary.headline}</div>
+                                        <div className="text-[10px] leading-relaxed text-slate-300">
+                                            {focusedStorySummary.currentBeliefs.length > 0
+                                                ? focusedStorySummary.currentBeliefs.slice(0, 2).join(' | ')
+                                                : 'Signals will appear here as soon as the bounded run starts producing evidence.'}
+                                        </div>
+                                    </div>
+                                )}
+                                {focusedCaseRows.length === 0 ? (
+                                    <div className="text-center py-10 opacity-50">
+                                        <CheckCircle className="w-10 h-10 mx-auto mb-2 text-slate-600" />
+                                        <div className="text-sm text-slate-500">
+                                            {status === 'planning' ? 'Planner is generating focused cases...' : 'No focused test cases have been generated yet.'}
+                                        </div>
+                                    </div>
+                                ) : (
+                                    focusedCaseRows.map((row) => {
+                                        const focusedCase = focusedCaseMap.get(row.id);
+                                        const caseStory = focusedStoryCaseMap.get(row.id) || null;
+                                        const candidateInputs = summarizeFocusedCaseInputs(row);
+                                        const boundedStopReason = summarizeFocusedCaseStopReason(row);
+                                        const nextStepSummary = summarizeFocusedCaseNextStep(row);
+                                        const actionPending = planActionCaseId === row.id;
+                                        const tracePreview = buildFocusedTracePreview(row.latestExecutionTracePreview, 2);
+
+                                        return (
+                                            <div key={row.id} className="rounded-lg border border-violet-500/10 bg-black/20 p-3 space-y-3">
+                                                <div className="flex items-start justify-between gap-2">
+                                                    <div className="min-w-0">
+                                                        <div className="text-sm font-semibold text-white break-words">{row.title}</div>
+                                                        <div className="text-[10px] text-violet-200 mt-1 break-all">{row.targetLabel}</div>
+                                                    </div>
+                                                    <div className="flex flex-wrap justify-end gap-1.5 shrink-0">
+                                                        <span className={`px-2 py-0.5 rounded border text-[10px] font-semibold uppercase ${
+                                                            row.priority === 'high'
+                                                                ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                : row.priority === 'medium'
+                                                                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                                    : 'border-slate-600 bg-slate-800/60 text-slate-300'
+                                                        }`}>
+                                                            {row.priority}
+                                                        </span>
+                                                        <span className={`px-2 py-0.5 rounded border text-[10px] ${
+                                                            row.reviewState === 'approved'
+                                                                ? 'border-green-500/30 bg-green-500/10 text-green-300'
+                                                                : row.reviewState === 'rejected'
+                                                                    ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                    : 'border-violet-500/30 bg-violet-500/10 text-violet-200'
+                                                        }`}>
+                                                            {formatFocusedReviewState(row.reviewState)}
+                                                        </span>
+                                                        <span className={`px-2 py-0.5 rounded border text-[10px] ${getExecutionBadgeClassName(row.executionPresentationState)}`}>
+                                                            {formatFocusedExecutionPresentationState(row.executionPresentationState)}
+                                                        </span>
+                                                        {row.executionRailSummary && (
+                                                            <span className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-[10px]">
+                                                                {formatFocusedExecutionRail(row.executionRailSummary.rail)}
+                                                            </span>
+                                                        )}
+                                                        {row.latestVerdict && (
+                                                            <span className={`px-2 py-0.5 rounded border text-[10px] font-semibold uppercase ${
+                                                                row.latestVerdict.verdictState === 'pass'
+                                                                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                                                    : row.latestVerdict.verdictState === 'fail'
+                                                                        ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                        : row.latestVerdict.verdictState === 'needs_review'
+                                                                            ? 'border-violet-500/30 bg-violet-500/10 text-violet-200'
+                                                                            : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                            }`}>
+                                                                {formatFocusedVerdictState(row.latestVerdict.verdictState)}
+                                                            </span>
+                                                        )}
+                                                        {row.investigationSummary && row.investigationSummary.unresolvedCount > 0 && (
+                                                            <span className={`px-2 py-0.5 rounded border text-[10px] ${
+                                                                row.investigationSummary.blockingCount > 0
+                                                                    ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                    : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                            }`}>
+                                                                {row.investigationSummary.blockingCount > 0
+                                                                    ? `${row.investigationSummary.blockingCount} blocking`
+                                                                    : `${row.investigationSummary.unresolvedCount} issue${row.investigationSummary.unresolvedCount === 1 ? '' : 's'}`}
+                                                            </span>
+                                                        )}
+                                                        {row.historicalCompare && (
+                                                            <span className={`px-2 py-0.5 rounded border text-[10px] ${
+                                                                row.historicalCompare.historicalOutcome === 'improved'
+                                                                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                                                    : row.historicalCompare.historicalOutcome === 'regressed'
+                                                                        ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                                                                        : row.historicalCompare.historicalOutcome === 'weaker_confidence'
+                                                                            ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                                                            : row.historicalCompare.historicalOutcome === 'stronger_confidence'
+                                                                                ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200'
+                                                                                : 'border-slate-600 bg-slate-800/60 text-slate-300'
+                                                            }`}>
+                                                                {formatFocusedHistoricalOutcome(row.historicalCompare.historicalOutcome)}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <div className="text-[11px] text-slate-300 leading-relaxed">{row.rationale}</div>
+                                                {focusedCase?.hypothesis && (
+                                                    <div className="text-[11px] text-slate-500 leading-relaxed">{focusedCase.hypothesis}</div>
+                                                )}
+                                                {(row.caseIntelligence || caseStory) && (
+                                                    <div className="rounded-lg border border-white/10 bg-slate-950/60 p-2.5 space-y-2">
+                                                        <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Why / What / Next</div>
+                                                        <div className="text-[10px] leading-relaxed text-slate-300">
+                                                            {row.caseIntelligence?.selectionSummary || caseStory?.currentBelief || 'The runtime preserved this case because it remained plausible inside the current anchors.'}
+                                                        </div>
+                                                        {candidateInputs.length > 0 && (
+                                                            <div className="flex flex-wrap gap-1.5">
+                                                                {candidateInputs.map((inputLabel) => (
+                                                                    <span key={`${row.id}-compact-${inputLabel}`} className="px-2 py-0.5 rounded border border-cyan-500/20 bg-cyan-500/10 text-[10px] text-cyan-100">
+                                                                        {inputLabel}
+                                                                    </span>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                        {(caseStory?.whyItMatters || boundedStopReason || nextStepSummary) && (
+                                                            <div className="space-y-1">
+                                                                {caseStory?.whyItMatters && (
+                                                                    <div className="text-[10px] leading-relaxed text-slate-400">
+                                                                        Why it matters: {caseStory.whyItMatters}
+                                                                    </div>
+                                                                )}
+                                                                {boundedStopReason && (
+                                                                    <div className="text-[10px] leading-relaxed text-red-200">
+                                                                        Bounded stop: {boundedStopReason}
+                                                                    </div>
+                                                                )}
+                                                                {nextStepSummary && (
+                                                                    <div className="text-[10px] leading-relaxed text-cyan-200">
+                                                                        Next step: {nextStepSummary}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                <div className="text-[10px] text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
+                                                    <span>{formatFocusedEvidenceCount(row.evidenceCount, row.scopeViolationCount)}</span>
+                                                    <span>{formatFocusedBrowserEvidenceCount(row.browserEvidenceCount, row.browserActionsUsed)}</span>
+                                                    {row.lastRunAt && (
+                                                        <span>Last run: {new Date(row.lastRunAt).toLocaleString()}</span>
+                                                    )}
+                                                    {row.executionProfileKey && (
+                                                        <span>Profile: {row.executionProfileKey}</span>
+                                                    )}
+                                                    {row.browserSessionId && (
+                                                        <span>Browser session: {row.browserSessionId}</span>
+                                                    )}
+                                                    {row.latestVerdict && (
+                                                        <span>{formatFocusedEvidenceSufficiencyState(row.latestVerdict.evidenceSufficiency.state)}</span>
+                                                    )}
+                                                    {row.executionRailSummary && (
+                                                        <span>{formatFocusedExecutionRail(row.executionRailSummary.rail)}</span>
+                                                    )}
+                                                    {row.historicalCompare?.verdictTransition && (
+                                                        <span>{formatFocusedVerdictTransition(row.historicalCompare.verdictTransition)}</span>
+                                                    )}
+                                                    {row.historicalCompare?.evidenceDriftClassification && row.historicalCompare.evidenceDriftClassification !== 'unchanged' && (
+                                                        <span>{formatFocusedEvidenceDriftClassification(row.historicalCompare.evidenceDriftClassification)}</span>
+                                                    )}
+                                                    {row.investigationSummary && row.investigationSummary.unresolvedCount > 0 && (
+                                                        <span>{row.investigationSummary.unresolvedCount} unresolved issue{row.investigationSummary.unresolvedCount === 1 ? '' : 's'}</span>
+                                                    )}
+                                                </div>
+                                                {row.latestVerdict && (
+                                                    <div className="text-[10px] text-slate-300 leading-relaxed">
+                                                        {row.latestVerdict.verdictReason}
+                                                    </div>
+                                                )}
+                                                {row.latestVerdict?.evidenceSufficiency.summary && (
+                                                    <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                        {row.latestVerdict.evidenceSufficiency.summary}
+                                                    </div>
+                                                )}
+                                                {row.historicalCompare && (
+                                                    <div className="text-[10px] text-cyan-100 leading-relaxed">
+                                                        {row.historicalCompare.compareStatus === 'baseline_only'
+                                                            ? 'First observed case in this baseline-producing run.'
+                                                            : row.historicalCompare.compareNarrative
+                                                                || formatFocusedBlockerRecurrence(row.historicalCompare)
+                                                                || (row.historicalCompare.compareStatus === 'newly_introduced'
+                                                                    ? 'Newly introduced case with no prior comparable case.'
+                                                                    : row.historicalCompare.compareStatus === 'not_comparable'
+                                                                        ? 'No safe prior case match was available.'
+                                                                        : row.historicalCompare.verdictTransition
+                                                                            ? formatFocusedVerdictTransition(row.historicalCompare.verdictTransition)
+                                                                            : 'Historical comparison available for this case.')}
+                                                    </div>
+                                                )}
+                                                {row.executionNotesSummary && (
+                                                    <div className={`text-[10px] leading-relaxed ${row.scopeViolationCount > 0 || row.executionError ? 'text-red-300' : 'text-slate-400'}`}>
+                                                        {row.executionError || row.executionNotesSummary}
+                                                    </div>
+                                                )}
+                                                {row.executionRailSummary && (
+                                                    <div className="text-[10px] text-slate-500 leading-relaxed">
+                                                        {formatFocusedRailSummary(row.executionRailSummary)}
+                                                    </div>
+                                                )}
+                                                {tracePreview.length > 0 && (
+                                                    <div className="text-[10px] text-cyan-100 leading-relaxed">
+                                                        {tracePreview.map((entry) => `${formatFocusedExecutionTraceActionType(entry.actionType)}: ${entry.actionSummary}`).join(' | ')}
+                                                    </div>
+                                                )}
+                                                {row.investigationSummary?.latestIssueTitle && row.investigationSummary.unresolvedCount > 0 && (
+                                                    <div className={`text-[10px] leading-relaxed ${
+                                                        row.investigationSummary.blockingCount > 0 ? 'text-red-200' : 'text-amber-200'
+                                                    }`}>
+                                                        {row.investigationSummary.latestIssueTitle}
+                                                    </div>
+                                                )}
+                                                {row.investigationSummary?.latestExpertFollowupHint && row.investigationSummary.unresolvedCount > 0 && (
+                                                    <div className="text-[10px] text-cyan-200 leading-relaxed">
+                                                        Expert follow-up: {row.investigationSummary.latestExpertFollowupHint}
+                                                    </div>
+                                                )}
+                                                <div className="flex flex-wrap gap-2 items-center">
+                                                    {showLegacyRecoveryPanel && isLegacyScopedReviewMode && (
+                                                        <button
+                                                            onClick={() => handleFocusedCaseUpdate(row.id, {
+                                                                reviewState: row.reviewState === 'approved' ? 'pending_review' : 'approved',
+                                                            })}
+                                                            disabled={actionPending}
+                                                            className="px-2.5 py-1 rounded-lg border border-green-500/30 bg-green-500/10 text-green-300 hover:bg-green-500/20 text-[10px] font-semibold disabled:opacity-50"
+                                                        >
+                                                            {row.reviewState === 'approved' ? 'Re-open' : 'Approve'}
+                                                        </button>
+                                                    )}
+                                                    {showLegacyRecoveryPanel && (
+                                                        <>
+                                                            <button
+                                                                onClick={() => handleFocusedCaseUpdate(row.id, {
+                                                                    status: row.status === 'disabled' ? 'planned' : 'disabled',
+                                                                })}
+                                                                disabled={actionPending}
+                                                                className="px-2.5 py-1 rounded-lg border border-slate-600 bg-slate-800/60 text-slate-200 hover:bg-slate-700 text-[10px] font-semibold disabled:opacity-50"
+                                                            >
+                                                                {row.status === 'disabled' ? 'Enable' : 'Disable'}
+                                                            </button>
+                                                            <select
+                                                                value={row.priority}
+                                                                onChange={(event) => handleFocusedCaseUpdate(row.id, {
+                                                                    priority: event.target.value as FocusedTestCase['priority'],
+                                                                })}
+                                                                disabled={actionPending}
+                                                                className="px-2 py-1 rounded-lg border border-violet-500/20 bg-slate-900 text-[10px] text-slate-200 disabled:opacity-50"
+                                                            >
+                                                                <option value="high">High priority</option>
+                                                                <option value="medium">Medium priority</option>
+                                                                <option value="low">Low priority</option>
+                                                            </select>
+                                                        </>
+                                                    )}
+                                                    <span className="text-[10px] text-slate-500 uppercase">{row.status}</span>
+                                                    {showLegacyRecoveryPanel && (
+                                                        <button
+                                                            onClick={() => handleRunFocusedExecution([row.id])}
+                                                            disabled={executePending || row.status === 'disabled' || (isLegacyScopedReviewMode && row.reviewState !== 'approved') || status === 'scoped_executing'}
+                                                            className="px-2.5 py-1 rounded-lg border border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 text-[10px] font-semibold disabled:opacity-50"
+                                                        >
+                                                            Retry
+                                                        </button>
+                                                    )}
+                                                    <button
+                                                        onClick={() => handleInspectEvidence(row.id)}
+                                                        disabled={evidenceLoadingCaseId === row.id}
+                                                        className="px-2.5 py-1 rounded-lg border border-slate-600 bg-slate-800/60 text-slate-200 hover:bg-slate-700 text-[10px] font-semibold disabled:opacity-50"
+                                                    >
+                                                        {evidenceLoadingCaseId === row.id ? 'Loading...' : 'Inspect Evidence'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        );
+                                    })
+                                )}
+                            </div>
                         </div>
-                    </div>
+                    ) : (
+                        <MissionControlExploratoryFindings
+                            vulnerabilities={vulns}
+                            getSeverityColor={getSeverityColor}
+                            onSelectVulnerability={(vuln) => {
+                                setSelectedVuln(vuln);
+                                setVulnChatHistory([]);
+                            }}
+                        />
+                    )}
+                </div>
                 </div>
 
             </main>

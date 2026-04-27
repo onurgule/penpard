@@ -67,6 +67,31 @@ function getLastScanOptions() {
     }
 }
 
+type ScanMode = 'exploratory' | 'scoped';
+type ScopedTargetType = 'request_scoped' | 'endpoint_scoped' | 'flow_scoped' | 'feature_scoped';
+
+function splitScopedList(value: string): string[] {
+    return value
+        .split(/\r?\n|,/)
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+}
+
+function buildScopedSelectedEndpoints(extractedEndpoints: any[] | null, selectedEndpointKeys: Set<string>) {
+    if (!extractedEndpoints || selectedEndpointKeys.size === 0) {
+        return [];
+    }
+
+    return extractedEndpoints
+        .filter((endpoint) => selectedEndpointKeys.has(`${endpoint.method}:${endpoint.path}`))
+        .map((endpoint) => ({
+            method: endpoint.method,
+            path: endpoint.path,
+            source: endpoint.source || 'unknown',
+            notes: endpoint.handler ? [String(endpoint.handler)] : [],
+        }));
+}
+
 export default function DashboardPage() {
     const router = useRouter();
     const { isAuthenticated, lock } = useAuthStore();
@@ -98,6 +123,15 @@ export default function DashboardPage() {
     const [extractedEndpoints, setExtractedEndpoints] = useState<any[] | null>(null);
     const [isExtracting, setIsExtracting] = useState(false);
     const [selectedEndpointKeys, setSelectedEndpointKeys] = useState<Set<string>>(new Set());
+    const [burpScanMode, setBurpScanMode] = useState<ScanMode>('exploratory');
+    const [burpScopedTargetType, setBurpScopedTargetType] = useState<ScopedTargetType>('request_scoped');
+    const [burpScopedTitle, setBurpScopedTitle] = useState('');
+    const [burpScopedFeatureDescription, setBurpScopedFeatureDescription] = useState('');
+    const [burpScopedGoal, setBurpScopedGoal] = useState('');
+    const [burpScopedOperatorNotes, setBurpScopedOperatorNotes] = useState('');
+    const [burpScopedRiskTags, setBurpScopedRiskTags] = useState('');
+    const [burpScopedBoundaryHints, setBurpScopedBoundaryHints] = useState('');
+    const [burpScopedOutOfScopeNotes, setBurpScopedOutOfScopeNotes] = useState('');
 
     useEffect(() => {
         if (!isAuthenticated) {
@@ -208,6 +242,15 @@ export default function DashboardPage() {
         setBurpOptions(getLastScanOptions());
         setExtractedEndpoints(null);
         setSelectedEndpointKeys(new Set());
+        setBurpScanMode('exploratory');
+        setBurpScopedTargetType('request_scoped');
+        setBurpScopedTitle('');
+        setBurpScopedFeatureDescription('');
+        setBurpScopedGoal('');
+        setBurpScopedOperatorNotes('');
+        setBurpScopedRiskTags('');
+        setBurpScopedBoundaryHints('');
+        setBurpScopedOutOfScopeNotes('');
         // Auto-select full source aware for Burp requests (single targeted endpoint)
         setSourceAnalysisMode('full_source_aware');
     };
@@ -217,10 +260,12 @@ export default function DashboardPage() {
         const token = useAuthStore.getState().token;
         if (!token) return;
         const { pendingId } = burpStartModal;
+        const selectedScopedEndpoints = buildScopedSelectedEndpoints(extractedEndpoints, selectedEndpointKeys);
         setStartingPendingId(pendingId);
         try {
             const formData = new FormData();
             formData.append('pendingId', pendingId);
+            formData.append('scanMode', burpScanMode);
             formData.append('iterations', String(burpOptions.iterations));
             formData.append('parallelAgents', String(burpOptions.parallelAgents));
             formData.append('rateLimit', String(burpOptions.rateLimit));
@@ -243,10 +288,26 @@ export default function DashboardPage() {
                 }
             }
 
-            // Pass selected target endpoints
-            if (extractedEndpoints && selectedEndpointKeys.size > 0) {
-                const selected = extractedEndpoints.filter(ep => selectedEndpointKeys.has(`${ep.method}:${ep.path}`));
-                formData.append('targetEndpoints', JSON.stringify(selected));
+            if (burpScanMode === 'exploratory' && selectedScopedEndpoints.length > 0) {
+                alert('Selected endpoints require Scoped Test Mode. Switch the launch mode to scoped or clear the endpoint selection.');
+                setStartingPendingId(null);
+                return;
+            }
+
+            if (burpScanMode === 'scoped') {
+                formData.append('focusedObjective', JSON.stringify({
+                    title: burpScopedTitle.trim(),
+                    scopeType: burpScopedTargetType,
+                    featureDescription: burpScopedFeatureDescription.trim(),
+                    goal: burpScopedGoal.trim(),
+                    operatorNotes: burpScopedOperatorNotes.trim(),
+                    riskTags: splitScopedList(burpScopedRiskTags),
+                }));
+                formData.append('scopeEnvelope', JSON.stringify({
+                    selectedEndpoints: selectedScopedEndpoints,
+                    boundaryHints: splitScopedList(burpScopedBoundaryHints),
+                    outOfScopeNotes: splitScopedList(burpScopedOutOfScopeNotes),
+                }));
             }
 
             const res = await fetch(`${API_URL}/scans/from-burp`, {
@@ -419,6 +480,154 @@ export default function DashboardPage() {
                                     />
                                     <p className="text-gray-500 text-xs mt-1">0 = default (model decides when to finish)</p>
                                 </div>
+
+                                <div>
+                                    <label className="block text-gray-400 text-sm mb-2">Launch Mode</label>
+                                    <div className="grid gap-3 md:grid-cols-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => setBurpScanMode('exploratory')}
+                                            disabled={!!startingPendingId}
+                                            className={`text-left rounded-lg border px-4 py-3 transition-colors ${
+                                                burpScanMode === 'exploratory'
+                                                    ? 'border-cyan-500/60 bg-cyan-500/10 text-white'
+                                                    : 'border-dark-600 bg-dark-900 text-gray-300 hover:border-cyan-500/30'
+                                            }`}
+                                        >
+                                            <div className="font-medium">Exploratory</div>
+                                            <div className="mt-1 text-xs text-gray-400">Use the existing broad Burp-centered startup and execution path without scoped persistence.</div>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setBurpScanMode('scoped')}
+                                            disabled={!!startingPendingId}
+                                            className={`text-left rounded-lg border px-4 py-3 transition-colors ${
+                                                burpScanMode === 'scoped'
+                                                    ? 'border-amber-500/60 bg-amber-500/10 text-white'
+                                                    : 'border-dark-600 bg-dark-900 text-gray-300 hover:border-amber-500/30'
+                                            }`}
+                                        >
+                                            <div className="font-medium">Scoped</div>
+                                            <div className="mt-1 text-xs text-gray-400">Persist a bounded mission, derive the scoped envelope, and then move straight into live exploratory-style execution.</div>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {burpScanMode === 'scoped' && (
+                                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+                                        <div className="flex items-center justify-between gap-4">
+                                            <div>
+                                                <h4 className="text-sm font-semibold text-white">Scoped Burp Launch</h4>
+                                                <p className="mt-1 text-xs text-gray-400">Burp-originated scoped launches default to request-scoped testing, preserve the baseline request server-side, and enter Mission Control as a live bounded mission.</p>
+                                            </div>
+                                            <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-[11px] font-medium uppercase tracking-wide text-amber-300">
+                                                Scoped
+                                            </span>
+                                        </div>
+
+                                        <div className="mt-4 grid gap-4 md:grid-cols-2">
+                                            <div>
+                                                <label className="block text-gray-400 text-sm mb-2">Scoped Target Type</label>
+                                                <select
+                                                    value={burpScopedTargetType}
+                                                    onChange={(e) => setBurpScopedTargetType(e.target.value as ScopedTargetType)}
+                                                    disabled={!!startingPendingId}
+                                                    className="input-field w-full"
+                                                >
+                                                    <option value="request_scoped">Request scoped</option>
+                                                    <option value="endpoint_scoped">Endpoint scoped</option>
+                                                    <option value="flow_scoped">Flow scoped</option>
+                                                    <option value="feature_scoped">Feature scoped</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="block text-gray-400 text-sm mb-2">Objective Title</label>
+                                                <input
+                                                    type="text"
+                                                    value={burpScopedTitle}
+                                                    onChange={(e) => setBurpScopedTitle(e.target.value)}
+                                                    disabled={!!startingPendingId}
+                                                    placeholder="Example: Replay checkout apply-coupon baseline"
+                                                    className="input-field w-full"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="mt-4">
+                                            <label className="block text-gray-400 text-sm mb-2">Feature or Change Description</label>
+                                            <textarea
+                                                value={burpScopedFeatureDescription}
+                                                onChange={(e) => setBurpScopedFeatureDescription(e.target.value)}
+                                                disabled={!!startingPendingId}
+                                                rows={2}
+                                                placeholder="Describe the specific request, endpoint family, or feature slice you want this Burp-seeded run to stay inside."
+                                                className="input-field w-full resize-y"
+                                            />
+                                        </div>
+
+                                        <div className="mt-4 grid gap-4 md:grid-cols-2">
+                                            <div>
+                                                <label className="block text-gray-400 text-sm mb-2">Goal</label>
+                                                <textarea
+                                                    value={burpScopedGoal}
+                                                    onChange={(e) => setBurpScopedGoal(e.target.value)}
+                                                    disabled={!!startingPendingId}
+                                                    rows={3}
+                                                    placeholder="What should PenPard validate inside this scope?"
+                                                    className="input-field w-full resize-y"
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className="block text-gray-400 text-sm mb-2">Operator Notes</label>
+                                                <textarea
+                                                    value={burpScopedOperatorNotes}
+                                                    onChange={(e) => setBurpScopedOperatorNotes(e.target.value)}
+                                                    disabled={!!startingPendingId}
+                                                    rows={3}
+                                                    placeholder="Extra operator context that should be persisted with the scoped run."
+                                                    className="input-field w-full resize-y"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="mt-4 grid gap-4 md:grid-cols-2">
+                                            <div>
+                                                <label className="block text-gray-400 text-sm mb-2">Focus / Risk Tags</label>
+                                                <input
+                                                    type="text"
+                                                    value={burpScopedRiskTags}
+                                                    onChange={(e) => setBurpScopedRiskTags(e.target.value)}
+                                                    disabled={!!startingPendingId}
+                                                    placeholder="idor, authz, checkout"
+                                                    className="input-field w-full"
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className="block text-gray-400 text-sm mb-2">Boundary Hints</label>
+                                                <textarea
+                                                    value={burpScopedBoundaryHints}
+                                                    onChange={(e) => setBurpScopedBoundaryHints(e.target.value)}
+                                                    disabled={!!startingPendingId}
+                                                    rows={3}
+                                                    placeholder={'Example:\nReplay only the captured buyer workflow\nAvoid unrelated admin surfaces'}
+                                                    className="input-field w-full resize-y"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="mt-4">
+                                            <label className="block text-gray-400 text-sm mb-2">Out-of-Scope Notes</label>
+                                            <textarea
+                                                value={burpScopedOutOfScopeNotes}
+                                                onChange={(e) => setBurpScopedOutOfScopeNotes(e.target.value)}
+                                                disabled={!!startingPendingId}
+                                                rows={2}
+                                                placeholder={'Example:\nDo not fuzz unrelated cart routes\nStay off administrative mutation paths'}
+                                                className="input-field w-full resize-y"
+                                            />
+                                        </div>
+                                    </div>
+                                )}
                             </div>
 
                             {/* Source Aware Additions */}
@@ -455,6 +664,99 @@ export default function DashboardPage() {
                                             disabled={!!startingPendingId}
                                         />
                                     </motion.div>
+                                )}
+
+                                {burpScanMode === 'scoped' && ((sourceType === 'local' && sourcePackagePath.trim()) || (sourceType === 'zip' && zipFile) || (sourceType === 'git' && gitUrl.trim())) && (
+                                    <div className="mt-4 rounded-lg border border-dark-600 bg-dark-900/60 p-4">
+                                        {!extractedEndpoints && (
+                                            <button
+                                                type="button"
+                                                onClick={handleExtractEndpoints}
+                                                disabled={isExtracting || !!startingPendingId}
+                                                className="btn btn-secondary w-full sm:w-auto"
+                                            >
+                                                {isExtracting ? 'Analyzing source...' : 'Extract Endpoints from Codebase'}
+                                            </button>
+                                        )}
+
+                                        {extractedEndpoints && (
+                                            <div>
+                                                <div className="mb-3 flex items-center justify-between gap-3 border-b border-dark-700 pb-2">
+                                                    <h5 className="text-sm font-semibold text-white">
+                                                        Scoped Endpoints <span className="ml-1 text-cyan-400">{selectedEndpointKeys.size}/{extractedEndpoints.length} selected</span>
+                                                    </h5>
+                                                    <div className="flex items-center gap-3 text-xs">
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setSelectedEndpointKeys(new Set(extractedEndpoints.map((ep) => `${ep.method}:${ep.path}`)))}
+                                                            className="text-cyan-400 hover:text-white"
+                                                        >
+                                                            All
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setSelectedEndpointKeys(new Set())}
+                                                            className="text-gray-400 hover:text-white"
+                                                        >
+                                                            None
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => { setExtractedEndpoints(null); setSelectedEndpointKeys(new Set()); }}
+                                                            className="text-gray-500 hover:text-white"
+                                                        >
+                                                            Clear
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                <div className="max-h-56 space-y-1 overflow-y-auto pr-1">
+                                                    {extractedEndpoints.map((endpoint, index) => {
+                                                        const key = `${endpoint.method}:${endpoint.path}`;
+                                                        const isSelected = selectedEndpointKeys.has(key);
+                                                        return (
+                                                            <label
+                                                                key={`${key}-${index}`}
+                                                                className={`flex items-center justify-between rounded border px-3 py-2 text-xs transition-colors ${
+                                                                    isSelected ? 'border-cyan-500/30 bg-cyan-500/10' : 'border-dark-700 bg-dark-900'
+                                                                }`}
+                                                            >
+                                                                <div className="flex min-w-0 items-center gap-3">
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked={isSelected}
+                                                                        onChange={() => {
+                                                                            const next = new Set(selectedEndpointKeys);
+                                                                            if (isSelected) {
+                                                                                next.delete(key);
+                                                                            } else {
+                                                                                next.add(key);
+                                                                            }
+                                                                            setSelectedEndpointKeys(next);
+                                                                        }}
+                                                                        className="accent-cyan-500"
+                                                                    />
+                                                                    <span className="rounded bg-dark-700 px-1.5 py-0.5 font-mono text-[11px] text-cyan-300">{endpoint.method}</span>
+                                                                    <span className="truncate font-mono text-gray-300">{endpoint.path}</span>
+                                                                </div>
+                                                                {endpoint.authRequired && (
+                                                                    <span className="rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase text-amber-300">
+                                                                        Auth
+                                                                    </span>
+                                                                )}
+                                                            </label>
+                                                        );
+                                                    })}
+                                                </div>
+
+                                                {selectedEndpointKeys.size > 0 && (
+                                                    <p className="mt-3 text-xs text-gray-500">
+                                                        Scoped launch will persist the selected endpoints in the scope envelope for this Burp-seeded run.
+                                                    </p>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
                                 )}
                             </div>
 
@@ -721,8 +1023,18 @@ export default function DashboardPage() {
                             {recentScans.map((scan) => (
                                 <a key={scan.id} href={`/scan/${scan.id}`}>
                                     <div className="flex items-center justify-between p-3 rounded-lg bg-dark-700/50 hover:bg-dark-700 border border-dark-600 transition-colors cursor-pointer group">
-                                        <div className="flex items-center gap-3">
-                                            <div className={`w-2 h-2 rounded-full ${scan.status === 'completed' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : scan.status === 'failed' ? 'bg-red-500' : 'bg-cyan-500 animate-pulse'}`} />
+                                    <div className="flex items-center gap-3">
+                                            <div className={`w-2 h-2 rounded-full ${
+                                                scan.status === 'completed' || scan.status === 'scoped_executed'
+                                                    ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]'
+                                                    : scan.status === 'failed'
+                                                        ? 'bg-red-500'
+                                                        : scan.status === 'awaiting_review'
+                                                            ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)]'
+                                                            : scan.status === 'scoped_executing'
+                                                                ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]'
+                                                            : 'bg-cyan-500 animate-pulse'
+                                            }`} />
                                             <div>
                                                 <p className="font-medium text-white group-hover:text-cyan-400 transition-colors truncate max-w-[200px] md:max-w-md">
                                                     {scan.target}
@@ -733,11 +1045,18 @@ export default function DashboardPage() {
                                             </div>
                                         </div>
                                         <div className="flex items-center gap-4">
-                                            <span className={`text-xs px-2 py-1 rounded font-medium ${scan.status === 'completed' ? 'bg-green-500/10 text-green-400' :
-                                                scan.status === 'failed' ? 'bg-red-500/10 text-red-400' :
-                                                    'bg-cyan-500/10 text-cyan-400'
-                                                }`}>
-                                                {scan.status.replace('_', ' ')}
+                                            <span className={`text-xs px-2 py-1 rounded font-medium ${
+                                                scan.status === 'completed' || scan.status === 'scoped_executed'
+                                                    ? 'bg-green-500/10 text-green-400'
+                                                    : scan.status === 'failed'
+                                                        ? 'bg-red-500/10 text-red-400'
+                                                        : scan.status === 'awaiting_review'
+                                                            ? 'bg-amber-500/10 text-amber-300'
+                                                            : scan.status === 'scoped_executing'
+                                                                ? 'bg-emerald-500/10 text-emerald-300'
+                                                            : 'bg-cyan-500/10 text-cyan-400'
+                                            }`}>
+                                                {scan.status === 'awaiting_review' ? 'legacy manual review' : scan.status.replace('_', ' ')}
                                             </span>
                                         </div>
                                     </div>

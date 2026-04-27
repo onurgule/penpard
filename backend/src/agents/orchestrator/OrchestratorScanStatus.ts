@@ -2,10 +2,22 @@ import { updateScanStatus } from '../../db/init';
 
 type ScanStatusWriter = (scanId: string, status: string, errorMessage?: string) => unknown;
 
+export interface OrchestratorScanStatusOverrides {
+    initializing?: string;
+    planning?: string;
+    testing?: string;
+    reporting?: string;
+    completed?: string;
+    failed?: string;
+    paused?: string;
+    stopped?: string;
+}
+
 export class OrchestratorScanStatus {
     constructor(
         private readonly scanId: string,
         private readonly writeStatus: ScanStatusWriter = updateScanStatus,
+        private readonly overrides: OrchestratorScanStatusOverrides = {},
     ) {}
 
     public set(status: string, errorMessage?: string): void {
@@ -13,34 +25,34 @@ export class OrchestratorScanStatus {
     }
 
     public initializing(): void {
-        this.set('initializing');
+        this.set(this.overrides.initializing || 'initializing');
     }
 
     public planning(): void {
-        this.set('planning');
+        this.set(this.overrides.planning || 'planning');
     }
 
     public testing(): void {
-        this.set('testing');
+        this.set(this.overrides.testing || 'testing');
     }
 
     public reporting(): void {
-        this.set('reporting');
+        this.set(this.overrides.reporting || 'reporting');
     }
 
     public completed(): void {
-        this.set('completed');
+        this.set(this.overrides.completed || 'completed');
     }
 
     public failed(errorMessage?: string): void {
-        this.set('failed', errorMessage);
+        this.set(this.overrides.failed || 'failed', errorMessage);
     }
 
     public paused(): void {
-        this.set('paused');
+        this.set(this.overrides.paused || 'paused');
     }
 
     public stopped(errorMessage?: string): void {
-        this.set('stopped', errorMessage);
+        this.set(this.overrides.stopped || 'stopped', errorMessage);
     }
 }

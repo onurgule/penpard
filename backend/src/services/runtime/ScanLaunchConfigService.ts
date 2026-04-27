@@ -1,6 +1,7 @@
 import { logger } from '../../utils/logger';
 import { defaultAuthStartupConfig, redactAuthStartupConfig, resolveAuthStartupConfig, toLegacyIdorUsers } from '../web-auth-startup-config';
 import type { WebScanRuntimeConfig } from './ScanRuntimeFactory';
+import { normalizeScanMode } from './ScopedScanTypes';
 
 type WarnFn = (message: string, meta?: Record<string, any>) => void;
 type MaybeBoolean = boolean | string | number | null | undefined;
@@ -11,6 +12,7 @@ export interface PreparedScanLaunch {
     scanMetadata: {
         sourcePackagePath?: string;
         sourceAnalysisMode?: string;
+        scanMode: 'exploratory' | 'scoped';
     };
     runtimeConfig: WebScanRuntimeConfig;
     persistedConfig: Record<string, any>;
@@ -18,6 +20,7 @@ export interface PreparedScanLaunch {
 
 export interface PrepareWebScanLaunchInput {
     userId: number;
+    scanMode?: unknown;
     rateLimit?: unknown;
     useNuclei?: unknown;
     useFfuf?: unknown;
@@ -38,6 +41,7 @@ export interface PrepareWebScanLaunchInput {
 export interface PrepareBurpScanLaunchInput {
     userId: number;
     initialRequest: string;
+    scanMode?: unknown;
     rateLimit?: unknown;
     parallelAgents?: unknown;
     scanInstructions?: unknown;
@@ -53,6 +57,7 @@ export class ScanLaunchConfigService {
     ) {}
 
     public prepareWebLaunch(input: PrepareWebScanLaunchInput): PreparedScanLaunch {
+        const scanMode = normalizeScanMode(input.scanMode);
         const requestedUseNuclei = this.normalizeBoolean(input.useNuclei);
         const requestedUseFfuf = this.normalizeBoolean(input.useFfuf);
         if (requestedUseNuclei) {
@@ -79,6 +84,7 @@ export class ScanLaunchConfigService {
             : legacyIdorUsers;
 
         const runtimeConfig: WebScanRuntimeConfig = {
+            scanMode,
             userId: input.userId,
             rateLimit: this.resolvePositiveNumber(input.rateLimit, 5),
             useNuclei: false,
@@ -99,7 +105,9 @@ export class ScanLaunchConfigService {
     }
 
     public prepareBurpLaunch(input: PrepareBurpScanLaunchInput): PreparedScanLaunch {
+        const scanMode = normalizeScanMode(input.scanMode);
         const runtimeConfig: WebScanRuntimeConfig = {
+            scanMode,
             userId: input.userId,
             rateLimit: this.resolvePositiveNumber(input.rateLimit, 5),
             useNuclei: false,
@@ -128,12 +136,14 @@ export class ScanLaunchConfigService {
 
         return {
             scanMetadata: {
+                scanMode: runtimeConfig.scanMode || 'exploratory',
                 sourcePackagePath: runtimeConfig.sourcePackagePath,
                 sourceAnalysisMode: runtimeConfig.sourceAnalysisMode,
             },
             runtimeConfig,
             persistedConfig: {
                 ...runtimeConfig,
+                scanMode: runtimeConfig.scanMode || 'exploratory',
                 effectiveParallelAgents: 1,
                 executionMode: 'single-agent',
                 idorUsers: safeLegacyUsers,

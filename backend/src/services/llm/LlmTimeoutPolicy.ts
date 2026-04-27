@@ -10,6 +10,10 @@ import type {
 const CRITICAL_CALL_SITES = new Set<LlmCallSite>([
     'plan_creation',
     'replan_check',
+    'focused_test_planning',
+    'focused_test_execution',
+    'focused_test_verdict',
+    'focused_test_investigation',
     'step_execution_reasoning',
     'instruction_analysis',
 ]);

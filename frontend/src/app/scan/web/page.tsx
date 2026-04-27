@@ -1,30 +1,31 @@
 'use client';
 
-import {
-    useState, useEffect
-} from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { motion } from 'framer-motion';
 import Link from 'next/link';
 import axios from 'axios';
+import { motion } from 'framer-motion';
 import toast from 'react-hot-toast';
 import {
     ArrowLeft,
-    Globe,
-    Search,
-    Shield,
-    Loader2,
     CheckCircle,
-    XCircle,
     Download,
-    Zap,
+    Globe,
+    Loader2,
+    Shield,
+    XCircle,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
-import SourceModeSelector, { SourceMode } from '@/components/SourceModeSelector';
-import SourceProviderInput, { SourceType } from '@/components/SourceProviderInput';
-import { FolderOpen } from 'lucide-react';
+import SourceModeSelector, { type SourceMode } from '@/components/SourceModeSelector';
+import SourceProviderInput, { type SourceType } from '@/components/SourceProviderInput';
+import {
+    buildScopedSecurityTestRequest,
+    createDefaultScopedRequestIntake,
+    type ScopedRequestIntakeFormValues,
+    validateScopedRequestIntake,
+} from './scoped-request-intake';
 
 const SOURCE_ANALYSIS_MODES: SourceMode[] = [
     {
@@ -32,8 +33,8 @@ const SOURCE_ANALYSIS_MODES: SourceMode[] = [
         title: 'Version Aware',
         description: [
             'Lightweight source intelligence',
-            'Dependency/version/CVE-aware testing',
-            'Lower token cost',
+            'Dependency and CVE-aware enrichment',
+            'Good default for most launches',
         ],
         tokenCost: 'low',
         icon: 'zap',
@@ -42,9 +43,9 @@ const SOURCE_ANALYSIS_MODES: SourceMode[] = [
         id: 'full_source_aware',
         title: 'Full Source Aware',
         description: [
-            'Deep code understanding',
-            'Function/endpoint/flow-aware testing',
-            'Higher token cost, richer analysis',
+            'Deeper route and flow awareness',
+            'Richer security hints from source',
+            'Higher token cost',
         ],
         tokenCost: 'high',
         icon: 'brain',
@@ -53,31 +54,7 @@ const SOURCE_ANALYSIS_MODES: SourceMode[] = [
 
 const SCAN_OPTIONS_KEY = 'penpard-scan-options';
 
-function getDefaultScanOptions() {
-    if (typeof window === 'undefined') return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
-    try {
-        const s = localStorage.getItem(SCAN_OPTIONS_KEY);
-        if (!s) return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
-        const o = JSON.parse(s);
-        return {
-            iterations: Math.max(10, Math.min(500, Number(o.iterations) || 50)),
-            parallelAgents: Math.max(1, Math.min(10, Number(o.parallelAgents) || 1)),
-            rateLimit: Number(o.rateLimit) || 5,
-            maxPlanRounds: Math.max(0, Math.min(99, Number(o.maxPlanRounds) ?? 0)),
-        };
-    } catch {
-        return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
-    }
-}
-
-interface ScanStatus {
-    id: string | null;
-    status: 'idle' | 'validating' | 'scanning' | 'analyzing' | 'complete' | 'error';
-    message: string;
-    progress: number;
-    vulnerabilities: any[];
-}
-
+type ScanMode = 'exploratory' | 'scoped';
 type AuthStartupMode = 'no_credentials' | 'provided_credentials';
 type CredentialPrivilege = 'low' | 'high' | 'unknown';
 
@@ -88,6 +65,31 @@ interface StartupCredentialRow {
     role: string;
     privilege: CredentialPrivilege;
     label: string;
+}
+
+interface ScanStatus {
+    id: string | null;
+    status: 'idle' | 'validating' | 'scanning' | 'analyzing' | 'complete' | 'error';
+    message: string;
+    progress: number;
+    vulnerabilities: any[];
+}
+
+function getDefaultScanOptions() {
+    if (typeof window === 'undefined') return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+    try {
+        const raw = localStorage.getItem(SCAN_OPTIONS_KEY);
+        if (!raw) return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+        const parsed = JSON.parse(raw);
+        return {
+            iterations: Math.max(10, Math.min(500, Number(parsed.iterations) || 50)),
+            parallelAgents: Math.max(1, Math.min(10, Number(parsed.parallelAgents) || 1)),
+            rateLimit: Number(parsed.rateLimit) || 5,
+            maxPlanRounds: Math.max(0, Math.min(99, Number(parsed.maxPlanRounds) || 0)),
+        };
+    } catch {
+        return { iterations: 50, parallelAgents: 1, rateLimit: 5, maxPlanRounds: 0 };
+    }
 }
 
 function createEmptyCredentialRow(): StartupCredentialRow {
@@ -101,40 +103,50 @@ function createEmptyCredentialRow(): StartupCredentialRow {
     };
 }
 
+function getSeverityClass(severity: string) {
+    switch (String(severity || '').toLowerCase()) {
+        case 'critical':
+            return 'px-2 py-0.5 rounded text-xs font-semibold border border-red-500/30 bg-red-500/10 text-red-300';
+        case 'high':
+            return 'px-2 py-0.5 rounded text-xs font-semibold border border-orange-500/30 bg-orange-500/10 text-orange-300';
+        case 'medium':
+            return 'px-2 py-0.5 rounded text-xs font-semibold border border-amber-500/30 bg-amber-500/10 text-amber-300';
+        default:
+            return 'px-2 py-0.5 rounded text-xs font-semibold border border-cyan-500/30 bg-cyan-500/10 text-cyan-300';
+    }
+}
+
+function normalizeUrlInput(url: string): string {
+    return url.startsWith('http') ? url : `https://${url}`;
+}
+
 export default function WebScanPage() {
     const router = useRouter();
     const { isAuthenticated } = useAuthStore();
 
     const [targetUrl, setTargetUrl] = useState('');
     const [scanInstructions, setScanInstructions] = useState('');
+    const [scanMode, setScanMode] = useState<ScanMode>('exploratory');
+    const [scopedRequest, setScopedRequest] = useState<ScopedRequestIntakeFormValues>(createDefaultScopedRequestIntake());
     const [sessionCookies, setSessionCookies] = useState('');
     const [authStartupMode, setAuthStartupMode] = useState<AuthStartupMode>('no_credentials');
     const [allowAccountCreation, setAllowAccountCreation] = useState(false);
     const [preferSharedPassword, setPreferSharedPassword] = useState(true);
+    const [userAccounts, setUserAccounts] = useState<StartupCredentialRow[]>([createEmptyCredentialRow()]);
     const [rateLimit, setRateLimit] = useState(() => getDefaultScanOptions().rateLimit);
     const [parallelAgents, setParallelAgents] = useState(() => getDefaultScanOptions().parallelAgents);
     const [iterations, setIterations] = useState(() => getDefaultScanOptions().iterations);
     const [maxPlanRounds, setMaxPlanRounds] = useState(() => getDefaultScanOptions().maxPlanRounds);
-    const [userAccounts, setUserAccounts] = useState<StartupCredentialRow[]>([createEmptyCredentialRow()]);
     const [sourcePackagePath, setSourcePackagePath] = useState('');
     const [sourceAnalysisMode, setSourceAnalysisMode] = useState<string | null>(null);
     const [sourceType, setSourceType] = useState<SourceType>('local');
     const [zipFile, setZipFile] = useState<File | null>(null);
     const [gitUrl, setGitUrl] = useState('');
     const [gitToken, setGitToken] = useState('');
-    const [reportModalOpen, setReportModalOpen] = useState(false);
     const [externalTools, setExternalTools] = useState({
         nuclei: false,
         ffuf: false,
     });
-    const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'agent', content: string }[]>([]);
-    const [chatInput, setChatInput] = useState('');
-    const [extractedEndpoints, setExtractedEndpoints] = useState<any[] | null>(null);
-    const [isExtracting, setIsExtracting] = useState(false);
-    const [selectedEndpointKeys, setSelectedEndpointKeys] = useState<Set<string>>(new Set());
-    const [isDeepScanning, setIsDeepScanning] = useState(false);
-    const [endpointFilter, setEndpointFilter] = useState<'all' | 'static' | 'ai'>('all');
-
     const [scanStatus, setScanStatus] = useState<ScanStatus>({
         id: null,
         status: 'idle',
@@ -142,126 +154,62 @@ export default function WebScanPage() {
         progress: 0,
         vulnerabilities: [],
     });
+    const [reportModalOpen, setReportModalOpen] = useState(false);
 
     useEffect(() => {
         if (!isAuthenticated) {
             router.push('/');
-            return;
         }
     }, [isAuthenticated, router]);
 
+    const isScanning = scanStatus.status === 'validating' || scanStatus.status === 'scanning' || scanStatus.status === 'analyzing';
+
     const validateUrl = (url: string) => {
         try {
-            new URL(url.startsWith('http') ? url : `https://${url}`);
+            new URL(normalizeUrlInput(url));
             return true;
         } catch {
             return false;
         }
     };
 
-    const handleExtractEndpoints = async () => {
-        setIsExtracting(true);
-        setExtractedEndpoints(null);
-
-        const formData = new FormData();
-        formData.append('sourceType', sourceType);
-        if (sourceType === 'local') {
-            formData.append('sourcePackagePath', String(sourcePackagePath).trim());
-        } else if (sourceType === 'zip' && zipFile) {
-            formData.append('sourceZip', zipFile);
-        } else if (sourceType === 'git') {
-            formData.append('sourceGitUrl', String(gitUrl).trim());
-            if (gitToken?.trim()) formData.append('sourceGitToken', String(gitToken).trim());
-        }
-
-        try {
-            const res = await fetch(`${API_URL}/scans/extract-endpoints`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${useAuthStore.getState().token}` },
-                body: formData,
-            });
-            const data = await res.json();
-            if (data.endpoints) {
-                const tagged = data.endpoints.map((ep: any) => ({ ...ep, source: 'static' }));
-                setExtractedEndpoints(tagged);
-                setSelectedEndpointKeys(new Set(tagged.map((ep: any) => `${ep.method}:${ep.path}`)));
-                setEndpointFilter('all');
-                toast.success(`Extracted ${tagged.length} backend endpoints`);
-            } else {
-                toast.error(data.message || 'Failed to extract endpoints');
-            }
-        } catch (e: any) {
-            toast.error(e.message || 'Error executing request');
-        } finally {
-            setIsExtracting(false);
-        }
+    const handleCredentialChange = (index: number, field: keyof StartupCredentialRow, value: string) => {
+        setUserAccounts((current) => current.map((account, accountIndex) => (
+            accountIndex === index
+                ? { ...account, [field]: value }
+                : account
+        )));
     };
 
-    const handleDeepScanAI = async () => {
-        if (!extractedEndpoints) return;
-        setIsDeepScanning(true);
+    const handleAddCredential = () => {
+        setUserAccounts((current) => [...current, createEmptyCredentialRow()]);
+    };
 
-        const formData = new FormData();
-        formData.append('sourceType', sourceType);
-        if (sourceType === 'local') {
-            formData.append('sourcePackagePath', String(sourcePackagePath).trim());
-        } else if (sourceType === 'zip' && zipFile) {
-            formData.append('sourceZip', zipFile);
-        } else if (sourceType === 'git') {
-            formData.append('sourceGitUrl', String(gitUrl).trim());
-            if (gitToken?.trim()) formData.append('sourceGitToken', String(gitToken).trim());
-        }
-        formData.append('existingRoutes', JSON.stringify(extractedEndpoints));
-
-        try {
-            const res = await fetch(`${API_URL}/scans/extract-endpoints-ai`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${useAuthStore.getState().token}` },
-                body: formData,
-            });
-            const data = await res.json();
-            if (data.endpoints && data.endpoints.length > 0) {
-                const taggedAi = data.endpoints.map((ep: any) => ({ ...ep, source: 'ai' }));
-                // Deduplicate AI results against existing endpoints
-                const existingKeys = new Set(extractedEndpoints.map((ep: any) => `${ep.method}:${ep.path}`));
-                const uniqueAi = taggedAi.filter((ep: any) => {
-                    const key = `${ep.method}:${ep.path}`;
-                    if (existingKeys.has(key)) return false;
-                    existingKeys.add(key);
-                    return true;
-                });
-                if (uniqueAi.length > 0) {
-                    const merged = [...extractedEndpoints, ...uniqueAi];
-                    setExtractedEndpoints(merged);
-                    const newKeys = new Set(selectedEndpointKeys);
-                    uniqueAi.forEach((ep: any) => newKeys.add(`${ep.method}:${ep.path}`));
-                    setSelectedEndpointKeys(newKeys);
-                    toast.success(`AI discovered ${uniqueAi.length} additional dynamic route${uniqueAi.length !== 1 ? 's' : ''}`);
-                } else {
-                    toast.success('AI analysis complete — all found routes were already in the list');
-                }
-            } else {
-                toast.success('AI analysis complete — no additional dynamic routes found');
-            }
-        } catch (e: any) {
-            toast.error(e.message || 'AI deep scan failed');
-        } finally {
-            setIsDeepScanning(false);
-        }
+    const handleRemoveCredential = (index: number) => {
+        setUserAccounts((current) => current.length === 1
+            ? [createEmptyCredentialRow()]
+            : current.filter((_, accountIndex) => accountIndex !== index));
     };
 
     const handleStartScan = async () => {
-        if (!targetUrl) {
-            toast.error('Please enter a target URL');
+        if (!targetUrl.trim()) {
+            toast.error('Please enter a target URL.');
             return;
         }
-
         if (!validateUrl(targetUrl)) {
-            toast.error('Invalid URL format');
+            toast.error('Invalid URL format.');
             return;
         }
 
-        const fullUrl = targetUrl.startsWith('http') ? targetUrl : `https://${targetUrl}`;
+        const normalizedTargetUrl = normalizeUrlInput(targetUrl.trim());
+        if (scanMode === 'scoped') {
+            const validationError = validateScopedRequestIntake(normalizedTargetUrl, scopedRequest);
+            if (validationError) {
+                toast.error(validationError);
+                return;
+            }
+        }
+
         const providedCredentials = userAccounts
             .map((account) => ({
                 username: account.username.trim(),
@@ -272,42 +220,45 @@ export default function WebScanPage() {
                 label: account.label.trim(),
             }))
             .filter((account) => (account.username || account.email) && account.password.trim());
-        const startupCredentials = authStartupMode === 'provided_credentials' ? providedCredentials : [];
 
-        if (authStartupMode === 'provided_credentials' && startupCredentials.length === 0) {
-            toast.error('Add at least one username/email and password for "Start with provided credentials".');
+        if (scanMode !== 'scoped' && authStartupMode === 'provided_credentials' && providedCredentials.length === 0) {
+            toast.error('Add at least one username/email and password for provided-credential startup.');
             return;
         }
 
         setScanStatus({
             id: null,
             status: 'validating',
-            message: 'Validating target and whitelist...',
+            message: scanMode === 'scoped'
+                ? 'Persisting request intake and preparing bounded feature discovery...'
+                : 'Validating target and launching exploratory runtime...',
             progress: 10,
             vulnerabilities: [],
         });
 
         try {
-            // Start the scan
             const formData = new FormData();
-            formData.append('url', fullUrl);
+            formData.append('url', normalizedTargetUrl);
+            formData.append('scanMode', scanMode);
             formData.append('rateLimit', String(rateLimit));
             formData.append('parallelAgents', String(parallelAgents));
             formData.append('iterations', String(iterations));
             formData.append('maxPlanRounds', String(maxPlanRounds));
             formData.append('useNuclei', String(externalTools.nuclei));
             formData.append('useFfuf', String(externalTools.ffuf));
-            formData.append('authStartupMode', authStartupMode);
-            formData.append('authCredentials', JSON.stringify(startupCredentials));
-            formData.append('allowAccountCreation', String(allowAccountCreation));
-            formData.append('preferSharedPassword', String(preferSharedPassword));
-            formData.append('idorUsers', JSON.stringify(startupCredentials));
             if (scanInstructions.trim()) formData.append('scanInstructions', scanInstructions.trim());
-            if (sessionCookies.trim()) formData.append('sessionCookies', sessionCookies.trim());
+            if (scanMode !== 'scoped') {
+                formData.append('authStartupMode', authStartupMode);
+                formData.append('authCredentials', JSON.stringify(authStartupMode === 'provided_credentials' ? providedCredentials : []));
+                formData.append('allowAccountCreation', String(allowAccountCreation));
+                formData.append('preferSharedPassword', String(preferSharedPassword));
+                formData.append('idorUsers', JSON.stringify(authStartupMode === 'provided_credentials' ? providedCredentials : []));
+                if (sessionCookies.trim()) formData.append('sessionCookies', sessionCookies.trim());
+            }
 
-            const wantsSource = (sourceType === 'local' && sourcePackagePath.trim()) || 
-                                (sourceType === 'zip' && zipFile) || 
-                                (sourceType === 'git' && gitUrl.trim());
+            const wantsSource = (sourceType === 'local' && sourcePackagePath.trim())
+                || (sourceType === 'zip' && zipFile)
+                || (sourceType === 'git' && gitUrl.trim());
 
             if (wantsSource && sourceAnalysisMode) {
                 formData.append('sourceAnalysisMode', sourceAnalysisMode);
@@ -322,10 +273,10 @@ export default function WebScanPage() {
                 }
             }
 
-            // Pass selected endpoints to the scan
-            if (extractedEndpoints && selectedEndpointKeys.size > 0) {
-                const selected = extractedEndpoints.filter(ep => selectedEndpointKeys.has(`${ep.method}:${ep.path}`));
-                formData.append('targetEndpoints', JSON.stringify(selected));
+            if (scanMode === 'scoped') {
+                formData.append('securityTestRequest', JSON.stringify(
+                    buildScopedSecurityTestRequest(normalizedTargetUrl, scopedRequest),
+                ));
             }
 
             if (typeof window !== 'undefined') {
@@ -336,23 +287,25 @@ export default function WebScanPage() {
                         rateLimit,
                         maxPlanRounds,
                     }));
-                } catch { /* ignore */ }
-            }
-            const response = await axios.post(`${API_URL}/scans/web`, formData, {
-                headers: { 
-                    Authorization: `Bearer ${useAuthStore.getState().token}`,
-                    'Content-Type': 'multipart/form-data'
+                } catch {
+                    // ignore
                 }
+            }
+
+            const response = await axios.post(`${API_URL}/scans/web`, formData, {
+                headers: {
+                    Authorization: `Bearer ${useAuthStore.getState().token}`,
+                    'Content-Type': 'multipart/form-data',
+                },
             });
 
             const { scanId } = response.data;
-
-            toast.success('Scan initiated! Redirecting to Mission Control...');
-            // Use full navigation for dynamic routes (static export compatibility)
+            toast.success(scanMode === 'scoped'
+                ? 'Scoped mission accepted. Mission Control will show bounded discovery and then live execution.'
+                : 'Scan initiated. Redirecting to Mission Control...');
             window.location.href = `/scan/${scanId}`;
-
         } catch (error: any) {
-            const message = error.response?.data?.message || 'Failed to start scan';
+            const message = error.response?.data?.message || 'Failed to start scan.';
             setScanStatus({
                 id: null,
                 status: 'error',
@@ -364,728 +317,589 @@ export default function WebScanPage() {
         }
     };
 
-    const pollScanStatus = async (scanId: string) => {
-        let attempts = 0;
-        const maxAttempts = 60; // 5 minutes max
-
-        const poll = async () => {
-            try {
-                const response = await axios.get(`${API_URL}/scans/${scanId}`);
-                const { status, vulnerabilities, message } = response.data;
-
-                if (status === 'completed') {
-                    setScanStatus({
-                        id: scanId,
-                        status: 'complete',
-                        message: 'Scan completed successfully!',
-                        progress: 100,
-                        vulnerabilities: vulnerabilities || [],
-                    });
-                    toast.success('Scan completed!');
-                    return;
-                }
-
-                if (status === 'failed') {
-                    setScanStatus({
-                        id: scanId,
-                        status: 'error',
-                        message: message || 'Scan failed',
-                        progress: 0,
-                        vulnerabilities: [],
-                    });
-                    toast.error('Scan failed');
-                    return;
-                }
-
-                // Update progress
-                const progressMap: Record<string, number> = {
-                    queued: 15,
-                    crawling: 30,
-                    auditing: 50,
-                    analyzing: 75,
-                    reporting: 90,
-                };
-
-                setScanStatus((prev) => ({
-                    ...prev,
-                    status: 'scanning',
-                    message: `Status: ${status}`,
-                    progress: progressMap[status] || prev.progress,
-                }));
-
-                attempts++;
-                if (attempts < maxAttempts) {
-                    setTimeout(poll, 5000);
-                } else {
-                    setScanStatus((prev) => ({
-                        ...prev,
-                        status: 'error',
-                        message: 'Scan timed out',
-                    }));
-                }
-            } catch (error) {
-                console.error('Poll error:', error);
-                attempts++;
-                if (attempts < maxAttempts) {
-                    setTimeout(poll, 5000);
-                }
-            }
-        };
-
-        poll();
-    };
-
     const getStatusIcon = () => {
-        switch (scanStatus.status) {
-            case 'scanning':
-            case 'validating':
-            case 'analyzing':
-                return <Loader2 className="w-6 h-6 text-cyan-400 animate-spin" />;
-            case 'complete':
-                return <CheckCircle className="w-6 h-6 text-green-400" />;
-            case 'error':
-                return <XCircle className="w-6 h-6 text-red-400" />;
-            default:
-                return <Search className="w-6 h-6 text-gray-400" />;
+        if (scanStatus.status === 'error') {
+            return <XCircle className="w-6 h-6 text-red-400" />;
         }
-    };
-
-    const getSeverityClass = (severity: string) => {
-        switch (severity.toLowerCase()) {
-            case 'critical':
-                return 'severity-critical';
-            case 'high':
-                return 'severity-high';
-            case 'medium':
-                return 'severity-medium';
-            case 'low':
-                return 'severity-low';
-            default:
-                return 'severity-info';
+        if (scanStatus.status === 'complete') {
+            return <CheckCircle className="w-6 h-6 text-green-400" />;
         }
+        return <Loader2 className="w-6 h-6 text-cyan-400 animate-spin" />;
     };
-
-    const isScanning = ['validating', 'scanning', 'analyzing'].includes(scanStatus.status);
 
     return (
-        <div className="min-h-screen">
-            {/* Header */}
-            <header className="glass-darker border-b border-dark-600/50 sticky top-10 z-40">
-                <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
-                    <Link
-                        href="/dashboard"
-                        className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors"
-                    >
-                        <ArrowLeft className="w-5 h-5" />
-                        <span>Back to Dashboard</span>
-                    </Link>
-                </div>
-            </header>
-
-            {/* Main Content */}
-            <main className="max-w-4xl mx-auto px-4 py-8">
-                {/* Title */}
-                <div className="text-center mb-8">
-                    <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gradient-to-br from-cyan-500/20 to-blue-500/20 border border-cyan-500/30 mb-4">
-                        <Globe className="w-8 h-8 text-cyan-400" />
+        <div className="min-h-screen bg-dark-950 text-white">
+            <main className="max-w-6xl mx-auto px-4 py-8">
+                <div className="flex items-center justify-between gap-4 mb-8">
+                    <div>
+                        <Link href="/dashboard" className="inline-flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
+                            <ArrowLeft className="w-4 h-4" />
+                            Back to Dashboard
+                        </Link>
+                        <h1 className="text-3xl font-bold mt-3">Start Web Scan</h1>
+                        <p className="text-gray-400 mt-2 max-w-3xl">
+                            Exploratory mode stays unchanged. Scoped Test Mode now starts from a structured security testing request, with the target URL and description as the core required inputs.
+                        </p>
                     </div>
-                    <h1 className="text-3xl font-bold text-white mb-2">Web Application Scan</h1>
-                    <p className="text-gray-400">Enter a target URL to begin vulnerability analysis</p>
                 </div>
 
-                {/* URL Input - Minimalist PenPard Style */}
-                <motion.div
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="card p-6 mb-8"
-                >
-                    <div className="relative">
-                        <input
-                            type="text"
-                            value={targetUrl}
-                            onChange={(e) => setTargetUrl(e.target.value)}
-                            placeholder="Enter target URL (e.g., example.com)"
-                            disabled={isScanning}
-                            className="w-full px-6 py-4 bg-dark-900 border-2 border-dark-600 rounded-xl text-white text-lg terminal-text placeholder-gray-500 focus:outline-none focus:border-cyan-500/50 transition-colors disabled:opacity-50"
-                            onKeyDown={(e) => e.key === 'Enter' && !isScanning && handleStartScan()}
-                        />
-
-                        <button
-                            onClick={handleStartScan}
-                            disabled={isScanning}
-                            className="absolute right-2 top-1/2 -translate-y-1/2 px-6 py-2 bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-semibold rounded-lg transition-all hover:from-cyan-400 hover:to-blue-400 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                <div className="grid gap-6 lg:grid-cols-[1.25fr,0.75fr]">
+                    <div className="space-y-6">
+                        <motion.section
+                            initial={{ opacity: 0, y: 12 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card p-6 space-y-6"
                         >
-                            {isScanning ? (
-                                <>
-                                    <Loader2 className="w-5 h-5 animate-spin" />
-                                    <span>Scanning...</span>
-                                </>
-                            ) : (
-                                <>
-                                    <Search className="w-5 h-5" />
-                                    <span>Scan</span>
-                                </>
-                            )}
-                        </button>
-                    </div>
-
-                    {/* Scan Instructions */}
-                    <div className="mt-4">
-                        <label className="block text-gray-400 text-sm mb-2">Scan Instructions <span className="text-gray-600">(optional)</span></label>
-                        <textarea
-                            value={scanInstructions}
-                            onChange={(e) => setScanInstructions(e.target.value)}
-                            placeholder='Guide the AI scanner, e.g. "Focus only on /admin endpoints" or "Test the login form for SQLi" or "Check IDOR on /api/users/{id}"'
-                            disabled={isScanning}
-                            rows={3}
-                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-lg text-white text-sm placeholder-gray-600 focus:outline-none focus:border-cyan-500/50 transition-colors disabled:opacity-50 resize-y"
-                        />
-                    </div>
-
-                    <div className="mt-4">
-                        <label className="block text-gray-400 text-sm mb-3">Auth Startup Mode</label>
-                        <div className="grid gap-3 md:grid-cols-2">
-                            <button
-                                type="button"
-                                disabled={isScanning}
-                                onClick={() => setAuthStartupMode('no_credentials')}
-                                className={`text-left rounded-lg border px-4 py-3 transition-colors ${
-                                    authStartupMode === 'no_credentials'
-                                        ? 'border-cyan-500/60 bg-cyan-500/10 text-white'
-                                        : 'border-dark-600 bg-dark-900 text-gray-300 hover:border-cyan-500/30'
-                                }`}
-                            >
-                                <div className="font-medium">Start without credentials</div>
-                                <div className="mt-1 text-xs text-gray-400">PenPard begins with browser-first discovery of login, register, reset, SSO, MFA, onboarding, and recovery surfaces.</div>
-                            </button>
-                            <button
-                                type="button"
-                                disabled={isScanning}
-                                onClick={() => setAuthStartupMode('provided_credentials')}
-                                className={`text-left rounded-lg border px-4 py-3 transition-colors ${
-                                    authStartupMode === 'provided_credentials'
-                                        ? 'border-cyan-500/60 bg-cyan-500/10 text-white'
-                                        : 'border-dark-600 bg-dark-900 text-gray-300 hover:border-cyan-500/30'
-                                }`}
-                            >
-                                <div className="font-medium">Start with provided credentials</div>
-                                <div className="mt-1 text-xs text-gray-400">PenPard still locates the auth entry point in-browser first, then signs in and captures the real session transport from browser and Burp evidence.</div>
-                            </button>
-                        </div>
-                    </div>
-
-                    <div className="mt-4 grid gap-3 md:grid-cols-2">
-                        <label className="flex items-start gap-3 rounded-lg border border-dark-600 bg-dark-900 px-4 py-3 text-sm text-gray-300">
-                            <input
-                                type="checkbox"
-                                checked={allowAccountCreation}
-                                onChange={(e) => setAllowAccountCreation(e.target.checked)}
-                                disabled={isScanning}
-                                className="mt-0.5"
-                            />
-                            <span>
-                                <span className="block font-medium text-white">Allow account creation</span>
-                                <span className="mt-1 block text-xs text-gray-400">If registration or onboarding is available, PenPard may create test accounts during startup and preserve them for later authz testing.</span>
-                            </span>
-                        </label>
-                        <label className="flex items-start gap-3 rounded-lg border border-dark-600 bg-dark-900 px-4 py-3 text-sm text-gray-300">
-                            <input
-                                type="checkbox"
-                                checked={preferSharedPassword}
-                                onChange={(e) => setPreferSharedPassword(e.target.checked)}
-                                disabled={isScanning}
-                                className="mt-0.5"
-                            />
-                            <span>
-                                <span className="block font-medium text-white">Prefer shared password for generated users</span>
-                                <span className="mt-1 block text-xs text-gray-400">When PenPard creates multiple accounts, it reuses one password unless the target blocks that pattern.</span>
-                            </span>
-                        </label>
-                    </div>
-
-                    {/* Authenticated testing tip */}
-                    <div className="mt-4 p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-sm text-gray-300">
-                        <strong className="text-cyan-400">Browser-first auth startup:</strong> PenPard launches its Burp-proxied browser before normal planning, inventories auth routes/forms/buttons, correlates the resulting traffic, and captures reusable session state. Paste cookies below only if you already have a known session you want to seed.
-                    </div>
-
-                    {/* Session cookies (authenticated testing, e.g. Google login) */}
-                    <div className="mt-4">
-                        <label className="block text-gray-400 text-sm mb-2">Session cookies <span className="text-gray-600">(optional)</span></label>
-                        <textarea
-                            value={sessionCookies}
-                            onChange={(e) => setSessionCookies(e.target.value)}
-                            placeholder='Paste Cookie header from browser/Burp after logging in (e.g. Google). Or leave empty: agent will use cookies from Burp proxy history (newest first).'
-                            disabled={isScanning}
-                            rows={2}
-                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-lg text-white text-sm placeholder-gray-600 focus:outline-none focus:border-cyan-500/50 transition-colors disabled:opacity-50 resize-y font-mono"
-                        />
-                    </div>
-                </motion.div>
-
-                {/* Advanced Configuration */}
-                {scanStatus.status === 'idle' && (
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.1 }}
-                        className="card p-6 mb-8 space-y-6"
-                    >
-                        <h3 className="text-lg font-semibold text-white border-b border-dark-600 pb-2">Scan Configuration</h3>
-
-                        {/* Rate Limit */}
-                        <div>
-                            <label className="block text-gray-400 text-sm mb-2">
-                                Rate Limit: <span className="text-cyan-400 font-bold">{rateLimit} req/sec</span>
-                            </label>
-                            <div className="flex items-center gap-4">
-                                <input
-                                    type="range"
-                                    value={rateLimit}
-                                    onChange={(e) => setRateLimit(parseInt(e.target.value))}
-                                    min="1"
-                                    max="30"
-                                    step="1"
-                                    className="flex-1 h-2 bg-dark-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                                />
-                                <div className="flex gap-2">
-                                    <button
-                                        type="button"
-                                        onClick={() => setRateLimit(2)}
-                                        className={`px-2 py-1 text-xs rounded ${rateLimit === 2 ? 'bg-cyan-500 text-white' : 'bg-dark-700 text-gray-400'}`}
-                                    >
-                                        Stealth
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => setRateLimit(5)}
-                                        className={`px-2 py-1 text-xs rounded ${rateLimit === 5 ? 'bg-cyan-500 text-white' : 'bg-dark-700 text-gray-400'}`}
-                                    >
-                                        Normal
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => setRateLimit(15)}
-                                        className={`px-2 py-1 text-xs rounded ${rateLimit === 15 ? 'bg-amber-500 text-white' : 'bg-dark-700 text-gray-400'}`}
-                                    >
-                                        Fast
-                                    </button>
+                            <div className="grid gap-5 md:grid-cols-2">
+                                <div className="md:col-span-2">
+                                    <label className="block text-sm text-gray-300 mb-2">Target URL</label>
+                                    <div className="relative">
+                                        <Globe className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-cyan-400" />
+                                        <input
+                                            type="text"
+                                            value={targetUrl}
+                                            onChange={(event) => setTargetUrl(event.target.value)}
+                                            placeholder="https://app.example.com/feature"
+                                            disabled={isScanning}
+                                            className="w-full pl-10 pr-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-cyan-500"
+                                        />
+                                    </div>
                                 </div>
-                            </div>
-                            <p className="text-gray-500 text-xs mt-2">
-                                {rateLimit <= 3
-                                    ? 'Slow & stealthy — minimal footprint on the target'
-                                    : rateLimit <= 8
-                                        ? 'Balanced — good speed without overloading the target'
-                                        : rateLimit <= 20
-                                            ? 'Fast — may trigger WAF/rate limiting on some targets'
-                                            : 'Aggressive — use only on targets you control'
-                                }
-                            </p>
-                        </div>
 
-                        {/* Parallel Agents */}
-                        <div>
-                            <label className="block text-gray-400 text-sm mb-2 flex items-center gap-2">
-                                <Zap className="w-4 h-4 text-amber-400" />
-                                Parallel Agents: <span className="text-cyan-400 font-bold">{parallelAgents}</span>
-                                <span className="text-amber-400 text-xs">(Web auth-first startup runs single-orchestrator)</span>
-                            </label>
-                            <div className="flex items-center gap-4">
-                                <input
-                                    type="range"
-                                    value={parallelAgents}
-                                    onChange={(e) => setParallelAgents(parseInt(e.target.value))}
-                                    min="1"
-                                    max="10"
-                                    className="flex-1 h-2 bg-dark-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                                />
-                                <div className="flex gap-2">
-                                    <button
-                                        type="button"
-                                        onClick={() => setParallelAgents(1)}
-                                        className={`px-2 py-1 text-xs rounded ${parallelAgents === 1 ? 'bg-cyan-500 text-white' : 'bg-dark-700 text-gray-400'}`}
-                                    >
-                                        Single
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => setParallelAgents(5)}
-                                        className={`px-2 py-1 text-xs rounded ${parallelAgents === 5 ? 'bg-cyan-500 text-white' : 'bg-dark-700 text-gray-400'}`}
-                                    >
-                                        5x
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => setParallelAgents(10)}
-                                        className={`px-2 py-1 text-xs rounded ${parallelAgents === 10 ? 'bg-amber-500 text-white' : 'bg-dark-700 text-gray-400'}`}
-                                    >
-                                        10x Turbo
-                                    </button>
-                                </div>
-                            </div>
-                            <p className="text-gray-500 text-xs mt-2">
-                                Web Scan startup now keeps one orchestrator so browser-driven auth discovery, Burp traffic correlation, and captured session state stay consistent across the full run.
-                            </p>
-                        </div>
-
-                        {/* Iterations (max actions) */}
-                        <div>
-                            <label className="block text-gray-400 text-sm mb-2">
-                                Iterations (max actions): <span className="text-cyan-400 font-bold">{iterations}</span>
-                            </label>
-                            <input
-                                type="number"
-                                min={10}
-                                max={500}
-                                value={iterations}
-                                onChange={(e) => setIterations(Math.max(10, Math.min(500, Number(e.target.value) || 50)))}
-                                className="input-field w-full max-w-[120px]"
-                            />
-                            <p className="text-gray-500 text-xs mt-1">Max tool/action steps per scan (10–500).</p>
-                        </div>
-
-                        {/* Planning rounds */}
-                        <div>
-                            <label className="block text-gray-400 text-sm mb-2">
-                                Planning rounds: <span className="text-cyan-400 font-bold">{maxPlanRounds === 0 ? 'Default (model decides)' : maxPlanRounds}</span>
-                            </label>
-                            <input
-                                type="number"
-                                min={0}
-                                max={99}
-                                value={maxPlanRounds}
-                                onChange={(e) => setMaxPlanRounds(Math.max(0, Math.min(99, Number(e.target.value) ?? 0)))}
-                                className="input-field w-full max-w-[120px]"
-                            />
-                            <p className="text-gray-500 text-xs mt-1">0 = model decides when to finish; 1–99 = fixed number of planning rounds.</p>
-                        </div>
-
-                        {/* Provided Credentials */}
-                        <div>
-                            <div className="flex items-center justify-between mb-3">
-                                <label className="block text-gray-400 text-sm">Provided Credentials</label>
-                                <button
-                                    type="button"
-                                    onClick={() => setUserAccounts([...userAccounts, createEmptyCredentialRow()])}
-                                    disabled={isScanning || authStartupMode !== 'provided_credentials'}
-                                    className="text-cyan-400 text-xs hover:underline"
-                                >
-                                    + Add Credential
-                                </button>
-                            </div>
-                            {authStartupMode === 'provided_credentials' ? (
-                                <>
-                                    <div className="space-y-3">
-                                        {userAccounts.map((acc, idx) => (
-                                            <div key={idx} className="rounded-lg border border-dark-700 bg-dark-900/70 p-3">
-                                                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1.2fr_1.2fr_1fr_0.9fr_0.9fr_auto]">
-                                                    <input
-                                                        type="text"
-                                                        placeholder="Username"
-                                                        value={acc.username}
-                                                        onChange={(e) => {
-                                                            const newAccs = [...userAccounts];
-                                                            newAccs[idx].username = e.target.value;
-                                                            setUserAccounts(newAccs);
-                                                        }}
-                                                        className="input-field text-sm w-full min-w-0"
-                                                    />
-                                                    <input
-                                                        type="email"
-                                                        placeholder="Email"
-                                                        value={acc.email}
-                                                        onChange={(e) => {
-                                                            const newAccs = [...userAccounts];
-                                                            newAccs[idx].email = e.target.value;
-                                                            setUserAccounts(newAccs);
-                                                        }}
-                                                        className="input-field text-sm w-full min-w-0"
-                                                    />
-                                                    <input
-                                                        type="password"
-                                                        placeholder="Password"
-                                                        value={acc.password}
-                                                        onChange={(e) => {
-                                                            const newAccs = [...userAccounts];
-                                                            newAccs[idx].password = e.target.value;
-                                                            setUserAccounts(newAccs);
-                                                        }}
-                                                        className="input-field text-sm w-full min-w-0"
-                                                    />
-                                                    <input
-                                                        type="text"
-                                                        placeholder="Label (optional)"
-                                                        value={acc.label}
-                                                        onChange={(e) => {
-                                                            const newAccs = [...userAccounts];
-                                                            newAccs[idx].label = e.target.value;
-                                                            setUserAccounts(newAccs);
-                                                        }}
-                                                        className="input-field text-sm w-full min-w-0"
-                                                    />
-                                                    <select
-                                                        value={acc.role}
-                                                        onChange={(e) => {
-                                                            const newAccs = [...userAccounts];
-                                                            newAccs[idx].role = e.target.value;
-                                                            setUserAccounts(newAccs);
-                                                        }}
-                                                        className="input-field text-sm"
-                                                    >
-                                                        <option value="user">User</option>
-                                                        <option value="admin">Admin</option>
-                                                        <option value="manager">Manager</option>
-                                                        <option value="unknown">Unknown</option>
-                                                    </select>
-                                                    <select
-                                                        value={acc.privilege}
-                                                        onChange={(e) => {
-                                                            const newAccs = [...userAccounts];
-                                                            newAccs[idx].privilege = e.target.value as CredentialPrivilege;
-                                                            setUserAccounts(newAccs);
-                                                        }}
-                                                        className="input-field text-sm"
-                                                    >
-                                                        <option value="unknown">Unknown Priv</option>
-                                                        <option value="low">Low Priv</option>
-                                                        <option value="high">High Priv</option>
-                                                    </select>
-                                                    {userAccounts.length > 1 ? (
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => setUserAccounts(userAccounts.filter((_, i) => i !== idx))}
-                                                            className="text-red-400 hover:bg-red-500/10 p-2 rounded flex-shrink-0"
-                                                        >
-                                                            <XCircle className="w-4 h-4" />
-                                                        </button>
-                                                    ) : (
-                                                        <div className="w-8" />
-                                                    )}
-                                                </div>
-                                            </div>
+                                <div>
+                                    <label className="block text-sm text-gray-300 mb-2">Scan Mode</label>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {(['exploratory', 'scoped'] as ScanMode[]).map((mode) => (
+                                            <button
+                                                key={mode}
+                                                type="button"
+                                                onClick={() => setScanMode(mode)}
+                                                disabled={isScanning}
+                                                className={`px-4 py-3 rounded-xl border text-sm font-medium transition-colors ${
+                                                    scanMode === mode
+                                                        ? 'border-cyan-500 bg-cyan-500/10 text-cyan-300'
+                                                        : 'border-dark-600 bg-dark-900 text-gray-300 hover:border-dark-500'
+                                                }`}
+                                            >
+                                                {mode === 'scoped' ? 'Scoped Test Mode' : 'Exploratory Mode'}
+                                            </button>
                                         ))}
                                     </div>
-                                    <p className="text-gray-500 text-xs mt-2">
-                                        Supply one or more identities for startup login. PenPard will use them to locate the real auth flow, sign in in-browser, capture session transport, and preserve users for later authorization testing.
-                                    </p>
-                                </>
-                            ) : (
-                                <div className="rounded-lg border border-dark-700 bg-dark-900/50 px-4 py-3 text-sm text-gray-400">
-                                    Startup is set to <span className="text-cyan-400 font-medium">Start without credentials</span>. PenPard will begin by discovering login, register, reset, SSO, MFA, onboarding, and recovery surfaces before generic crawling.
                                 </div>
-                            )}
-                        </div>
 
-                        {/* External Tools */}
-                        <div>
-                            <label className="block text-gray-400 text-sm mb-2">External Tools</label>
-                            <div className="flex gap-4">
-                                <label className="flex items-center gap-2 card p-3 border border-dark-600 opacity-50 cursor-not-allowed" title="Nuclei integration is not yet implemented">
-                                    <input
-                                        type="checkbox"
-                                        checked={false}
-                                        disabled
-                                        className="checkbox"
-                                    />
-                                    <span className="text-gray-400">Nuclei Vulnerability Scanner</span>
-                                    <span className="text-[10px] text-yellow-500/80 font-mono ml-1">(Coming Soon)</span>
-                                </label>
-                                <label className="flex items-center gap-2 card p-3 border border-dark-600 opacity-50 cursor-not-allowed" title="FFUF integration is not yet implemented">
-                                    <input
-                                        type="checkbox"
-                                        checked={false}
-                                        disabled
-                                        className="checkbox"
-                                    />
-                                    <span className="text-gray-400">FFUF Fuzzing</span>
-                                    <span className="text-[10px] text-yellow-500/80 font-mono ml-1">(Coming Soon)</span>
-                                </label>
-                            </div>
-                        </div>
-
-                        {/* Source Package / Source Analysis */}
-                        <div className="border-t border-dark-600 pt-6">
-                            <h4 className="text-white font-medium mb-4 flex items-center gap-2">
-                                <FolderOpen className="w-4 h-4 text-cyan-400" />
-                                Source-Aware Scanning
-                                <span className="text-gray-600 text-xs font-normal">(optional)</span>
-                            </h4>
-
-                            <div className="mb-4">
-                                <SourceProviderInput
-                                    sourceType={sourceType} setSourceType={setSourceType}
-                                    localPath={sourcePackagePath} setLocalPath={(val) => {
-                                        setSourcePackagePath(val);
-                                        if (!val.trim() && sourceType === 'local') setSourceAnalysisMode(null);
-                                    }}
-                                    zipFile={zipFile} setZipFile={(val) => {
-                                        setZipFile(val);
-                                        if (!val && sourceType === 'zip') setSourceAnalysisMode(null);
-                                    }}
-                                    gitUrl={gitUrl} setGitUrl={(val) => {
-                                        setGitUrl(val);
-                                        if (!val.trim() && sourceType === 'git') setSourceAnalysisMode(null);
-                                    }}
-                                    gitToken={gitToken} setGitToken={setGitToken}
-                                    disabled={isScanning}
-                                />
-                            </div>
-
-                            {((sourceType === 'local' && sourcePackagePath.trim()) || (sourceType === 'zip' && zipFile) || (sourceType === 'git' && gitUrl.trim())) && (
-                                <motion.div
-                                    initial={{ opacity: 0, height: 0 }}
-                                    animate={{ opacity: 1, height: 'auto' }}
-                                    transition={{ duration: 0.2 }}
-                                >
-                                    <SourceModeSelector
-                                        modes={SOURCE_ANALYSIS_MODES}
-                                        selected={sourceAnalysisMode}
-                                        onSelect={setSourceAnalysisMode}
+                                <div>
+                                    <label className="block text-sm text-gray-300 mb-2">General Instructions</label>
+                                    <textarea
+                                        value={scanInstructions}
+                                        onChange={(event) => setScanInstructions(event.target.value)}
+                                        rows={4}
+                                        placeholder="Optional operator guidance for the run."
                                         disabled={isScanning}
+                                        className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-cyan-500 resize-none"
                                     />
-                                    
-                                    <div className="mt-6 flex flex-col gap-4">
-                                        {!extractedEndpoints && (
-                                            <button
-                                                type="button"
-                                                onClick={handleExtractEndpoints}
-                                                disabled={isExtracting || isScanning}
-                                                className="btn btn-secondary w-full sm:w-auto"
-                                            >
-                                                {isExtracting ? (
-                                                    <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin text-cyan-400" /> Analyzing Source Code...</span>
-                                                ) : (
-                                                    <span className="flex items-center gap-2"><Search className="w-4 h-4 text-cyan-400" /> Extract Endpoints from Codebase</span>
-                                                )}
-                                            </button>
-                                        )}
-                                                                      {extractedEndpoints && (
-                                            <div className="bg-dark-800 rounded-lg border border-dark-600 p-4">
-                                                {/* Header — outside scroll */}
-                                                <div className="flex justify-between items-center mb-3 pb-2 border-b border-dark-700">
-                                                    <h4 className="text-sm font-semibold text-white">Extracted Routes <span className="text-cyan-400 ml-1">{selectedEndpointKeys.size}/{extractedEndpoints.length} selected</span></h4>
-                                                    <div className="flex items-center gap-3">
-                                                        {endpointFilter === 'all' && (
-                                                            <>
-                                                                <button type="button" onClick={() => setSelectedEndpointKeys(new Set(extractedEndpoints.map(ep => `${ep.method}:${ep.path}`)))} className="text-xs text-cyan-400 hover:text-white">All</button>
-                                                                <button type="button" onClick={() => setSelectedEndpointKeys(new Set())} className="text-xs text-gray-400 hover:text-white">None</button>
-                                                            </>
-                                                        )}
-                                                        <button type="button" onClick={() => { setExtractedEndpoints(null); setSelectedEndpointKeys(new Set()); setEndpointFilter('all'); }} className="text-xs text-gray-500 hover:text-white">Clear</button>
-                                                    </div>
+                                </div>
+                            </div>
+                        </motion.section>
+
+                        {scanMode === 'scoped' && (
+                            <motion.section
+                                initial={{ opacity: 0, y: 12 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                className="card p-6 space-y-6 border border-violet-500/20"
+                            >
+                                <div className="flex items-start justify-between gap-4">
+                                    <div>
+                                        <h2 className="text-xl font-semibold">Structured Security Test Request</h2>
+                                        <p className="text-sm text-gray-400 mt-1 max-w-2xl">
+                                            This is the new primary scoped intake contract. URL and description are required; everything else is optional enrichment for bounded feature anchoring.
+                                        </p>
+                                    </div>
+                                    <span className="px-3 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-200 text-xs font-semibold uppercase">
+                                        Request Driven
+                                    </span>
+                                </div>
+
+                                <div className="grid gap-5 md:grid-cols-2">
+                                    <div className="md:col-span-2">
+                                        <label className="block text-sm text-gray-300 mb-2">Request Description</label>
+                                        <textarea
+                                            value={scopedRequest.description}
+                                            onChange={(event) => setScopedRequest((current) => ({ ...current, description: event.target.value }))}
+                                            rows={5}
+                                            placeholder="Describe the feature, screen, behavior, or changed area that should be security tested."
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-violet-500 resize-none"
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Environment</label>
+                                        <input
+                                            type="text"
+                                            value={scopedRequest.environment}
+                                            onChange={(event) => setScopedRequest((current) => ({ ...current, environment: event.target.value }))}
+                                            placeholder="staging, qa, preview..."
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-violet-500"
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Service / Application Name</label>
+                                        <input
+                                            type="text"
+                                            value={scopedRequest.serviceName}
+                                            onChange={(event) => setScopedRequest((current) => ({ ...current, serviceName: event.target.value }))}
+                                            placeholder="Orders Portal"
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-violet-500"
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Test Data</label>
+                                        <textarea
+                                            value={scopedRequest.testData}
+                                            onChange={(event) => setScopedRequest((current) => ({ ...current, testData: event.target.value }))}
+                                            rows={4}
+                                            placeholder="One item per line or comma separated"
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-violet-500 resize-none"
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Test Users</label>
+                                        <textarea
+                                            value={scopedRequest.testUsers}
+                                            onChange={(event) => setScopedRequest((current) => ({ ...current, testUsers: event.target.value }))}
+                                            rows={4}
+                                            placeholder="One user or role per line"
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-violet-500 resize-none"
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Login Present</label>
+                                        <select
+                                            value={scopedRequest.loginPresent}
+                                            onChange={(event) => setScopedRequest((current) => ({ ...current, loginPresent: event.target.value as ScopedRequestIntakeFormValues['loginPresent'] }))}
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-violet-500"
+                                        >
+                                            <option value="unknown">Unknown</option>
+                                            <option value="present">Yes</option>
+                                            <option value="absent">No</option>
+                                        </select>
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Auth Mechanism Hints</label>
+                                        <textarea
+                                            value={scopedRequest.authMechanismHints}
+                                            onChange={(event) => setScopedRequest((current) => ({ ...current, authMechanismHints: event.target.value }))}
+                                            rows={4}
+                                            placeholder="SSO, session cookie, bearer token, magic link..."
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-violet-500 resize-none"
+                                        />
+                                    </div>
+
+                                    <div className="md:col-span-2 grid gap-5 md:grid-cols-2">
+                                        <div className="p-4 rounded-xl border border-dark-600 bg-dark-900/60 space-y-3">
+                                            <label className="inline-flex items-center gap-3 text-sm text-gray-200">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={scopedRequest.hasScreenshotOrAttachment}
+                                                    onChange={(event) => setScopedRequest((current) => ({ ...current, hasScreenshotOrAttachment: event.target.checked }))}
+                                                    disabled={isScanning}
+                                                    className="accent-violet-500"
+                                                />
+                                                Screenshot or attachment available
+                                            </label>
+                                            <textarea
+                                                value={scopedRequest.attachmentMetadata}
+                                                onChange={(event) => setScopedRequest((current) => ({ ...current, attachmentMetadata: event.target.value }))}
+                                                rows={3}
+                                                placeholder="Optional metadata, one per line. Use kind:label for quick structure."
+                                                disabled={isScanning}
+                                                className="w-full px-4 py-3 bg-dark-950 border border-dark-700 rounded-xl text-white focus:outline-none focus:border-violet-500 resize-none"
+                                            />
+                                            <textarea
+                                                value={scopedRequest.attachmentSummary}
+                                                onChange={(event) => setScopedRequest((current) => ({ ...current, attachmentSummary: event.target.value }))}
+                                                rows={3}
+                                                placeholder="Attachment content summary"
+                                                disabled={isScanning}
+                                                className="w-full px-4 py-3 bg-dark-950 border border-dark-700 rounded-xl text-white focus:outline-none focus:border-violet-500 resize-none"
+                                            />
+                                        </div>
+
+                                        <div className="p-4 rounded-xl border border-dark-600 bg-dark-900/60 grid gap-4">
+                                            <div className="grid grid-cols-2 gap-4">
+                                                <div>
+                                                    <label className="block text-sm text-gray-300 mb-2">New Screen Count</label>
+                                                    <input
+                                                        type="number"
+                                                        min="0"
+                                                        value={scopedRequest.newScreenCount}
+                                                        onChange={(event) => setScopedRequest((current) => ({ ...current, newScreenCount: event.target.value }))}
+                                                        disabled={isScanning}
+                                                        className="w-full px-4 py-3 bg-dark-950 border border-dark-700 rounded-xl text-white focus:outline-none focus:border-violet-500"
+                                                    />
                                                 </div>
-                                                {/* Filter Tabs */}
-                                                {(() => {
-                                                    const staticCount = extractedEndpoints.filter(ep => ep.source !== 'ai').length;
-                                                    const aiCount = extractedEndpoints.filter(ep => ep.source === 'ai').length;
-                                                    return (
-                                                        <div className="flex items-center gap-1 mb-3">
-                                                            {(['all', 'static', 'ai'] as const).map((tab) => {
-                                                                const count = tab === 'all' ? extractedEndpoints.length : tab === 'static' ? staticCount : aiCount;
-                                                                const label = tab === 'all' ? 'All' : tab === 'static' ? 'Static' : '🧠 AI';
-                                                                if (tab === 'ai' && aiCount === 0) return null;
-                                                                return (
-                                                                    <button
-                                                                        key={tab}
-                                                                        type="button"
-                                                                        onClick={() => setEndpointFilter(tab)}
-                                                                        className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors ${
-                                                                            endpointFilter === tab
-                                                                                ? tab === 'ai' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/40' : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40'
-                                                                                : 'bg-dark-700 text-gray-500 border border-dark-600 hover:text-gray-300'
-                                                                        }`}
-                                                                    >
-                                                                        {label} <span className="ml-1 opacity-70">{count}</span>
-                                                                    </button>
-                                                                );
-                                                            })}
-                                                        </div>
-                                                    );
-                                                })()}
-                                                {/* Scrollable list only */}
-                                                <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
-                                                    {extractedEndpoints
-                                                        .filter(ep => endpointFilter === 'all' ? true : endpointFilter === 'ai' ? ep.source === 'ai' : ep.source !== 'ai')
-                                                        .map((ep, i) => {
-                                                        const key = `${ep.method}:${ep.path}`;
-                                                        const isSelected = selectedEndpointKeys.has(key);
-                                                        const isAllTab = endpointFilter === 'all';
-                                                        const isAiEntry = ep.source === 'ai';
-                                                        return (
-                                                            <label key={i} className={`flex items-center justify-between text-xs p-2.5 rounded border transition-colors ${
-                                                                isAllTab ? 'cursor-pointer' : 'cursor-default'
-                                                            } ${
-                                                                isAllTab
-                                                                    ? (isSelected ? 'bg-cyan-500/10 border-cyan-500/30' : 'bg-dark-900 border-dark-700 opacity-60')
-                                                                    : (isAiEntry ? 'bg-purple-500/5 border-purple-500/20' : 'bg-dark-900 border-dark-700')
-                                                            }`}>
-                                                                <div className="flex items-center gap-3 truncate">
-                                                                    {isAllTab && (
-                                                                        <input
-                                                                            type="checkbox"
-                                                                            className="accent-cyan-500 w-3.5 h-3.5 flex-shrink-0"
-                                                                            checked={isSelected}
-                                                                            onChange={() => {
-                                                                                const next = new Set(selectedEndpointKeys);
-                                                                                isSelected ? next.delete(key) : next.add(key);
-                                                                                setSelectedEndpointKeys(next);
-                                                                            }}
-                                                                        />
-                                                                    )}
-                                                                    <span className={`font-mono font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${
-                                                                        ep.method === 'GET' ? 'bg-blue-500/20 text-blue-400' :
-                                                                        ep.method === 'POST' ? 'bg-green-500/20 text-green-400' :
-                                                                        ep.method === 'PUT' ? 'bg-amber-500/20 text-amber-400' :
-                                                                        ep.method === 'DELETE' ? 'bg-red-500/20 text-red-400' :
-                                                                        'bg-gray-500/20 text-gray-400'
-                                                                    }`}>{ep.method}</span>
-                                                                    <span className="text-gray-300 font-mono truncate" title={ep.handler}>{ep.path}</span>
-                                                                </div>
-                                                                <div className="flex items-center gap-2 flex-shrink-0 ml-2">
-                                                                    {ep.source === 'ai' && <span className="text-purple-400 text-[9px] bg-purple-400/10 px-1 rounded border border-purple-400/20">AI</span>}
-                                                                    {ep.authRequired && <span className="text-amber-400 text-[10px] bg-amber-400/10 px-1 rounded uppercase border border-amber-400/20">Auth</span>}
-                                                                    {ep.userInputs?.length > 0 && <span className="text-cyan-400 text-[10px] bg-cyan-400/10 px-1 rounded uppercase border border-cyan-400/20">Inputs</span>}
-                                                                </div>
-                                                            </label>
-                                                        );
-                                                    })}
-                                                    {extractedEndpoints.length === 0 && <p className="text-gray-500 text-sm italic">No dynamic routes found in source.</p>}
-                                                </div>
-                                                {/* Footer — outside scroll */}
-                                                <div className="mt-3 pt-3 border-t border-dark-700 space-y-3">
-                                                    {endpointFilter === 'all' && selectedEndpointKeys.size > 0 && (
-                                                        <p className="text-gray-500 text-xs">
-                                                            ✅ Scan will focus on the <span className="text-cyan-400 font-semibold">{selectedEndpointKeys.size}</span> selected endpoint{selectedEndpointKeys.size !== 1 ? 's' : ''}.
-                                                        </p>
-                                                    )}
-                                                    <button
-                                                        type="button"
-                                                        onClick={handleDeepScanAI}
-                                                        disabled={isDeepScanning || isScanning}
-                                                        className="w-full px-3 py-2 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/30 hover:bg-purple-500/20 transition-colors disabled:opacity-50 text-xs flex items-center justify-center gap-2"
-                                                    >
-                                                        {isDeepScanning ? (
-                                                            <span className="flex items-center gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> AI is analyzing dynamic routes...</span>
-                                                        ) : (
-                                                            <span className="flex items-center gap-2">🧠 Deep Scan with AI <span className="text-[9px] opacity-60">(uses tokens)</span></span>
-                                                        )}
-                                                    </button>
+                                                <div>
+                                                    <label className="block text-sm text-gray-300 mb-2">New Input Count</label>
+                                                    <input
+                                                        type="number"
+                                                        min="0"
+                                                        value={scopedRequest.newInputCount}
+                                                        onChange={(event) => setScopedRequest((current) => ({ ...current, newInputCount: event.target.value }))}
+                                                        disabled={isScanning}
+                                                        className="w-full px-4 py-3 bg-dark-950 border border-dark-700 rounded-xl text-white focus:outline-none focus:border-violet-500"
+                                                    />
                                                 </div>
                                             </div>
-                                        )}
+                                            <div>
+                                                <label className="block text-sm text-gray-300 mb-2">Operator Notes</label>
+                                                <textarea
+                                                    value={scopedRequest.operatorNotes}
+                                                    onChange={(event) => setScopedRequest((current) => ({ ...current, operatorNotes: event.target.value }))}
+                                                    rows={4}
+                                                    placeholder="Optional notes for discovery and planning."
+                                                    disabled={isScanning}
+                                                    className="w-full px-4 py-3 bg-dark-950 border border-dark-700 rounded-xl text-white focus:outline-none focus:border-violet-500 resize-none"
+                                                />
+                                            </div>
+                                        </div>
                                     </div>
-                                </motion.div>
-                            )}
-                        </div>
-                    </motion.div>
-                )}
+                                </div>
+                            </motion.section>
+                        )}
 
-                {/* Scan Progress */}
+                        <motion.section
+                            initial={{ opacity: 0, y: 12 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card p-6 space-y-5"
+                        >
+                            <div>
+                                <h2 className="text-xl font-semibold">{scanMode === 'scoped' ? 'Runtime Controls' : 'Auth and Runtime Controls'}</h2>
+                                <p className="text-sm text-gray-400 mt-1">
+                                    {scanMode === 'scoped'
+                                        ? 'Scoped mode keeps only the generic runtime tuning here. Auth-specific startup controls are intentionally hidden for this request-driven flow.'
+                                        : 'These controls remain runtime-specific. They are separate from the structured request metadata.'}
+                                </p>
+                            </div>
+
+                            {scanMode !== 'scoped' && (
+                                <div className="grid gap-5 md:grid-cols-2">
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Auth Startup Mode</label>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => setAuthStartupMode('no_credentials')}
+                                                disabled={isScanning}
+                                                className={`px-4 py-3 rounded-xl border text-sm ${
+                                                    authStartupMode === 'no_credentials'
+                                                        ? 'border-cyan-500 bg-cyan-500/10 text-cyan-300'
+                                                        : 'border-dark-600 bg-dark-900 text-gray-300'
+                                                }`}
+                                            >
+                                                Browser Discovery
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setAuthStartupMode('provided_credentials')}
+                                                disabled={isScanning}
+                                                className={`px-4 py-3 rounded-xl border text-sm ${
+                                                    authStartupMode === 'provided_credentials'
+                                                        ? 'border-cyan-500 bg-cyan-500/10 text-cyan-300'
+                                                        : 'border-dark-600 bg-dark-900 text-gray-300'
+                                                }`}
+                                            >
+                                                Provided Credentials
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm text-gray-300 mb-2">Session Cookies</label>
+                                        <textarea
+                                            value={sessionCookies}
+                                            onChange={(event) => setSessionCookies(event.target.value)}
+                                            rows={4}
+                                            placeholder="Optional raw Cookie header value for runtime continuity"
+                                            disabled={isScanning}
+                                            className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-cyan-500 resize-none font-mono text-sm"
+                                        />
+                                    </div>
+                                </div>
+                            )}
+
+                            {scanMode !== 'scoped' && authStartupMode === 'provided_credentials' && (
+                                <div className="space-y-4">
+                                    {userAccounts.map((account, index) => (
+                                        <div key={`credential-${index}`} className="grid gap-3 md:grid-cols-6 p-4 rounded-xl border border-dark-600 bg-dark-900/60">
+                                            <input
+                                                value={account.username}
+                                                onChange={(event) => handleCredentialChange(index, 'username', event.target.value)}
+                                                placeholder="Username"
+                                                disabled={isScanning}
+                                                className="px-3 py-2 bg-dark-950 border border-dark-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                                            />
+                                            <input
+                                                value={account.email}
+                                                onChange={(event) => handleCredentialChange(index, 'email', event.target.value)}
+                                                placeholder="Email"
+                                                disabled={isScanning}
+                                                className="px-3 py-2 bg-dark-950 border border-dark-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                                            />
+                                            <input
+                                                type="password"
+                                                value={account.password}
+                                                onChange={(event) => handleCredentialChange(index, 'password', event.target.value)}
+                                                placeholder="Password"
+                                                disabled={isScanning}
+                                                className="px-3 py-2 bg-dark-950 border border-dark-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                                            />
+                                            <input
+                                                value={account.role}
+                                                onChange={(event) => handleCredentialChange(index, 'role', event.target.value)}
+                                                placeholder="Role"
+                                                disabled={isScanning}
+                                                className="px-3 py-2 bg-dark-950 border border-dark-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                                            />
+                                            <input
+                                                value={account.label}
+                                                onChange={(event) => handleCredentialChange(index, 'label', event.target.value)}
+                                                placeholder="Label"
+                                                disabled={isScanning}
+                                                className="px-3 py-2 bg-dark-950 border border-dark-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                                            />
+                                            <button
+                                                type="button"
+                                                onClick={() => handleRemoveCredential(index)}
+                                                disabled={isScanning}
+                                                className="px-3 py-2 rounded-lg border border-red-500/20 bg-red-500/10 text-red-300 hover:bg-red-500/20"
+                                            >
+                                                Remove
+                                            </button>
+                                        </div>
+                                    ))}
+
+                                    <div className="flex flex-wrap gap-3">
+                                        <button
+                                            type="button"
+                                            onClick={handleAddCredential}
+                                            disabled={isScanning}
+                                            className="px-4 py-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
+                                        >
+                                            Add Credential
+                                        </button>
+                                        <label className="inline-flex items-center gap-2 text-sm text-gray-300">
+                                            <input
+                                                type="checkbox"
+                                                checked={allowAccountCreation}
+                                                onChange={(event) => setAllowAccountCreation(event.target.checked)}
+                                                disabled={isScanning}
+                                                className="accent-cyan-500"
+                                            />
+                                            Allow account creation
+                                        </label>
+                                        <label className="inline-flex items-center gap-2 text-sm text-gray-300">
+                                            <input
+                                                type="checkbox"
+                                                checked={preferSharedPassword}
+                                                onChange={(event) => setPreferSharedPassword(event.target.checked)}
+                                                disabled={isScanning}
+                                                className="accent-cyan-500"
+                                            />
+                                            Prefer shared password heuristics
+                                        </label>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div className="grid gap-4 md:grid-cols-4">
+                                <div>
+                                    <label className="block text-sm text-gray-300 mb-2">Iterations</label>
+                                    <input
+                                        type="number"
+                                        min="10"
+                                        max="500"
+                                        value={iterations}
+                                        onChange={(event) => setIterations(Number(event.target.value))}
+                                        disabled={isScanning}
+                                        className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-cyan-500"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-300 mb-2">Parallel Agents</label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        max="10"
+                                        value={parallelAgents}
+                                        onChange={(event) => setParallelAgents(Number(event.target.value))}
+                                        disabled={isScanning}
+                                        className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-cyan-500"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-300 mb-2">Rate Limit</label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        max="20"
+                                        value={rateLimit}
+                                        onChange={(event) => setRateLimit(Number(event.target.value))}
+                                        disabled={isScanning}
+                                        className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-cyan-500"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-sm text-gray-300 mb-2">Max Plan Rounds</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        max="99"
+                                        value={maxPlanRounds}
+                                        onChange={(event) => setMaxPlanRounds(Number(event.target.value))}
+                                        disabled={isScanning}
+                                        className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-xl text-white focus:outline-none focus:border-cyan-500"
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="flex flex-wrap gap-4">
+                                <label className="inline-flex items-center gap-2 text-sm text-gray-300">
+                                    <input
+                                        type="checkbox"
+                                        checked={externalTools.nuclei}
+                                        onChange={(event) => setExternalTools((current) => ({ ...current, nuclei: event.target.checked }))}
+                                        disabled={isScanning}
+                                        className="accent-cyan-500"
+                                    />
+                                    Enable Nuclei
+                                </label>
+                                <label className="inline-flex items-center gap-2 text-sm text-gray-300">
+                                    <input
+                                        type="checkbox"
+                                        checked={externalTools.ffuf}
+                                        onChange={(event) => setExternalTools((current) => ({ ...current, ffuf: event.target.checked }))}
+                                        disabled={isScanning}
+                                        className="accent-cyan-500"
+                                    />
+                                    Enable ffuf
+                                </label>
+                            </div>
+                        </motion.section>
+
+                        <motion.section
+                            initial={{ opacity: 0, y: 12 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card p-6 space-y-5"
+                        >
+                            <div>
+                                <h2 className="text-xl font-semibold">Source Enrichment</h2>
+                                <p className="text-sm text-gray-400 mt-1">
+                                    Source analysis remains optional internal enrichment for planning and discovery. Endpoint intelligence is no longer part of scan creation.
+                                </p>
+                            </div>
+
+                            <SourceModeSelector
+                                modes={SOURCE_ANALYSIS_MODES}
+                                selected={sourceAnalysisMode}
+                                onSelect={setSourceAnalysisMode}
+                                disabled={isScanning}
+                            />
+
+                            <SourceProviderInput
+                                sourceType={sourceType}
+                                setSourceType={setSourceType}
+                                localPath={sourcePackagePath}
+                                setLocalPath={setSourcePackagePath}
+                                zipFile={zipFile}
+                                setZipFile={setZipFile}
+                                gitUrl={gitUrl}
+                                setGitUrl={setGitUrl}
+                                gitToken={gitToken}
+                                setGitToken={setGitToken}
+                                disabled={isScanning}
+                            />
+                        </motion.section>
+                    </div>
+
+                    <div className="space-y-6">
+                        <motion.aside
+                            initial={{ opacity: 0, y: 12 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="card p-6 space-y-5 sticky top-6"
+                        >
+                            <div>
+                                <h2 className="text-xl font-semibold">Launch Summary</h2>
+                                <p className="text-sm text-gray-400 mt-1">
+                                    {scanMode === 'scoped'
+                                    ? 'Scoped launch will persist the structured request, derive bounded feature anchors, seed internal hypotheses, and move straight into live bounded execution.'
+                                        : 'Exploratory launch keeps the current runtime-driven workflow.'}
+                                </p>
+                            </div>
+
+                            <div className="space-y-3 text-sm text-gray-300">
+                                <div className="flex items-center justify-between">
+                                    <span>Mode</span>
+                                    <span className="text-white font-medium">{scanMode === 'scoped' ? 'Scoped Test Mode' : 'Exploratory Mode'}</span>
+                                </div>
+                                <div className="flex items-center justify-between">
+                                    <span>Target</span>
+                                    <span className="text-white font-medium truncate max-w-[220px] text-right">{targetUrl || 'Not set'}</span>
+                                </div>
+                                {scanMode === 'scoped' && (
+                                    <>
+                                        <div className="flex items-center justify-between">
+                                            <span>Description</span>
+                                            <span className="text-white font-medium">{scopedRequest.description.trim() ? 'Provided' : 'Required'}</span>
+                                        </div>
+                                        <div className="flex items-center justify-between">
+                                            <span>Optional Metadata</span>
+                                            <span className="text-white font-medium">
+                                                {[
+                                                    scopedRequest.environment,
+                                                    scopedRequest.serviceName,
+                                                    scopedRequest.testData,
+                                                    scopedRequest.testUsers,
+                                                    scopedRequest.authMechanismHints,
+                                                    scopedRequest.operatorNotes,
+                                                ].filter((value) => String(value || '').trim()).length}
+                                            </span>
+                                        </div>
+                                    </>
+                                )}
+                                <div className="flex items-center justify-between">
+                                    <span>Source Enrichment</span>
+                                    <span className="text-white font-medium">{sourceAnalysisMode || 'Disabled'}</span>
+                                </div>
+                            </div>
+
+                            <button
+                                type="button"
+                                onClick={handleStartScan}
+                                disabled={isScanning}
+                                className="w-full px-4 py-3 rounded-xl bg-cyan-500 text-black font-semibold hover:bg-cyan-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                        {isScanning ? 'Launching...' : scanMode === 'scoped' ? 'Start Scoped Mission' : 'Start Exploratory Scan'}
+                            </button>
+                        </motion.aside>
+                    </div>
+                </div>
+
                 {scanStatus.status !== 'idle' && (
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
+                    <motion.section
+                        initial={{ opacity: 0, y: 16 }}
                         animate={{ opacity: 1, y: 0 }}
-                        className="card p-6 mb-8"
+                        className="card p-6 mt-8"
                     >
                         <div className="flex items-center gap-4 mb-4">
                             {getStatusIcon()}
@@ -1094,36 +908,34 @@ export default function WebScanPage() {
                                     {scanStatus.status === 'complete'
                                         ? 'Scan Complete'
                                         : scanStatus.status === 'error'
-                                            ? 'Scan Failed'
-                                            : 'Scanning in Progress'}
+                                            ? 'Launch Failed'
+                                            : 'Launch In Progress'}
                                 </h3>
                                 <p className="text-gray-400 text-sm">{scanStatus.message}</p>
                             </div>
                         </div>
-
-                        {/* Progress Bar */}
                         <div className="h-2 bg-dark-700 rounded-full overflow-hidden">
                             <motion.div
                                 initial={{ width: 0 }}
                                 animate={{ width: `${scanStatus.progress}%` }}
-                                transition={{ duration: 0.5 }}
-                                className={`h-full rounded-full ${scanStatus.status === 'error'
-                                    ? 'bg-red-500'
-                                    : scanStatus.status === 'complete'
-                                        ? 'bg-green-500'
-                                        : 'bg-gradient-to-r from-cyan-500 to-blue-500'
-                                    }`}
+                                transition={{ duration: 0.4 }}
+                                className={`h-full rounded-full ${
+                                    scanStatus.status === 'error'
+                                        ? 'bg-red-500'
+                                        : scanStatus.status === 'complete'
+                                            ? 'bg-green-500'
+                                            : 'bg-gradient-to-r from-cyan-500 to-blue-500'
+                                }`}
                             />
                         </div>
-                    </motion.div>
+                    </motion.section>
                 )}
 
-                {/* Vulnerabilities */}
                 {scanStatus.vulnerabilities.length > 0 && (
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
+                    <motion.section
+                        initial={{ opacity: 0, y: 16 }}
                         animate={{ opacity: 1, y: 0 }}
-                        className="card p-6"
+                        className="card p-6 mt-8"
                     >
                         <div className="flex items-center justify-between mb-4">
                             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
@@ -1141,65 +953,31 @@ export default function WebScanPage() {
                         </div>
 
                         <div className="space-y-3">
-                            {scanStatus.vulnerabilities.map((vuln, index) => (
-                                <div
-                                    key={index}
-                                    className="p-4 bg-dark-800/50 rounded-lg border border-dark-600/50"
-                                >
-                                    <div className="flex items-start justify-between">
+                            {scanStatus.vulnerabilities.map((vulnerability, index) => (
+                                <div key={index} className="p-4 bg-dark-800/50 rounded-lg border border-dark-600/50">
+                                    <div className="flex items-start justify-between gap-4">
                                         <div>
-                                            <h4 className="font-medium text-white">{vuln.name}</h4>
-                                            <p className="text-gray-400 text-sm mt-1">{vuln.description}</p>
+                                            <h4 className="font-medium text-white">{vulnerability.name}</h4>
+                                            <p className="text-gray-400 text-sm mt-1">{vulnerability.description}</p>
                                         </div>
-                                        <span className={getSeverityClass(vuln.severity)}>
-                                            {vuln.severity}
+                                        <span className={getSeverityClass(vulnerability.severity)}>
+                                            {vulnerability.severity}
                                         </span>
                                     </div>
-                                    {vuln.cwe && (
-                                        <p className="text-gray-500 text-xs mt-2">CWE-{vuln.cwe}</p>
-                                    )}
                                 </div>
                             ))}
                         </div>
-                    </motion.div>
+                    </motion.section>
                 )}
 
-                {/* Info Section */}
-                {scanStatus.status === 'idle' && (
-                    <div className="grid md:grid-cols-2 gap-4">
-                        <div className="card p-4">
-                            <h4 className="font-medium text-white mb-2">What we scan for:</h4>
-                            <ul className="text-gray-400 text-sm space-y-1">
-                                <li>• SQL Injection (SQLi)</li>
-                                <li>• Cross-Site Scripting (XSS)</li>
-                                <li>• Insecure Direct Object References (IDOR)</li>
-                                <li>• Authentication Issues</li>
-                                <li>• Sensitive Data Exposure</li>
-                            </ul>
-                        </div>
-
-                        <div className="card p-4">
-                            <h4 className="font-medium text-white mb-2">How it works:</h4>
-                            <ul className="text-gray-400 text-sm space-y-1">
-                                <li>1. URL validation & whitelist check</li>
-                                <li>2. Burp Suite automated crawl</li>
-                                <li>3. AI-enhanced vulnerability testing</li>
-                                <li>4. Recheck agent validation</li>
-                                <li>5. PDF report generation</li>
-                            </ul>
-                        </div>
-                    </div>
+                {scanStatus.id && (
+                    <ReportOptionsModal
+                        isOpen={reportModalOpen}
+                        onClose={() => setReportModalOpen(false)}
+                        scanId={scanStatus.id}
+                    />
                 )}
             </main>
-
-            {/* Report Options Modal */}
-            {scanStatus.id && (
-                <ReportOptionsModal
-                    isOpen={reportModalOpen}
-                    onClose={() => setReportModalOpen(false)}
-                    scanId={scanStatus.id}
-                />
-            )}
         </div>
     );
 }

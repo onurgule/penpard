@@ -34,7 +34,7 @@ interface NormalizedBurpHttpResult {
     responseBody: string;
 }
 
-interface RequestExecutionAftermath {
+export interface RequestExecutionAftermath {
     url: string;
     method: string;
     statusCode: number;

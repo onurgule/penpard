@@ -53,9 +53,11 @@ import { OrchestratorSystemPromptBuilder } from './orchestrator/OrchestratorSyst
 import { OrchestratorToolDispatcher } from './orchestrator/OrchestratorToolDispatcher';
 import { OrchestratorToolRegistry } from './orchestrator/OrchestratorToolRegistry';
 import { OrchestratorScanStatus } from './orchestrator/OrchestratorScanStatus';
+import type { OrchestratorScanStatusOverrides } from './orchestrator/OrchestratorScanStatus';
 import { safeSnippetForLog, summarizeToolCallForLog } from './orchestrator/OrchestratorSafeLogging';
 import { evaluateToolExecutionGuard, resolveAuthIdentityId } from './orchestrator/OrchestratorToolPolicy';
 import { buildPromptIdentityContext } from '../services/prompt-data-minimization';
+import { ScopedMissionPolicy } from '../services/runtime/ScopedMissionPolicy';
 import {
     AgentReflection,
     AgentPhase,
@@ -91,6 +93,10 @@ interface ScanConfig {
     sourceAnalysisMode?: string;
     /** Explicit startup auth discovery/login strategy for Web Scans. */
     authStartup?: AuthStartupConfig;
+    /** Optional scoped mission runtime policy for bounded exploratory launches. */
+    scopedMissionPolicy?: ScopedMissionPolicy;
+    /** Optional status remapping for runtimes that reuse the exploratory agent under a different lifecycle. */
+    statusOverrides?: OrchestratorScanStatusOverrides;
 }
 
 interface ContinueScanOptions {
@@ -442,6 +448,7 @@ export class OrchestratorAgent {
             burp,
             authManager: this.authManager,
             log: (channel, message) => this.log(channel, message),
+            scopePolicy: config.scopedMissionPolicy,
             onEndpointDiscovered: (_path, _method, source) => {
                 if (source === 'harvest-refresh') {
                     void this.scanSurface.refreshEndpointInventory('harvest', false);
@@ -481,11 +488,14 @@ export class OrchestratorAgent {
             setRateLimitPauseUntil: (until) => {
                 this.state.setRateLimitPauseUntil(until);
             },
-            onRequestAftermath: ({ url, method, statusCode }) => this.scanSurface.recordRequestExecution({
-                url,
-                method,
-                statusCode,
-            }),
+            onRequestAftermath: (aftermath) => {
+                this.scanSurface.recordRequestExecution({
+                    url: aftermath.url,
+                    method: aftermath.method,
+                    statusCode: aftermath.statusCode,
+                });
+                this.config.scopedMissionPolicy?.recordExecutedRequest(aftermath);
+            },
             onManagedAuthRefreshed: (identityId) => this.browserSession.seedBrowserFromAuthManager(identityId),
         });
         this.findingTracker = new OrchestratorFindingTracker({
@@ -495,9 +505,10 @@ export class OrchestratorAgent {
             getLastExchange: () => this.requestExecutor.getLastExchange(),
             onFindingSaved: (finding) => {
                 this.state.pushFinding(finding);
+                this.config.scopedMissionPolicy?.recordFinding(finding);
             },
         });
-        this.scanStatus = new OrchestratorScanStatus(scanId);
+        this.scanStatus = new OrchestratorScanStatus(scanId, undefined, config.statusOverrides);
         this.browserTools = new OrchestratorBrowserTools({
             browserSession: this.browserSession,
             scanSurface: this.scanSurface,
@@ -556,7 +567,9 @@ export class OrchestratorAgent {
             guard: (toolCall) => {
                 const guardResult = evaluateToolExecutionGuard({
                     toolName: toolCall.tool,
+                    toolArgs: toolCall.args,
                     isFocusedScope: this.isFocusedScope,
+                    scopePolicy: this.config.scopedMissionPolicy,
                     rateLimitPauseUntil: this.state.rateLimitPauseUntil,
                 });
 
@@ -1004,6 +1017,13 @@ export class OrchestratorAgent {
             currentPlan: stateSnapshot.currentPlan,
             ...loopState,
         };
+    }
+
+    public getRuntimeSummary(): any | null {
+        return this.config.scopedMissionPolicy?.buildRuntimeSummary({
+            missionState: this.getState().phase,
+            targetUrl: this.targetUrl,
+        }) || null;
     }
 
     public getLogs(since: number = 0): string[] {

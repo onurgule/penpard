@@ -1,10 +1,13 @@
 import { IdentityRegistry, RequestAuthIntent } from '../../services/auth';
+import { ScopedMissionPolicy } from '../../services/runtime/ScopedMissionPolicy';
 
 const ENUMERATION_TOOLS = new Set(['spider_url', 'get_sitemap', 'extract_links']);
 
 export interface ToolExecutionGuardInput {
     toolName: string;
+    toolArgs?: Record<string, any>;
     isFocusedScope: boolean;
+    scopePolicy?: ScopedMissionPolicy;
     rateLimitPauseUntil: Date | null;
     now?: Date;
 }
@@ -29,6 +32,7 @@ export function evaluateToolExecutionGuard(input: ToolExecutionGuardInput): Tool
     }
 
     if (input.isFocusedScope && ENUMERATION_TOOLS.has(input.toolName)) {
+        input.scopePolicy?.recordBoundaryBlock(`Blocked "${input.toolName}" because the scoped mission does not allow broad enumeration.`);
         return {
             allowed: false,
             logMessage: `Blocked "${input.toolName}" because operator instructions define a focused scope.`,
@@ -39,7 +43,51 @@ export function evaluateToolExecutionGuard(input: ToolExecutionGuardInput): Tool
         };
     }
 
+    if (input.scopePolicy && isScopedPolicyTool(input.toolName)) {
+        const decision = input.scopePolicy.evaluateTool({
+            toolName: input.toolName,
+            method: typeof input.toolArgs?.method === 'string' ? input.toolArgs.method : undefined,
+            url: typeof input.toolArgs?.url === 'string' ? input.toolArgs.url : undefined,
+            useInitialRequestBaseline: input.toolArgs?.useInitialRequestBaseline === true,
+        });
+        if (!decision.allowed) {
+            const reason = decision.reason || `Blocked "${input.toolName}" because it would leave the active scoped mission boundary.`;
+            return {
+                allowed: false,
+                logMessage: reason,
+                response: {
+                    error: reason,
+                    blocked: true,
+                    boundaryReason: reason,
+                },
+            };
+        }
+    }
+
     return { allowed: true };
+}
+
+function isScopedPolicyTool(toolName: string): toolName is
+    | 'send_http_request'
+    | 'send_to_scanner'
+    | 'browser_navigate'
+    | 'browser_fill_and_submit'
+    | 'browser_get_page_state'
+    | 'browser_get_frontend_analysis'
+    | 'browser_evaluate_js'
+    | 'browser_screenshot'
+    | 'browser_correlate_burp' {
+    return [
+        'send_http_request',
+        'send_to_scanner',
+        'browser_navigate',
+        'browser_fill_and_submit',
+        'browser_get_page_state',
+        'browser_get_frontend_analysis',
+        'browser_evaluate_js',
+        'browser_screenshot',
+        'browser_correlate_burp',
+    ].includes(toolName);
 }
 
 export function resolveAuthIdentityId(args: Record<string, any> | undefined): string {

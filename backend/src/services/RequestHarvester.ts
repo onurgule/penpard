@@ -79,6 +79,16 @@ export interface RequestHarvesterCheckpointSummary {
     topScoring: Array<{ id: string; score: number; method: string; path: string; classification: string }>;
 }
 
+export interface RequestHarvesterScopeDecision {
+    allowed: boolean;
+    reason?: string;
+}
+
+export interface RequestHarvesterOptions {
+    allowRequest?: (request: HarvestedRequest) => RequestHarvesterScopeDecision;
+    onPolicyBlock?: (request: HarvestedRequest, reason: string) => void;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Service Class
 // ─────────────────────────────────────────────────────────────
@@ -86,6 +96,11 @@ export interface RequestHarvesterCheckpointSummary {
 export class RequestHarvester {
     private harvested: Map<string, HarvestedRequest> = new Map();
     private harvestCount: number = 0;
+    private readonly options: RequestHarvesterOptions;
+
+    constructor(options: RequestHarvesterOptions = {}) {
+        this.options = options;
+    }
 
     /**
      * Harvest new requests from Burp proxy history.
@@ -119,7 +134,8 @@ export class RequestHarvester {
                     req.interestScore = this.score(req);
                     return req;
                 })
-                .filter((req) => req.classification !== 'noise');
+                .filter((req) => req.classification !== 'noise')
+                .filter((req) => this.isAllowedByScope(req));
 
             if (processed.length === 0) {
                 logger.info('[Harvester] All newly observed requests were filtered as noise');
@@ -234,6 +250,21 @@ export class RequestHarvester {
     clear(): void {
         this.harvested.clear();
         this.harvestCount = 0;
+    }
+
+    private isAllowedByScope(request: HarvestedRequest): boolean {
+        if (!this.options.allowRequest) {
+            return true;
+        }
+
+        const decision = this.options.allowRequest(request);
+        if (decision.allowed) {
+            return true;
+        }
+
+        const reason = String(decision.reason || 'Request fell outside the active scoped mission boundary.');
+        this.options.onPolicyBlock?.(request, reason);
+        return false;
     }
 
     // ─────────────────────────────────────────────────────────

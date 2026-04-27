@@ -9,6 +9,7 @@ test('prepareWebLaunch centralizes runtime defaults, auth shaping, and persisted
 
     const prepared = service.prepareWebLaunch({
         userId: 7,
+        scanMode: 'scoped',
         rateLimit: '9',
         useNuclei: 'true',
         useFfuf: true,
@@ -26,6 +27,8 @@ test('prepareWebLaunch centralizes runtime defaults, auth shaping, and persisted
         preferSharedPassword: 'false',
     });
 
+    assert.equal(prepared.scanMetadata.scanMode, 'scoped');
+    assert.equal(prepared.runtimeConfig.scanMode, 'scoped');
     assert.equal(prepared.runtimeConfig.rateLimit, 9);
     assert.equal(prepared.runtimeConfig.parallelAgents, 1);
     assert.equal(prepared.runtimeConfig.requestedParallelAgents, 10);
@@ -42,6 +45,7 @@ test('prepareWebLaunch centralizes runtime defaults, auth shaping, and persisted
     assert.equal(prepared.runtimeConfig.idorUsers?.[0]?.username, 'primary-user');
     assert.equal(prepared.runtimeConfig.idorUsers?.[0]?.password, 'top-secret');
     assert.equal(prepared.persistedConfig.executionMode, 'single-agent');
+    assert.equal(prepared.persistedConfig.scanMode, 'scoped');
     assert.equal(prepared.persistedConfig.effectiveParallelAgents, 1);
     assert.equal(prepared.persistedConfig.idorUsers[0].password, '[REDACTED]');
     assert.equal(prepared.persistedConfig.authStartup.credentials[0].password, '[REDACTED]');
@@ -66,6 +70,7 @@ test('prepareBurpLaunch keeps the control plane on the single-agent runtime path
     });
 
     assert.equal(prepared.runtimeConfig.parallelAgents, 1);
+    assert.equal(prepared.runtimeConfig.scanMode, 'exploratory');
     assert.equal(prepared.runtimeConfig.requestedParallelAgents, 3);
     assert.equal(prepared.runtimeConfig.maxIterations, 50);
     assert.equal(prepared.runtimeConfig.maxPlanRounds, 0);
@@ -76,4 +81,5 @@ test('prepareBurpLaunch keeps the control plane on the single-agent runtime path
     assert.equal(prepared.runtimeConfig.authStartup?.mode, 'no_credentials');
     assert.deepEqual(prepared.runtimeConfig.idorUsers, []);
     assert.equal(prepared.persistedConfig.executionMode, 'single-agent');
+    assert.equal(prepared.persistedConfig.scanMode, 'exploratory');
 });

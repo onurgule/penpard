@@ -1,5 +1,6 @@
 import { AgentPool } from '../../agents/AgentPool';
 import { OrchestratorAgent } from '../../agents/OrchestratorAgent';
+import type { ActiveScanRuntime } from './ScanRuntimeContract';
 
 export interface ScanLogCacheEntry {
     logs: string[];
@@ -9,11 +10,13 @@ export interface ScanLogCacheEntry {
 
 export type ScanRuntimeHandle =
     | { kind: 'agent'; scanId: string; agent: OrchestratorAgent }
-    | { kind: 'pool'; scanId: string; pool: AgentPool };
+    | { kind: 'pool'; scanId: string; pool: AgentPool }
+    | { kind: 'runtime'; scanId: string; runtime: ActiveScanRuntime };
 
 export class ScanRuntimeRegistry {
     private readonly activeAgents = new Map<string, OrchestratorAgent>();
     private readonly activePools = new Map<string, AgentPool>();
+    private readonly activeRuntimes = new Map<string, ActiveScanRuntime>();
     private readonly scanLogCache = new Map<string, ScanLogCacheEntry>();
 
     constructor(private readonly maxCachedScans: number = 20) {}
@@ -26,17 +29,31 @@ export class ScanRuntimeRegistry {
         this.activePools.set(scanId, pool);
     }
 
+    public registerRuntime(scanId: string, runtime: ActiveScanRuntime): void {
+        this.activeRuntimes.set(scanId, runtime);
+    }
+
     public unregister(scanId: string): void {
         this.activeAgents.delete(scanId);
         this.activePools.delete(scanId);
+        this.activeRuntimes.delete(scanId);
     }
 
     public getAgent(scanId: string): OrchestratorAgent | undefined {
-        return this.activeAgents.get(scanId);
+        const directAgent = this.activeAgents.get(scanId);
+        if (directAgent) {
+            return directAgent;
+        }
+
+        return this.activeRuntimes.get(scanId)?.getAgent?.();
     }
 
     public getPool(scanId: string): AgentPool | undefined {
         return this.activePools.get(scanId);
+    }
+
+    public getActiveRuntime(scanId: string): ActiveScanRuntime | undefined {
+        return this.activeRuntimes.get(scanId);
     }
 
     public getRuntime(scanId: string): ScanRuntimeHandle | undefined {
@@ -50,11 +67,16 @@ export class ScanRuntimeRegistry {
             return { kind: 'pool', scanId, pool };
         }
 
+        const runtime = this.activeRuntimes.get(scanId);
+        if (runtime) {
+            return { kind: 'runtime', scanId, runtime };
+        }
+
         return undefined;
     }
 
     public hasActiveRuntime(scanId: string): boolean {
-        return this.activeAgents.has(scanId) || this.activePools.has(scanId);
+        return this.activeAgents.has(scanId) || this.activePools.has(scanId) || this.activeRuntimes.has(scanId);
     }
 
     public getActiveAgentCount(): number {
@@ -65,8 +87,12 @@ export class ScanRuntimeRegistry {
         return this.activePools.size;
     }
 
+    public getActiveRuntimeCount(): number {
+        return this.activeRuntimes.size;
+    }
+
     public getTotalActiveRuntimeCount(): number {
-        return this.activeAgents.size + this.activePools.size;
+        return this.activeAgents.size + this.activePools.size + this.activeRuntimes.size;
     }
 
     public cacheLogs(scanId: string, snapshot: Omit<ScanLogCacheEntry, 'cachedAt'>): ScanLogCacheEntry {
@@ -97,6 +123,15 @@ export class ScanRuntimeRegistry {
             logs: pool.getLogs(0),
             phase,
         });
+    }
+
+    public captureRuntimeLogs(scanId: string, runtime: ActiveScanRuntime, phaseOverride?: string): ScanLogCacheEntry {
+        const snapshot = runtime.captureLogs?.(phaseOverride) || {
+            logs: runtime.getLogs(0),
+            phase: phaseOverride ?? runtime.getPhase(),
+        };
+
+        return this.cacheLogs(scanId, snapshot);
     }
 
     private trimLogCache(): void {
