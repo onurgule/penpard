@@ -104,6 +104,62 @@ test('runHarvestCycle logs and completes without errors', async () => {
     assert.ok(logs.some((l) => l.includes('HARVEST CYCLE')));
 });
 
+test('repeater_test sends scoped mutations through the Burp-visible request rail with attribution', async () => {
+    const sent: Array<{ tool: string; args: Record<string, any> }> = [];
+    const { coordinator } = createCoordinator({
+        scanId: 'scan-domain-scoped',
+        burp: {
+            callTool: async (tool: string, args: Record<string, any>) => {
+                sent.push({ tool, args });
+                return {
+                    statusCode: 200,
+                    headers: ['content-type: application/json'],
+                    body: '{"orderId":2}',
+                };
+            },
+        },
+    });
+    (coordinator.harvester as any).getById = () => ({
+        id: 'req-order',
+        method: 'GET',
+        url: 'https://app.example.com/api/orders?orderId=1',
+        path: '/api/orders?orderId=1',
+        host: 'app.example.com',
+        statusCode: 200,
+        mimeType: 'application/json',
+        requestHeaders: {},
+        requestBody: '',
+        responseBody: '{"orderId":1}',
+        responseHeaders: { 'content-type': 'application/json' },
+        params: [],
+        classification: 'object-reference',
+        interestScore: 90,
+        harvestedAt: new Date(),
+        source: 'user',
+        promoted: true,
+        testedHypotheses: [],
+    });
+
+    const result = await coordinator.executeRepeaterTest({
+        tool: 'repeater_test',
+        args: {
+            requestId: 'req-order',
+            mutations: [{
+                parameter: 'orderId',
+                originalValue: '1',
+                newValue: '2',
+                description: 'Adjacent order identifier contrast',
+            }],
+        },
+    });
+
+    assert.equal(sent[0].tool, 'send_http_request');
+    assert.equal(sent[0].args.use_proxy, true);
+    assert.match(sent[0].args.penpard_source, /scan-domain-scoped\/repeater_test/);
+    assert.equal(result.results[0].burpVisible, true);
+    assert.match(result.results[0].requestSummary, /orderId=2/);
+});
+
 test('getHarvestConversationSummary returns system-injection-ready string', () => {
     const { coordinator } = createCoordinator();
     const summary = coordinator.getHarvestConversationSummary();

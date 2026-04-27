@@ -42,6 +42,36 @@ test('scan chat service routes live commands to the active agent and only persis
     ]);
 });
 
+test('scan chat service routes commands through live runtime wrappers when present', async () => {
+    const persisted: Array<{ role: string; content: string }> = [];
+    let handledCommand = '';
+
+    const service = new ScanChatService({
+        runtimeService: {
+            getActiveAgent: () => undefined,
+            sendCommandToActiveRuntime: async (_scanId: string, command: string) => {
+                handledCommand = command;
+                return true;
+            },
+        } as any,
+        generate: async () => {
+            throw new Error('LLM should not be called for active runtime chats');
+        },
+        persistChatMessage: (_scanId, role, content) => {
+            persisted.push({ role, content });
+        },
+        loadFindings: () => [],
+    });
+
+    const result = await service.handleCommand(scan, 'Stay on the checkout route and keep probing totals');
+
+    assert.deepEqual(result, { message: 'Command sent to agent' });
+    assert.equal(handledCommand, 'Stay on the checkout route and keep probing totals');
+    assert.deepEqual(persisted, [
+        { role: 'human', content: 'Stay on the checkout route and keep probing totals' },
+    ]);
+});
+
 test('scan chat service answers completed-scan questions with scan-context LLM prompts and persists the reply', async () => {
     const persisted: Array<{ role: string; content: string }> = [];
     let capturedRequest: any = null;

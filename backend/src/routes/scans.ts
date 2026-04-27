@@ -117,6 +117,7 @@ function buildMissionControlLiveRuntimePayload(input: {
     scopedTestRequest: ReturnType<typeof getScopedTestRequest>;
     focusedTestCases: ReturnType<typeof listFocusedTestCasesWithExecutionSummary>;
     focusedFindingThreads: ReturnType<typeof listLatestPrimaryFocusedFindingThreadsByScan>;
+    standardFindingCount?: number;
 }) {
     const liveRuntime = scanRuntimeService.getRuntimeSummary(input.scanId);
     if (liveRuntime) {
@@ -162,7 +163,7 @@ function buildMissionControlLiveRuntimePayload(input: {
             : null,
         latestSuspiciousSignal: activeFindingThread?.strongestSuspiciousSignal || activeFindingThread?.strongestSupportSummary || null,
         currentDecisionSummary: latestTrace?.nextStepRationale || latestTrace?.reasoningNote || activeCase?.hypothesis || null,
-        liveFindingCount: input.focusedFindingThreads.length,
+        liveFindingCount: input.focusedFindingThreads.length + Math.max(0, Number(input.standardFindingCount) || 0),
         boundarySummary: input.scopeEnvelope ? {
             allowedHosts: input.scopeEnvelope.allowedHosts,
             allowedRoutes: input.scopeEnvelope.allowedRoutes,
@@ -871,6 +872,7 @@ router.get('/:id', authenticateToken, async (req: AuthRequest, res: Response) =>
                 scopedTestRequest,
                 focusedTestCases: focusedVisibilityPayload.focusedTestCases,
                 focusedFindingThreads: focusedVisibilityPayload.focusedFindingThreads,
+                standardFindingCount: vulnerabilities.length,
             })
             : null;
 
@@ -1668,7 +1670,31 @@ router.get('/:id/live', authenticateToken, async (req: AuthRequest, res: Respons
         const scan = getOwnedScanOrRespond(id, user.id, res);
         if (!scan) return;
 
-        res.json(scanRuntimeService.getLiveStatus(id, scan as any, since));
+        const liveStatus = scanRuntimeService.getLiveStatus(id, scan as any, since);
+        if (scan.scan_mode === 'scoped' && (!liveStatus.liveRuntimeSummary || !liveStatus.scopedRuntime)) {
+            const focusedTestCases = listFocusedTestCasesWithExecutionSummary(id);
+            const focusedVisibilityPayload = buildFocusedVisibilityPayload(id, focusedTestCases);
+            const scopedRuntimeSummary = buildMissionControlLiveRuntimePayload({
+                scanId: id,
+                status: scan.status,
+                focusedTestObjective: getFocusedTestObjective(id),
+                scopeEnvelope: getScopeEnvelope(id),
+                scopedTestRequest: getScopedTestRequest(id),
+                focusedTestCases: focusedVisibilityPayload.focusedTestCases,
+                focusedFindingThreads: focusedVisibilityPayload.focusedFindingThreads,
+                standardFindingCount: getVulnerabilitiesByScan(id).length,
+            });
+            liveStatus.liveRuntimeSummary = liveStatus.liveRuntimeSummary || scopedRuntimeSummary;
+            liveStatus.scopedRuntime = liveStatus.scopedRuntime || scopedRuntimeSummary;
+            if (scan.status === 'scoped_executed') {
+                liveStatus.scanCompleted = true;
+                if (liveStatus.burpConnected === false) {
+                    liveStatus.burpConnected = null;
+                }
+            }
+        }
+
+        res.json(liveStatus);
     } catch (error: any) {
         logger.error('Live status error', { error: error.message });
         res.status(500).json({ error: true, message: 'Failed to get live status' });
@@ -1702,6 +1728,3 @@ router.post('/:id/browser/hide', authenticateToken, async (req: AuthRequest, res
 });
 
 export default router;
-
-
-

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const { ScanRuntimeService } = require('../src/services/runtime/ScanRuntimeService') as typeof import('../src/services/runtime/ScanRuntimeService');
-const { createScan, getScan, initDatabase } = require('../src/db/init') as typeof import('../src/db/init');
+const { createScan, getScan, initDatabase, updateScanStatus } = require('../src/db/init') as typeof import('../src/db/init');
 const { scanRuntimeCheckpointService } = require('../src/services/runtime/ScanRuntimeCheckpointService') as typeof import('../src/services/runtime/ScanRuntimeCheckpointService');
 
 test('finalizeAgentRuntime captures the resolved terminal phase before unregistering the runtime', () => {
@@ -418,6 +418,31 @@ test('getLiveStatus surfaces the persisted runtime checkpoint when no active run
     assert.equal(Object.prototype.hasOwnProperty.call(live, 'scopedRuntime'), true);
     assert.equal(live.liveRuntimeSummary, null);
     assert.equal(live.scopedRuntime, null);
+});
+
+test('getLiveStatus treats scoped_executed as a completed terminal state', async () => {
+    await initDatabase();
+
+    const scanId = `scan-runtime-scoped-complete-${Date.now()}`;
+    createScan({
+        id: scanId,
+        userId: 1,
+        type: 'web',
+        target: 'https://app.example.com/orders/1',
+        scanMode: 'scoped',
+    });
+    updateScanStatus(scanId, 'scoped_executed');
+
+    const service = new ScanRuntimeService({
+        getRuntime: () => undefined,
+        getCachedLogs: () => undefined,
+        getTotalActiveRuntimeCount: () => 0,
+    } as any);
+
+    const live = service.getLiveStatus(scanId, getScan(scanId) as any, 0);
+
+    assert.equal(live.scanCompleted, true);
+    assert.equal(live.burpConnected, null);
 });
 
 test('getLiveStatus mirrors active agent runtime summaries onto the generic Mission Control field', () => {

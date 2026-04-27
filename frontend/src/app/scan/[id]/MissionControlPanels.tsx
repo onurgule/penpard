@@ -15,7 +15,7 @@ import {
 } from './focused-plan';
 
 export interface MissionControlVulnerability {
-    id: number;
+    id: number | string;
     name: string;
     severity: string;
     description: string;
@@ -25,6 +25,8 @@ export interface MissionControlVulnerability {
     request?: string;
     response?: string;
     remediation?: string;
+    badgeLabel?: string;
+    metadata?: string[];
 }
 
 interface MissionControlScopedSupportStripProps {
@@ -38,10 +40,10 @@ interface MissionControlScopedSupportStripProps {
     onToggleLegacyRecovery: () => void;
 }
 
-interface MissionControlExploratoryFindingsProps {
-    vulnerabilities: MissionControlVulnerability[];
+interface MissionControlLiveFindingsProps {
+    findings: MissionControlVulnerability[];
     getSeverityColor: (severity: string) => string;
-    onSelectVulnerability: (vulnerability: MissionControlVulnerability) => void;
+    onSelectFinding: (finding: MissionControlVulnerability) => void;
 }
 
 export function MissionControlScopedSupportStrip(props: MissionControlScopedSupportStripProps) {
@@ -212,36 +214,45 @@ export function MissionControlScopedSupportStrip(props: MissionControlScopedSupp
     );
 }
 
-export function MissionControlExploratoryFindings(props: MissionControlExploratoryFindingsProps) {
-    const { vulnerabilities, getSeverityColor, onSelectVulnerability } = props;
+export function MissionControlLiveFindings(props: MissionControlLiveFindingsProps) {
+    const { findings, getSeverityColor, onSelectFinding } = props;
 
     return (
         <div className="flex-1 flex flex-col bg-white/5 rounded-xl border border-white/10 overflow-hidden min-h-0">
             <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0">
                 <h2 className="font-bold text-sm text-white">Live Findings</h2>
-                <span className="bg-red-500/20 text-red-400 px-2 py-0.5 rounded text-xs border border-red-500/20">{vulnerabilities.length} Issues</span>
+                <span className="bg-red-500/20 text-red-400 px-2 py-0.5 rounded text-xs border border-red-500/20">{findings.length} Issues</span>
             </div>
             <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin scrollbar-thumb-slate-700 min-h-0">
-                {vulnerabilities.length === 0 ? (
+                {findings.length === 0 ? (
                     <div className="text-center py-10 opacity-50">
                         <Shield className="w-10 h-10 mx-auto mb-2 text-slate-600" />
                         <div className="text-sm text-slate-500">No vulnerabilities found yet.</div>
                     </div>
                 ) : (
                     <AnimatePresence>
-                        {vulnerabilities.map((vulnerability) => (
+                        {findings.map((finding) => (
                             <motion.div
-                                key={vulnerability.id}
+                                key={finding.id}
                                 initial={{ opacity: 0, x: 20 }}
                                 animate={{ opacity: 1, x: 0 }}
-                                onClick={() => onSelectVulnerability(vulnerability)}
-                                className={`p-3 rounded-lg border cursor-pointer hover:bg-white/5 transition-colors ${getSeverityColor(vulnerability.severity)}`}
+                                onClick={() => onSelectFinding(finding)}
+                                className={`p-3 rounded-lg border cursor-pointer hover:bg-white/5 transition-colors ${getSeverityColor(finding.severity)}`}
                             >
                                 <div className="flex justify-between items-start mb-1">
-                                    <div className="font-bold text-sm truncate pr-2">{vulnerability.name}</div>
-                                    <div className="text-[10px] uppercase font-bold opacity-70">{vulnerability.severity}</div>
+                                    <div className="font-bold text-sm truncate pr-2">{finding.name}</div>
+                                    <div className="text-[10px] uppercase font-bold opacity-70">{finding.badgeLabel || finding.severity}</div>
                                 </div>
-                                <div className="text-xs opacity-80 line-clamp-2">{vulnerability.description}</div>
+                                <div className="text-xs opacity-80 line-clamp-2">{finding.description}</div>
+                                {finding.metadata?.length ? (
+                                    <div className="mt-2 flex flex-wrap gap-1.5 text-[10px] opacity-75">
+                                        {finding.metadata.slice(0, 4).map((entry) => (
+                                            <span key={`${finding.id}-${entry}`} className="px-1.5 py-0.5 rounded border border-white/10 bg-black/20">
+                                                {entry}
+                                            </span>
+                                        ))}
+                                    </div>
+                                ) : null}
                             </motion.div>
                         ))}
                     </AnimatePresence>

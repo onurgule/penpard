@@ -10,7 +10,6 @@ export interface MissionControlPolicy {
     isLegacyScopedRecoveryState: boolean;
     showLegacyRecoveryTools: boolean;
     showScopedSecondaryContext: boolean;
-    showSharedLiveFindings: boolean;
 }
 
 export function deriveMissionControlPolicy(input: MissionControlPolicyInput): MissionControlPolicy {
@@ -21,6 +20,5 @@ export function deriveMissionControlPolicy(input: MissionControlPolicyInput): Mi
         isLegacyScopedRecoveryState,
         showLegacyRecoveryTools: isScopedScan && input.legacyRecoveryRequested,
         showScopedSecondaryContext: isScopedScan,
-        showSharedLiveFindings: true,
     };
 }

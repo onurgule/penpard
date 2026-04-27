@@ -322,8 +322,8 @@ test('focused planning routes list, update, and regenerate persisted scoped case
     assert.equal((getResponse.body as any).scopedLiveRuntime.objectiveTitle, 'Orders scoped review');
     assert.equal(Object.prototype.hasOwnProperty.call(liveResponse.body as any, 'liveRuntimeSummary'), true);
     assert.equal(Object.prototype.hasOwnProperty.call(liveResponse.body as any, 'scopedRuntime'), true);
-    assert.equal((liveResponse.body as any).liveRuntimeSummary, null);
-    assert.equal((liveResponse.body as any).scopedRuntime, null);
+    assert.equal((liveResponse.body as any).liveRuntimeSummary.objectiveTitle, 'Orders scoped review');
+    assert.equal((liveResponse.body as any).scopedRuntime.objectiveTitle, 'Orders scoped review');
 
     const patchResponse = await request(app)
         .patch('/api/scans/scoped-route-scan/focused-test-cases/case-seeded')

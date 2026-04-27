@@ -444,6 +444,7 @@ export class OrchestratorAgent {
 
         // Initialize domain coordinator (owns harvester, hypothesis engine, coverage tracker)
         this.domainCoordinator = new OrchestratorDomainCoordinator({
+            scanId,
             targetUrl,
             burp,
             authManager: this.authManager,
@@ -484,6 +485,7 @@ export class OrchestratorAgent {
             log: (channel, message) => this.log(channel as any, message),
             delay: (ms) => this.delay(ms),
             maxSameRequest: 2,
+            disableDuplicateResponseCache: !!config.scopedMissionPolicy,
             rateLimitPauseMs: this.RATE_LIMIT_PAUSE_MS,
             setRateLimitPauseUntil: (until) => {
                 this.state.setRateLimitPauseUntil(until);

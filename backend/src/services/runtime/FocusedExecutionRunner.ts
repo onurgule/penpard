@@ -211,6 +211,7 @@ export class FocusedExecutionRunner {
             authManager,
             initialRequest: typeof scan.initial_request === 'string' ? scan.initial_request : undefined,
             log: (channel, message) => logger.info(`Focused execution [${channel}] ${message}`, { scanId }),
+            disableDuplicateResponseCache: true,
             rateLimitPauseMs: 60_000,
             setRateLimitPauseUntil: () => undefined,
         });

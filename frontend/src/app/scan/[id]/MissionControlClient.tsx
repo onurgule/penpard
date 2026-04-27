@@ -34,7 +34,7 @@ import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
 import { buildEndpointDisplayRows, EndpointInventorySnapshot } from './endpoint-intel';
 import {
-    MissionControlExploratoryFindings,
+    MissionControlLiveFindings,
     MissionControlScopedSupportStrip,
     type MissionControlVulnerability,
 } from './MissionControlPanels';
@@ -52,7 +52,6 @@ import {
     formatFocusedCaseCompareStatus,
     formatScopedFeatureDiscoveryOutcome,
     formatScopedFeatureDiscoveryPhase,
-    formatScopedWorkflowStage,
     formatFocusedEvidenceDriftClassification,
     formatFocusedInvestigationImpact,
     formatFocusedInvestigationStatus,
@@ -84,7 +83,6 @@ import {
     formatFocusedSupportProvenanceSummary,
     formatFocusedVerdictState,
     formatFocusedVerdictTransition,
-    getScopedRecommendedAction,
     summarizeScopedPlanReviewCounts,
     type EvidenceBundle,
     type FocusedCaseFinding,
@@ -107,8 +105,6 @@ import {
     type FocusedSuspicionExplanation,
     type MissionControlLiveRuntimeSummary,
     type FocusedTestCaseExecution,
-    isScopedReviewStage,
-    isScopedExecutionStage,
     type FocusedPlanSummary,
     type FocusedTestCase,
     type FocusedTestObjectiveSummary,
@@ -1006,11 +1002,38 @@ User Question: ${userQuestion}`;
     };
 
     // Show loading until scanId is resolved from URL
+    const isScopedScan = scanMode === 'scoped';
     const endpointRows = buildEndpointDisplayRows(endpointInventory, 24);
     const focusedCaseRows = buildFocusedCaseRows(focusedTestCases);
     const focusedCaseMap = new Map(focusedTestCases.map((testCase) => [testCase.id, testCase]));
     const focusedFindingRows = buildFocusedScanFindingRows(focusedFindings, focusedTestCases, focusedFindingThreads);
     const visibleFocusedFindingRows = focusedFindingRows.filter((entry) => entry.finding.status !== 'not_confirmed');
+    const scopedFindingCaseMap = new Map(visibleFocusedFindingRows.map((entry) => [String(entry.finding.id), entry.caseId]));
+    const scopedLiveFindingItems: MissionControlVulnerability[] = visibleFocusedFindingRows.map(({ finding, source, caseTitle, targetLabel }) => ({
+        id: finding.id,
+        name: finding.title,
+        severity: finding.status === 'confirmed' ? 'high' : finding.status === 'likely' ? 'medium' : finding.status === 'suspicious' ? 'low' : 'info',
+        badgeLabel: formatFocusedFindingStatus(finding.status),
+        description: finding.strongestSupportSummary || finding.nextStepSummary || `${caseTitle} on ${targetLabel}`,
+        metadata: [
+            source === 'runtime_thread' ? 'Provisional live thread' : caseTitle,
+            targetLabel,
+            formatFocusedFindingFamily(finding.family),
+            `${finding.suspicionScore}% suspicion`,
+        ].filter(Boolean),
+    }));
+    const scopedStandardFindingItems: MissionControlVulnerability[] = vulns.map((vulnerability) => ({
+        ...vulnerability,
+        badgeLabel: vulnerability.severity,
+        metadata: [
+            vulnerability.request ? 'Burp-visible request evidence' : 'Evidence pending request capture',
+            vulnerability.cwe,
+            vulnerability.cvssScore ? `CVSS ${vulnerability.cvssScore}` : null,
+        ].filter((entry): entry is string => !!entry),
+    }));
+    const liveFindingItems: MissionControlVulnerability[] = isScopedScan
+        ? [...scopedStandardFindingItems, ...scopedLiveFindingItems]
+        : vulns;
     const selectedEvidenceCase = selectedEvidenceCaseId ? focusedCaseMap.get(selectedEvidenceCaseId) || null : null;
     const selectedEvidenceRow = selectedEvidenceCaseId
         ? focusedCaseRows.find((row) => row.id === selectedEvidenceCaseId) || null
@@ -1052,24 +1075,27 @@ User Question: ${userQuestion}`;
         reviewState: selectedEvidenceCase?.reviewState,
         status: selectedEvidenceCase?.status,
     });
-    const isScopedScan = scanMode === 'scoped';
     const missionControlPolicy = deriveMissionControlPolicy({
         scanMode,
         status,
         legacyRecoveryRequested: showLegacyRecovery,
     });
-    const isScopedDiscoveryMode = isScopedScan && status === 'scoped_discovering';
-    const isScopedReviewMode = isScopedReviewStage(scanMode, status);
     const isLegacyScopedReviewMode = missionControlPolicy.isLegacyScopedRecoveryState;
-    const isScopedExecutionMode = isScopedExecutionStage(scanMode, status);
     const showLegacyRecoveryPanel = missionControlPolicy.showLegacyRecoveryTools;
     const showScopedSecondaryContext = missionControlPolicy.showScopedSecondaryContext;
-    const showSharedLiveFindings = missionControlPolicy.showSharedLiveFindings;
-    const scopedControlMode = isScopedScan && !isAgentActive && !scanCompleted && status !== 'failed' && status !== 'completed' && status !== 'stopped';
+    const isPrimaryMissionActive = isAgentActive || [
+        'scoped_discovering',
+        'planning',
+        'scoped_executing',
+        'scanning',
+        'crawling',
+        'testing',
+        'executing',
+        'replanning',
+        'reporting',
+    ].includes(status);
     const scopedReviewCounts = summarizeScopedPlanReviewCounts(focusedTestCases, focusedPlanSummary);
     const runnableFocusedCaseCount = scopedReviewCounts.approvedCount;
-    const scopedStageLabel = formatScopedWorkflowStage(status);
-    const scopedNextAction = getScopedRecommendedAction(status, scopedReviewCounts);
     const scopedExecutionLabel = status === 'scoped_executing'
         ? 'Running'
         : status === 'scoped_executed'
@@ -1202,30 +1228,6 @@ User Question: ${userQuestion}`;
             || browserLifecycleState === 'closed'
             ? 'bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20'
             : 'bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:bg-purple-500/20';
-    const scopedStatusBadgeClass = (() => {
-        switch (status) {
-            case 'scoped_discovering':
-                return 'border-blue-500/30 bg-blue-500/10 text-blue-200';
-            case 'planning':
-                return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200';
-            case 'awaiting_review':
-                return 'border-violet-500/30 bg-violet-500/10 text-violet-200';
-            case 'scoped_executing':
-                return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
-            case 'scoped_executed':
-                return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200';
-            case 'failed':
-                return 'border-red-500/30 bg-red-500/10 text-red-200';
-            default:
-                return 'border-slate-600 bg-slate-800/60 text-slate-200';
-        }
-    })();
-    const scopedPrimaryActionDisabled = executePending
-        || status === 'scoped_discovering'
-        || status === 'planning'
-        || status === 'scoped_executing'
-        || runnableFocusedCaseCount === 0;
-
     const getCaseCardClassName = (row: typeof focusedCaseRows[number]) => {
         if (row.status === 'disabled') {
             return 'border-slate-800 bg-slate-950/60 opacity-80';
@@ -1318,1674 +1320,6 @@ User Question: ${userQuestion}`;
                     <div className="w-12 h-12 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin mx-auto" />
                     <p className="text-slate-400">Loading Mission Control...</p>
                 </div>
-            </div>
-        );
-    }
-
-    if (isScopedScan && !showSharedLiveFindings) {
-        return (
-            <div className="min-h-screen bg-black text-slate-200 font-sans selection:bg-cyan-500/30">
-                <header className="border-b border-white/10 bg-black/50 backdrop-blur fixed top-10 w-full z-50">
-                    <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-                        <div className="flex items-center gap-4">
-                            <Link href="/dashboard" className="p-2 hover:bg-white/5 rounded-lg transition-colors">
-                                <ArrowLeft className="w-5 h-5 text-slate-400" />
-                            </Link>
-                            <div>
-                                <h1 className="font-bold text-white flex items-center gap-2">
-                                    <Activity className="w-4 h-4 text-cyan-400 animate-pulse" />
-                                    Mission Control
-                                </h1>
-                                <div className="text-xs text-slate-500 font-mono">ID: {scanId.substring(0, 8)}...</div>
-                            </div>
-                        </div>
-                        <div className="flex items-center gap-3">
-                            {isAgentActive && supportsBrowserVisibility && browserSessionId && status !== 'completed' && status !== 'failed' && status !== 'stopped' && (
-                                <button
-                                    onClick={async () => {
-                                        if (browserTransitioning) return;
-                                        setBrowserTransitioning(true);
-                                        try {
-                                            const endpoint = browserToggleAction;
-                                            const response = await axios.post(`${API_URL}/scans/${scanIdRef.current}/browser/${endpoint}`, {}, {
-                                                headers: { Authorization: `Bearer ${token}` },
-                                            });
-                                            const visibility = response.data || {};
-                                            setBrowserIsHeadless(visibility.isHeadless ?? null);
-                                            setBrowserTransitioning(Boolean(visibility.transitioning));
-                                            setBrowserLifecycleState(visibility.lifecycleState ?? null);
-                                            setBrowserIsLive(Boolean(visibility.isLive));
-                                            toast.success(
-                                                visibility.message
-                                                || (endpoint === 'show' ? 'Browser window opened' : 'Browser hidden'),
-                                            );
-                                        } catch (error: any) {
-                                            toast.error(error.response?.data?.message || 'Failed to toggle browser');
-                                        } finally {
-                                            setBrowserTransitioning(false);
-                                        }
-                                    }}
-                                    disabled={browserTransitioning}
-                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${browserButtonClass} disabled:opacity-50`}
-                                >
-                                    {browserTransitioning ? (
-                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                    ) : browserToggleAction === 'show' ? (
-                                        <Eye className="w-3.5 h-3.5" />
-                                    ) : (
-                                        <EyeOff className="w-3.5 h-3.5" />
-                                    )}
-                                    {browserButtonLabel}
-                                </button>
-                            )}
-                            {isAgentActive && supportsPause && !isPaused && status !== 'completed' && status !== 'failed' && status !== 'stopped' && (
-                                <button
-                                    onClick={handlePause}
-                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20 transition-colors text-xs font-medium"
-                                >
-                                    <Pause className="w-3.5 h-3.5" /> Pause
-                                </button>
-                            )}
-                            {supportsPause && isPaused && (
-                                <button
-                                    onClick={handleResume}
-                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20 transition-colors text-xs font-medium animate-pulse"
-                                >
-                                    <Play className="w-3.5 h-3.5" /> Resume
-                                </button>
-                            )}
-                            {(status === 'completed' || status === 'stopped' || status === 'scoped_executed') && (
-                                <button
-                                    onClick={() => setReportModalOpen(true)}
-                                    className="btn-primary flex items-center gap-2 text-xs"
-                                >
-                                    <Download className="w-4 h-4" /> Export Report
-                                </button>
-                            )}
-                            <div className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
-                                isPaused ? 'bg-amber-500/20 text-amber-400' :
-                                    status === 'scoped_discovering' ? 'bg-blue-500/20 text-blue-300 animate-pulse' :
-                                        status === 'planning' ? 'bg-cyan-500/20 text-cyan-300 animate-pulse' :
-                                            status === 'awaiting_review' ? 'bg-violet-500/20 text-violet-300' :
-                                                status === 'scoped_executing' ? 'bg-emerald-500/20 text-emerald-300 animate-pulse' :
-                                                    status === 'scoped_executed' ? 'bg-emerald-500/20 text-emerald-300' :
-                                                        status === 'failed' ? 'bg-red-500/20 text-red-300' :
-                                                            'bg-slate-800 text-slate-400'
-                            }`}>
-                                {isPaused ? 'paused' : status}
-                            </div>
-                        </div>
-                    </div>
-                </header>
-
-                <main className="pt-24 pb-8 px-4 max-w-7xl mx-auto space-y-6">
-                    <section className="grid gap-6 xl:grid-cols-[1.35fr,1fr]">
-                        <motion.div
-                            initial={{ opacity: 0, y: 12 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="card p-5 border-white/10"
-                        >
-                            <div className="flex items-start justify-between gap-4">
-                                <div className="space-y-3 min-w-0">
-                                    <div>
-                                        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">Request Summary</div>
-                                        <h2 className="mt-2 text-xl font-semibold text-white">Structured security test request</h2>
-                                    </div>
-                                    {scopedTestRequest ? (
-                                        <>
-                                            <div className="flex flex-wrap gap-2">
-                                                <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs break-all">
-                                                    {scopedTestRequest.targetUrl}
-                                                </span>
-                                                {scopedTestRequest.serviceName && (
-                                                    <span className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-200 text-xs">
-                                                        {scopedTestRequest.serviceName}
-                                                    </span>
-                                                )}
-                                                {scopedTestRequest.environment && (
-                                                    <span className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-300 text-xs uppercase">
-                                                        {scopedTestRequest.environment}
-                                                    </span>
-                                                )}
-                                            </div>
-                                            <p className="text-sm leading-7 text-slate-200">{scopedTestRequest.description}</p>
-                                        </>
-                                    ) : (
-                                        <p className="text-sm leading-7 text-slate-400">
-                                            Request details will appear here once the scoped run is initialized.
-                                        </p>
-                                    )}
-                                    {focusedTestObjective?.goal && (
-                                        <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Mission</div>
-                                            <p className="mt-2 text-sm leading-7 text-slate-200">{focusedTestObjective.goal}</p>
-                                        </div>
-                                    )}
-                                </div>
-                                <div className="shrink-0 hidden lg:flex">
-                                    <div className="w-16 h-16 rounded-2xl border border-cyan-500/20 bg-cyan-500/10 flex items-center justify-center">
-                                        <Crosshair className="w-7 h-7 text-cyan-300" />
-                                    </div>
-                                </div>
-                            </div>
-                            {(focusedTestObjective?.riskTags?.length || scopeEnvelope?.boundaryHints?.length) && (
-                                <div className="mt-4 flex flex-wrap gap-2">
-                                    {focusedTestObjective?.riskTags?.map((tag) => (
-                                        <span key={tag} className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-200 text-xs">
-                                            {tag}
-                                        </span>
-                                    ))}
-                                    {scopeEnvelope?.boundaryHints?.slice(0, 2).map((hint) => (
-                                        <span key={hint} className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-300 text-xs">
-                                            {hint}
-                                        </span>
-                                    ))}
-                                </div>
-                            )}
-                        </motion.div>
-
-                        <motion.div
-                            initial={{ opacity: 0, y: 12 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="card p-5 border-white/10"
-                        >
-                            <div className="space-y-4">
-                                <div className="flex flex-wrap items-center gap-2">
-                                    <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${scopedStatusBadgeClass}`}>
-                                        {scopedStageLabel}
-                                    </span>
-                                    {featureDiscoveryState && (
-                                        <span className="px-2.5 py-1 rounded-full border border-slate-700 bg-slate-900/70 text-slate-200 text-xs">
-                                            {formatScopedFeatureDiscoveryOutcome(featureDiscoveryState.outcome)}
-                                        </span>
-                                    )}
-                                </div>
-                                <div>
-                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Feature Discovery</div>
-                                    <h2 className="mt-2 text-lg font-semibold text-white">Bounded feature anchors</h2>
-                                </div>
-                                <p className="text-sm leading-7 text-slate-300">
-                                    {featureDiscoveryState?.errorMessage
-                                        || featureDiscoveryState?.summary
-                                        || 'PenPard is keeping discovery scoped to the submitted request and nearby feature flow.'}
-                                </p>
-                                <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-2">
-                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Anchors</div>
-                                    <div className="text-sm text-slate-200">{buildScopedAnchorSummary(scopeEnvelope, featureDiscoveryState)}</div>
-                                    {scopeEnvelope?.allowedRoutes?.length ? (
-                                        <div className="text-xs text-slate-400">
-                                            Scoped routes: {scopeEnvelope.allowedRoutes.slice(0, 3).join(', ')}
-                                            {scopeEnvelope.allowedRoutes.length > 3 ? ` +${scopeEnvelope.allowedRoutes.length - 3} more` : ''}
-                                        </div>
-                                    ) : null}
-                                </div>
-                            </div>
-                        </motion.div>
-                    </section>
-
-                    <motion.section
-                        initial={{ opacity: 0, y: 14 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="card p-6 border-violet-500/20 bg-gradient-to-br from-violet-500/6 via-slate-950 to-slate-950"
-                    >
-                        <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
-                            <div className="space-y-4 max-w-3xl">
-                                <div className="flex flex-wrap items-center gap-3">
-                                    <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${scopedStatusBadgeClass}`}>
-                                        {scopedStageLabel}
-                                    </span>
-                                    <span className="text-sm text-slate-400">Next action</span>
-                                    <span className="text-sm font-medium text-white">{scopedNextAction}</span>
-                                </div>
-                                <div>
-                                    <h2 className="text-2xl font-semibold text-white">{isLegacyScopedReviewMode ? 'Legacy Scoped Plan' : 'Live Scoped Mission'}</h2>
-                                    <p className="mt-2 text-sm leading-7 text-slate-300">
-                                        {isLegacyScopedReviewMode
-                                            ? 'This older scoped run still uses the manual case review flow. You can review and launch it here.'
-                                            : 'Scoped mode now uses the live exploratory-style runtime while staying pinned to the bounded feature area and route set.'}
-                                    </p>
-                                </div>
-                                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-                                    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
-                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Cases</div>
-                                        <div className="mt-2 text-2xl font-semibold text-white">{scopedReviewCounts.totalCases}</div>
-                                    </div>
-                                    {isLegacyScopedReviewMode ? (
-                                        <div className="rounded-2xl border border-violet-500/20 bg-violet-500/10 p-4">
-                                            <div className="text-[11px] uppercase tracking-[0.18em] text-violet-200">Awaiting Review</div>
-                                            <div className="mt-2 text-2xl font-semibold text-white">{scopedReviewCounts.pendingReviewCount}</div>
-                                        </div>
-                                    ) : (
-                                        <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-4">
-                                            <div className="text-[11px] uppercase tracking-[0.18em] text-cyan-200">Active Case</div>
-                                            <div className="mt-2 text-sm font-semibold text-white leading-6">{scopedActiveCaseLabel || 'Waiting for execution'}</div>
-                                        </div>
-                                    )}
-                                    <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-4">
-                                        <div className="text-[11px] uppercase tracking-[0.18em] text-emerald-200">{isLegacyScopedReviewMode ? 'Approved' : 'Finding Threads'}</div>
-                                        <div className="mt-2 text-2xl font-semibold text-white">{isLegacyScopedReviewMode ? scopedReviewCounts.approvedCount : (scopedLiveRuntime?.liveFindingCount ?? focusedFindingThreads.length)}</div>
-                                    </div>
-                                    <div className="rounded-2xl border border-slate-700 bg-slate-900/70 p-4">
-                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Disabled</div>
-                                        <div className="mt-2 text-2xl font-semibold text-white">{scopedReviewCounts.disabledCount}</div>
-                                    </div>
-                                    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
-                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{isLegacyScopedReviewMode ? 'Execution' : 'Rail'}</div>
-                                        <div className="mt-2 text-lg font-semibold text-white">{isLegacyScopedReviewMode ? scopedExecutionLabel : (scopedLiveRuntime?.currentRail ? formatFocusedExecutionRail(scopedLiveRuntime.currentRail) : 'System-only')}</div>
-                                    </div>
-                                    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
-                                        <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Verdict</div>
-                                        <div className="mt-2 text-lg font-semibold text-white">{formatFocusedVerdictState(focusedVerdictSummary?.overallVerdict)}</div>
-                                        {focusedHistoricalCompareState && (
-                                            <div className="mt-1 text-xs text-slate-400">{formatFocusedHistoricalCompareStatus(focusedHistoricalCompareState.comparisonStatus)}</div>
-                                        )}
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div className="w-full lg:max-w-sm rounded-2xl border border-white/10 bg-black/30 p-4 space-y-4">
-                                <div>
-                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Operator Controls</div>
-                                    <p className="mt-2 text-sm leading-6 text-slate-300">
-                                        {isLegacyScopedReviewMode
-                                            ? 'Review the cases you want to keep, then run only the approved set inside the current scope.'
-                                            : 'Watch the bounded mission work live. Manual controls are tucked behind recovery mode so the live runtime stays primary.'}
-                                    </p>
-                                </div>
-                                {!isLegacyScopedReviewMode && (
-                                    <button
-                                        onClick={() => setShowLegacyRecovery((current) => !current)}
-                                        className="w-full px-4 py-2 rounded-2xl border border-slate-700 bg-slate-900/70 text-slate-200 hover:bg-slate-800 text-sm font-medium"
-                                    >
-                                        {showLegacyRecoveryPanel ? 'Hide Legacy Recovery Tools' : 'Show Legacy Recovery Tools'}
-                                    </button>
-                                )}
-                                <div className="space-y-2">
-                                    {showLegacyRecoveryPanel && isLegacyScopedReviewMode && (
-                                        <button
-                                            onClick={() => handleRunFocusedExecution()}
-                                            disabled={scopedPrimaryActionDisabled}
-                                            className="w-full px-4 py-3 rounded-2xl bg-emerald-500 text-black font-semibold hover:bg-emerald-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                        >
-                                            {executePending || status === 'scoped_executing' ? 'Running Legacy Cases...' : 'Run Approved Legacy Cases'}
-                                        </button>
-                                    )}
-                                    <div className={`grid gap-2 ${showLegacyRecoveryPanel ? 'sm:grid-cols-2' : ''}`}>
-                                        <button
-                                            onClick={handleRefreshFocusedPlan}
-                                            disabled={!showLegacyRecoveryPanel || planRefreshPending || status === 'scoped_discovering' || status === 'planning' || status === 'scoped_executing'}
-                                            className="px-3 py-2 rounded-xl border border-violet-500/30 bg-violet-500/10 text-violet-200 hover:bg-violet-500/20 text-sm font-medium disabled:opacity-50"
-                                        >
-                                            {planRefreshPending || status === 'planning' ? 'Planning...' : isLegacyScopedReviewMode ? 'Regenerate Legacy Plan' : 'Re-seed Mission'}
-                                        </button>
-                                        <button
-                                            onClick={handleRefreshFocusedVerdicts}
-                                            disabled={!showLegacyRecoveryPanel || verdictRefreshPending || status !== 'scoped_executed'}
-                                            className="px-3 py-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 text-sm font-medium disabled:opacity-50"
-                                        >
-                                            {verdictRefreshPending ? 'Refreshing...' : 'Refresh Verdicts'}
-                                        </button>
-                                    </div>
-                                </div>
-                                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Recommended next step</div>
-                                    <div className="mt-2 text-sm font-medium text-white">{scopedNextAction}</div>
-                                    <div className="mt-2 text-xs leading-6 text-slate-400">
-                                        {isLegacyScopedReviewMode
-                                            ? (scopedPrimaryActionDisabled && status === 'awaiting_review'
-                                                ? 'Approve at least one enabled case to make execution available.'
-                                                : 'Execution remains bounded to the current scoped anchors and approved cases only.')
-                                            : showLegacyRecoveryPanel
-                                                ? 'Recovery actions stay secondary. The normal operator path is still the live bounded mission.'
-                                                : 'The mission stays bounded to the current scoped anchors, route set, and feature description even while it follows live suspicious signals.'}
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </motion.section>
-
-                    <section className="grid gap-6 xl:grid-cols-[minmax(0,1.7fr),380px] items-start">
-                        <motion.section
-                            initial={{ opacity: 0, y: 16 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="card border-white/10 overflow-hidden"
-                        >
-                            <div className="p-5 border-b border-white/10 bg-white/5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                                <div>
-                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{isLegacyScopedReviewMode ? 'Case Review' : 'Live Casebook'}</div>
-                                    <h2 className="mt-2 text-xl font-semibold text-white">
-                                        {focusedTestObjective?.title || (isLegacyScopedReviewMode ? 'Focused plan ready for operator review' : 'Bounded mission activity and case state')}
-                                    </h2>
-                                    <p className="mt-1 text-sm text-slate-400">
-                                        {isLegacyScopedReviewMode
-                                            ? 'Review each case, confirm what should run, and inspect evidence once execution starts.'
-                                            : 'Inspect live case reasoning, bounded follow-up decisions, and evidence as the mission progresses.'}
-                                    </p>
-                                </div>
-                                <div className="flex flex-wrap gap-2 text-xs text-slate-400">
-                                    {isLegacyScopedReviewMode && (
-                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20">Awaiting review: <span className="text-white">{scopedReviewCounts.pendingReviewCount}</span></span>
-                                    )}
-                                    <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20">{isLegacyScopedReviewMode ? 'Approved' : 'Live threads'}: <span className="text-white">{isLegacyScopedReviewMode ? scopedReviewCounts.approvedCount : (scopedLiveRuntime?.liveFindingCount ?? focusedFindingThreads.length)}</span></span>
-                                    <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20">Enabled: <span className="text-white">{scopedReviewCounts.enabledCount}</span></span>
-                                </div>
-                            </div>
-
-                            <div className="p-5 space-y-4">
-                                {focusedStorySummary && (
-                                    <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-3">
-                                        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                                            <div className="min-w-0">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200">Live Scoped Story</div>
-                                                <div className="mt-2 text-sm leading-7 text-amber-50">{focusedStorySummary.headline}</div>
-                                            </div>
-                                            <div className="flex flex-wrap gap-2 text-xs">
-                                                <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-black/20 text-amber-100">
-                                                    Suspicious cases {focusedStorySummary.suspiciousCaseCount}
-                                                </span>
-                                                <span className="px-2.5 py-1 rounded-full border border-red-500/20 bg-black/20 text-red-100">
-                                                    Blocked {focusedStorySummary.blockedCaseCount}
-                                                </span>
-                                                <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-black/20 text-violet-100">
-                                                    Provisional findings {focusedStorySummary.provisionalFindingCount}
-                                                </span>
-                                            </div>
-                                        </div>
-                                        {focusedStorySummary.currentBeliefs.length > 0 && (
-                                            <div className="text-xs leading-6 text-amber-100">
-                                                Current beliefs: {focusedStorySummary.currentBeliefs.slice(0, 3).join(' | ')}
-                                            </div>
-                                        )}
-                                        <div className="grid gap-3 lg:grid-cols-2">
-                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Unresolved Questions</div>
-                                                <div className="mt-2 text-xs leading-6 text-slate-300">
-                                                    {focusedStorySummary.unresolvedQuestions.length > 0
-                                                        ? focusedStorySummary.unresolvedQuestions.slice(0, 3).join(' | ')
-                                                        : 'No material unresolved question has been preserved yet.'}
-                                                </div>
-                                            </div>
-                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Recommended Next Steps</div>
-                                                <div className="mt-2 text-xs leading-6 text-cyan-100">
-                                                    {focusedStorySummary.recommendedNextSteps.length > 0
-                                                        ? focusedStorySummary.recommendedNextSteps.slice(0, 3).join(' | ')
-                                                        : isLegacyScopedReviewMode
-                                                            ? 'Continue with the approved bounded cases or refresh verdicts after execution completes.'
-                                                            : 'Continue following the bounded mission evidence and refresh verdicts after the run completes.'}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                )}
-                                {focusedCaseRows.length === 0 ? (
-                                    <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 p-10 text-center">
-                                        <CheckCircle className="w-10 h-10 mx-auto text-slate-600 mb-3" />
-                                        <h3 className="text-lg font-semibold text-white">{scopedStageLabel}</h3>
-                                        <p className="mt-2 text-sm text-slate-400">
-                                            {status === 'planning' || status === 'scoped_discovering'
-                                                ? 'Focused cases will appear here as soon as discovery and planning finish.'
-                                                : 'No focused cases are available for this scoped run yet.'}
-                                        </p>
-                                    </div>
-                                ) : (
-                                    focusedCaseRows.map((row) => {
-                                        const caseStory = focusedStoryCaseMap.get(row.id) || null;
-                                        const candidateInputs = summarizeFocusedCaseInputs(row);
-                                        const primaryConcern = row.caseIntelligence?.securityConcerns?.[0] || null;
-                                        const followUpPolicy = row.caseIntelligence?.followUpPolicy || null;
-                                        const boundedStopReason = summarizeFocusedCaseStopReason(row);
-                                        const nextStepSummary = summarizeFocusedCaseNextStep(row);
-                                        const actionPending = planActionCaseId === row.id;
-                                        const retryLabel = row.lastRunAt ? 'Retry' : 'Run Case';
-                                        const tracePreview = buildFocusedTracePreview(row.latestExecutionTracePreview, 2);
-                                        const reasoningPreview = buildFocusedReasoningTracePreview(row.latestReasoningTracePreview, 2);
-
-                                        return (
-                                            <article
-                                                key={row.id}
-                                                className={`rounded-2xl border p-5 transition-colors ${getCaseCardClassName(row)}`}
-                                            >
-                                                <div className="flex flex-col gap-4">
-                                                    <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                                                        <div className="space-y-3 min-w-0">
-                                                            <div className="flex flex-wrap gap-2">
-                                                                <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${getPriorityBadgeClassName(row.priority)}`}>
-                                                                    {formatFocusedPriority(row.priority)}
-                                                                </span>
-                                                                <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${getReviewBadgeClassName(row)}`}>
-                                                                    {formatFocusedReviewState(row.reviewState)}
-                                                                </span>
-                                                                <span className={`px-2.5 py-1 rounded-full border text-xs ${getExecutionBadgeClassName(row.executionPresentationState)}`}>
-                                                                    {formatFocusedExecutionPresentationState(row.executionPresentationState)}
-                                                                </span>
-                                                                {row.executionRailSummary && (
-                                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs">
-                                                                        {formatFocusedExecutionRail(row.executionRailSummary.rail)}
-                                                                    </span>
-                                                                )}
-                                                                {row.latestVerdict && (
-                                                                    <span className={`px-2.5 py-1 rounded-full border text-xs ${getVerdictBadgeClassName(row.latestVerdict.verdictState)}`}>
-                                                                        {formatFocusedVerdictState(row.latestVerdict.verdictState)}
-                                                                    </span>
-                                                                )}
-                                                                {row.historicalCompare && (
-                                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs">
-                                                                        {formatFocusedHistoricalOutcome(row.historicalCompare.historicalOutcome)}
-                                                                    </span>
-                                                                )}
-                                                                {row.status === 'disabled' && (
-                                                                    <span className="px-2.5 py-1 rounded-full border border-slate-600 bg-slate-900/80 text-slate-300 text-xs">
-                                                                        Disabled
-                                                                    </span>
-                                                                )}
-                                                            </div>
-                                                            <div>
-                                                                <h3 className="text-lg font-semibold text-white">{row.title}</h3>
-                                                                <p className="mt-1 text-sm text-cyan-100 break-all">{row.targetLabel}</p>
-                                                                {row.primaryFinding && (
-                                                                    <div className="mt-3 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-3 space-y-2">
-                                                                        <div className="flex flex-wrap items-center justify-between gap-2">
-                                                                            <div className="min-w-0">
-                                                                                <div className="text-sm font-semibold text-white truncate">{row.primaryFinding.title}</div>
-                                                                                <div className="text-[10px] text-slate-400">
-                                                                                    {formatFocusedFindingFamily(row.primaryFinding.family)} · {formatFocusedFindingConfidenceBand(row.primaryFinding.confidenceBand)}
-                                                                                </div>
-                                                                            </div>
-                                                                            <div className="flex flex-wrap gap-2">
-                                                                                <span className={`px-2 py-0.5 rounded-full border text-[10px] font-semibold uppercase ${
-                                                                                    row.primaryFinding.status === 'confirmed'
-                                                                                        ? 'border-red-500/30 bg-red-500/10 text-red-300'
-                                                                                        : row.primaryFinding.status === 'likely'
-                                                                                            ? 'border-orange-500/30 bg-orange-500/10 text-orange-300'
-                                                                                            : row.primaryFinding.status === 'suspicious'
-                                                                                                ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-                                                                                                : row.primaryFinding.status === 'inconclusive'
-                                                                                                    ? 'border-slate-500/30 bg-slate-500/10 text-slate-300'
-                                                                                                    : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                                                                                }`}>
-                                                                                    {formatFocusedFindingStatus(row.primaryFinding.status)}
-                                                                                </span>
-                                                                                {row.secondaryFindingsCount > 0 && (
-                                                                                    <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-[10px] text-slate-300">
-                                                                                        +{row.secondaryFindingsCount} secondary finding{row.secondaryFindingsCount === 1 ? '' : 's'}
-                                                                                    </span>
-                                                                                )}
-                                                                            </div>
-                                                                        </div>
-                                                                        <div className="grid gap-2 sm:grid-cols-2 text-[10px] text-slate-300">
-                                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
-                                                                                Suspicion {row.primaryFinding.suspicionScore}%
-                                                                            </div>
-                                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
-                                                                                Confirmation {row.primaryFinding.confirmationProgress}%
-                                                                            </div>
-                                                                        </div>
-                                                                        <div className="text-[11px] text-slate-200 leading-relaxed">
-                                                                            Strongest signal: {row.primaryFinding.strongestSupportSummary}
-                                                                        </div>
-                                                                        {row.primaryFinding.blockingConstraintSummary && (
-                                                                            <div className="text-[10px] text-red-200 leading-relaxed">
-                                                                                Blocker: {row.primaryFinding.blockingConstraintSummary}
-                                                                            </div>
-                                                                        )}
-                                                                        {row.primaryFinding.nextStepSummary && (
-                                                                            <div className="text-[10px] text-cyan-100 leading-relaxed">
-                                                                                Next step: {row.primaryFinding.nextStepSummary}
-                                                                            </div>
-                                                                        )}
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                        <div className="text-xs text-slate-500 lg:text-right shrink-0">
-                                                            {row.lastRunAt
-                                                                ? `Last run ${new Date(row.lastRunAt).toLocaleString()}`
-                                                                : 'Not executed yet'}
-                                                        </div>
-                                                    </div>
-
-                                                    <div className="grid gap-3 md:grid-cols-2">
-                                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Hypothesis</div>
-                                                            <p className="mt-2 text-sm leading-7 text-slate-200">{row.hypothesis}</p>
-                                                            {row.hypothesisVisibility && (
-                                                                <div className="mt-3 space-y-2">
-                                                                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                                        <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
-                                                                            {formatFocusedHypothesisStatus(row.hypothesisVisibility.currentStatus)}
-                                                                        </span>
-                                                                        <span className="text-slate-500">
-                                                                            {row.hypothesisVisibility.caseFamily.replace(/_/g, ' ')}
-                                                                        </span>
-                                                                    </div>
-                                                                    {row.hypothesisVisibility.latestConfidenceSummary && (
-                                                                        <div className="text-xs leading-6 text-cyan-100">
-                                                                            {row.hypothesisVisibility.latestConfidenceSummary}
-                                                                        </div>
-                                                                    )}
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Planner rationale</div>
-                                                            <p className="mt-2 text-sm leading-7 text-slate-300">{row.rationale}</p>
-                                                            {row.suspicionExplanation && (
-                                                                <div className="mt-3 space-y-2">
-                                                                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                                        <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
-                                                                            {formatFocusedSuspicionProofStatus(row.suspicionExplanation.proofStatus)}
-                                                                        </span>
-                                                                        <span className="text-slate-500">
-                                                                            Suspiciousness {row.suspicionExplanation.suspiciousness}
-                                                                        </span>
-                                                                    </div>
-                                                                    <div className="text-xs leading-6 text-violet-100">
-                                                                        {row.suspicionExplanation.whySuspicious}
-                                                                    </div>
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    </div>
-
-                                                    {(row.caseIntelligence || caseStory) && (
-                                                        <div className="grid gap-3 xl:grid-cols-3">
-                                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Why This Case Exists</div>
-                                                                <div className="mt-2 text-sm leading-7 text-slate-200">
-                                                                    {row.caseIntelligence?.selectionSummary || caseStory?.currentBelief || row.rationale}
-                                                                </div>
-                                                                {row.caseIntelligence?.anchorSummary && (
-                                                                    <div className="mt-3 text-xs leading-6 text-slate-400">
-                                                                        Anchor: {row.caseIntelligence.anchorSummary}
-                                                                    </div>
-                                                                )}
-                                                                {caseStory?.whatWasObserved && (
-                                                                    <div className="mt-3 text-xs leading-6 text-violet-100">
-                                                                        Observed: {caseStory.whatWasObserved}
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Targeted Inputs</div>
-                                                                {candidateInputs.length > 0 ? (
-                                                                    <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                                                                        {candidateInputs.map((inputLabel) => (
-                                                                            <span key={`${row.id}-${inputLabel}`} className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
-                                                                                {inputLabel}
-                                                                            </span>
-                                                                        ))}
-                                                                    </div>
-                                                                ) : (
-                                                                    <div className="mt-2 text-xs leading-6 text-slate-500">No concrete observed input has been preserved yet.</div>
-                                                                )}
-                                                                <div className="mt-3 text-xs leading-6 text-slate-300">
-                                                                    {primaryConcern?.whyRelevant || caseStory?.whyItMatters || 'The runtime kept this case because it remained plausible inside the persisted anchors.'}
-                                                                </div>
-                                                                {caseStory?.whatWasTested && (
-                                                                    <div className="mt-3 text-xs leading-6 text-cyan-100">
-                                                                        Tested: {caseStory.whatWasTested}
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Bounded Follow-Up</div>
-                                                                {nextStepSummary ? (
-                                                                    <div className="mt-2 text-xs leading-6 text-cyan-100">Next step: {nextStepSummary}</div>
-                                                                ) : (
-                                                                    <div className="mt-2 text-xs leading-6 text-slate-500">No additional same-scope step is currently queued.</div>
-                                                                )}
-                                                                {boundedStopReason && (
-                                                                    <div className="mt-3 text-xs leading-6 text-red-200">Bounded stop: {boundedStopReason}</div>
-                                                                )}
-                                                                {(row.latestVerdict?.interpretationSummary?.uncertaintyReasons?.length || 0) > 0 && (
-                                                                    <div className="mt-3 text-xs leading-6 text-amber-200">
-                                                                        Uncertainty: {row.latestVerdict?.interpretationSummary?.uncertaintyReasons?.slice(0, 2).join(' | ')}
-                                                                    </div>
-                                                                )}
-                                                                {followUpPolicy && (
-                                                                    <div className="mt-3 text-[10px] leading-6 text-slate-400">
-                                                                        Follow-up budget {followUpPolicy.maxAdaptiveFollowUps} | queue threshold {followUpPolicy.queueThresholdScore}
-                                                                        {followUpPolicy.allowedConfirmationKinds.length > 0
-                                                                            ? ` | allowed: ${followUpPolicy.allowedConfirmationKinds.slice(0, 3).map((kind) => formatFocusedConfirmationKind(kind)).join(', ')}`
-                                                                            : ''}
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                    )}
-
-                                                    <div className="flex flex-wrap gap-2 text-xs">
-                                                        {row.primaryFinding && (
-                                                            <>
-                                                                <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-200">
-                                                                    Suspicion {row.primaryFinding.suspicionScore}%
-                                                                </span>
-                                                                <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
-                                                                    Confirmation {row.primaryFinding.confirmationProgress}%
-                                                                </span>
-                                                            </>
-                                                        )}
-                                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
-                                                            {formatFocusedEvidenceCount(row.evidenceCount, row.scopeViolationCount)}
-                                                        </span>
-                                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
-                                                            {formatFocusedBrowserEvidenceCount(row.browserEvidenceCount, row.browserActionsUsed)}
-                                                        </span>
-                                                        {row.investigationSummary && (
-                                                            <span className={`px-2.5 py-1 rounded-full border text-xs ${
-                                                                row.investigationSummary.blockingCount > 0
-                                                                    ? 'border-red-500/30 bg-red-500/10 text-red-200'
-                                                                    : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
-                                                            }`}>
-                                                                {row.investigationSummary.unresolvedCount > 0
-                                                                    ? `${row.investigationSummary.unresolvedCount} investigation issue${row.investigationSummary.unresolvedCount === 1 ? '' : 's'}`
-                                                                    : 'No open investigation issues'}
-                                                            </span>
-                                                        )}
-                                                        {row.latestVerdict && (
-                                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
-                                                                {formatFocusedEvidenceSufficiencyState(row.latestVerdict.evidenceSufficiency.state)}
-                                                            </span>
-                                                        )}
-                                                        {row.executionRailSummary && (
-                                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-slate-300">
-                                                                {formatFocusedExecutionRail(row.executionRailSummary.rail)}
-                                                            </span>
-                                                        )}
-                                                    </div>
-
-                                                    {(row.latestVerdict || row.executionNotesSummary || row.executionError || row.historicalCompare || row.investigationSummary?.latestIssueTitle) && (
-                                                        <div className="space-y-2">
-                                                            {row.latestVerdict && (
-                                                                <div className="text-sm text-slate-200 leading-7">{row.latestVerdict.verdictReason}</div>
-                                                            )}
-                                                            {row.historicalCompare && (
-                                                                <div className="text-xs text-cyan-100 leading-6">
-                                                                    {row.historicalCompare.compareNarrative
-                                                                        || formatFocusedBlockerRecurrence(row.historicalCompare)
-                                                                        || formatFocusedVerdictTransition(row.historicalCompare.verdictTransition)}
-                                                                </div>
-                                                            )}
-                                                            {(row.executionError || row.executionNotesSummary) && (
-                                                                <div className={`text-xs leading-6 ${row.executionError ? 'text-red-200' : 'text-slate-400'}`}>
-                                                                    {row.executionError || row.executionNotesSummary}
-                                                                </div>
-                                                            )}
-                                                            {row.executionRailSummary && (
-                                                                <div className="text-xs text-slate-500 leading-6">
-                                                                    {formatFocusedRailSummary(row.executionRailSummary)}
-                                                                </div>
-                                                            )}
-                                                            {tracePreview.length > 0 && (
-                                                                <div className="text-xs text-cyan-100 leading-6">
-                                                                    {tracePreview.map((entry) => `${formatFocusedExecutionTraceActionType(entry.actionType)}: ${entry.actionSummary}`).join(' | ')}
-                                                                </div>
-                                                            )}
-                                                            {reasoningPreview.length > 0 && (
-                                                                <div className="text-xs text-violet-100 leading-6">
-                                                                    {reasoningPreview.map((entry) => `${formatFocusedReasoningStage(entry.stage)} ${formatFocusedReasoningEntryType(entry.entryType)}: ${entry.summary}`).join(' | ')}
-                                                                </div>
-                                                            )}
-                                                            {row.investigationSummary?.latestIssueTitle && row.investigationSummary.unresolvedCount > 0 && (
-                                                                <div className={`text-xs leading-6 ${
-                                                                    row.investigationSummary.blockingCount > 0 ? 'text-red-200' : 'text-amber-200'
-                                                                }`}>
-                                                                    {row.investigationSummary.latestIssueTitle}
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    )}
-
-                                                    <div className="border-t border-white/10 pt-4 flex flex-wrap gap-2">
-                                                        {isLegacyScopedReviewMode && (
-                                                            <button
-                                                                onClick={() => handleFocusedCaseUpdate(row.id, {
-                                                                    reviewState: row.reviewState === 'approved' ? 'pending_review' : 'approved',
-                                                                })}
-                                                                disabled={actionPending}
-                                                                className="px-3 py-2 rounded-xl bg-emerald-500 text-black text-sm font-semibold hover:bg-emerald-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                                            >
-                                                                {actionPending
-                                                                    ? 'Saving...'
-                                                                    : row.reviewState === 'approved'
-                                                                        ? 'Re-open'
-                                                                        : 'Approve'}
-                                                            </button>
-                                                        )}
-                                                        <button
-                                                            onClick={() => handleFocusedCaseUpdate(row.id, {
-                                                                status: row.status === 'disabled' ? 'planned' : 'disabled',
-                                                            })}
-                                                            disabled={actionPending}
-                                                            className="px-3 py-2 rounded-xl border border-slate-600 bg-slate-900/70 text-slate-100 text-sm font-medium hover:bg-slate-800 transition-colors disabled:opacity-50"
-                                                        >
-                                                            {row.status === 'disabled' ? 'Enable' : 'Disable'}
-                                                        </button>
-                                                        <button
-                                                            onClick={() => handleInspectEvidence(row.id)}
-                                                            disabled={evidenceLoadingCaseId === row.id}
-                                                            className="px-3 py-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 text-cyan-100 text-sm font-medium hover:bg-cyan-500/20 transition-colors disabled:opacity-50"
-                                                        >
-                                                            {evidenceLoadingCaseId === row.id ? 'Loading...' : 'Inspect Evidence'}
-                                                        </button>
-                                                        <div className="flex-1" />
-                                                        <select
-                                                            value={row.priority}
-                                                            onChange={(event) => handleFocusedCaseUpdate(row.id, {
-                                                                priority: event.target.value as FocusedTestCase['priority'],
-                                                            })}
-                                                            disabled={actionPending}
-                                                            className="min-w-[150px] px-3 py-2 rounded-xl border border-violet-500/20 bg-slate-950 text-sm text-slate-200 disabled:opacity-50"
-                                                        >
-                                                            <option value="high">High priority</option>
-                                                            <option value="medium">Medium priority</option>
-                                                            <option value="low">Low priority</option>
-                                                        </select>
-                                                        <button
-                                                            onClick={() => handleRunFocusedExecution([row.id])}
-                                                            disabled={executePending || row.status === 'disabled' || (isLegacyScopedReviewMode && row.reviewState !== 'approved') || status === 'scoped_executing'}
-                                                            className="px-3 py-2 rounded-xl border border-violet-500/30 bg-violet-500/10 text-violet-100 text-sm font-medium hover:bg-violet-500/20 transition-colors disabled:opacity-50"
-                                                        >
-                                                            {retryLabel}
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            </article>
-                                        );
-                                    })
-                                )}
-                            </div>
-                        </motion.section>
-
-                        <motion.aside
-                            initial={{ opacity: 0, y: 16 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="card border-white/10 overflow-hidden xl:sticky xl:top-24"
-                        >
-                            <div className="p-5 border-b border-white/10 bg-white/5 flex items-start justify-between gap-3">
-                                <div>
-                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Supporting Detail</div>
-                                    <h2 className="mt-2 text-lg font-semibold text-white">
-                                        {selectedEvidenceCase ? 'Case evidence and outcomes' : 'Evidence, verdicts, and follow-up'}
-                                    </h2>
-                                    <p className="mt-1 text-sm text-slate-400">
-                                        {selectedEvidenceCase
-                                            ? 'Details for the selected focused case.'
-                                            : 'Select a case to inspect evidence, verdict history, and troubleshooting detail.'}
-                                    </p>
-                                </div>
-                                {selectedEvidenceCase && (
-                                    <button
-                                        onClick={() => {
-                                            setSelectedEvidenceCaseId(null);
-                                            setSelectedExecution(null);
-                                            setSelectedCaseVerdict(null);
-                                            setSelectedPrimaryFinding(null);
-                                            setSelectedPrimaryFindingThread(null);
-                                            setSelectedCaseFindings([]);
-                                            setSelectedCaseFindingThreads([]);
-                                            setSelectedCaseHistoricalCompare(null);
-                                            setSelectedHypothesisVisibility(null);
-                                            setSelectedSuspicionExplanation(null);
-                                            setSelectedContextInfluenceSummary(null);
-                                            setSelectedEvidenceReasoningLinks([]);
-                                            setSelectedReasoningTrace([]);
-                                            setSelectedEvidenceBundles([]);
-                                            setSelectedExecutionTrace([]);
-                                            setSelectedRailSummary(null);
-                                            setSelectedInvestigationIssues([]);
-                                        }}
-                                        className="text-xs text-slate-400 hover:text-white"
-                                    >
-                                        Close
-                                    </button>
-                                )}
-                            </div>
-
-                            <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700">
-                                {selectedEvidenceCase ? (
-                                    <>
-                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
-                                            <div>
-                                                <h3 className="text-base font-semibold text-white">{selectedEvidenceCase.title}</h3>
-                                                <p className="mt-1 text-sm text-cyan-100 break-all">{selectedEvidenceRow?.targetLabel || selectedEvidenceCase.title}</p>
-                                            </div>
-                                            <div className="flex flex-wrap gap-2 text-xs">
-                                                {selectedEvidenceRow && (
-                                                    <>
-                                                        <span className={`px-2.5 py-1 rounded-full border ${getReviewBadgeClassName(selectedEvidenceRow)}`}>
-                                                            {formatFocusedReviewState(selectedEvidenceRow.reviewState)}
-                                                        </span>
-                                                        <span className={`px-2.5 py-1 rounded-full border ${getExecutionBadgeClassName(selectedEvidenceRow.executionPresentationState)}`}>
-                                                            {formatFocusedExecutionPresentationState(selectedEvidenceRow.executionPresentationState)}
-                                                        </span>
-                                                    </>
-                                                )}
-                                                {effectiveSelectedCaseVerdict && (
-                                                    <span className={`px-2.5 py-1 rounded-full border ${getVerdictBadgeClassName(effectiveSelectedCaseVerdict.verdictState)}`}>
-                                                        {formatFocusedVerdictState(effectiveSelectedCaseVerdict.verdictState)}
-                                                    </span>
-                                                )}
-                                            </div>
-                                            {selectedExecution?.notesSummary ? (
-                                                <div className="text-sm leading-7 text-slate-300">{selectedExecution.notesSummary}</div>
-                                            ) : (
-                                                <div className="text-sm leading-7 text-slate-400">
-                                                    Review the evidence captured for this case and decide whether follow-up work is needed.
-                                                </div>
-                                            )}
-                                            {selectedExecution && (
-                                                <div className="text-xs text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
-                                                    <span>Request actions: {selectedExecution.requestActionsUsed}</span>
-                                                    <span>Browser actions: {selectedExecution.browserActionsUsed}</span>
-                                                    {selectedExecution.browserSessionId && (
-                                                        <span>Browser session: {selectedExecution.browserSessionId}</span>
-                                                    )}
-                                                </div>
-                                            )}
-                                        </div>
-
-                                        {effectiveSelectedCaseFindings.length > 0 && (
-                                            <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-3">
-                                                <div className="flex items-start justify-between gap-3">
-                                                    <div>
-                                                        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200">Findings</div>
-                                                        <div className="mt-1 text-sm leading-7 text-slate-300">
-                                                            What this case currently suggests, including support, blockers, and the next bounded confirmation step.
-                                                        </div>
-                                                    </div>
-                                                    {effectiveSelectedPrimaryFinding && (
-                                                        <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-xs text-slate-300">
-                                                            Primary + {Math.max(effectiveSelectedCaseFindings.length - 1, 0)} secondary
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                {effectiveSelectedFindingThread && (
-                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2 text-xs text-slate-300">
-                                                        <div className="flex flex-wrap gap-2">
-                                                            {effectiveSelectedFindingThread.status !== 'published' && (
-                                                                <span className="px-2 py-0.5 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-200">
-                                                                    Provisional
-                                                                </span>
-                                                            )}
-                                                            <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-slate-300">
-                                                                {formatFocusedFindingThreadStatus(effectiveSelectedFindingThread.status)}
-                                                            </span>
-                                                            <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-slate-300">
-                                                                Suspicion {effectiveSelectedFindingThread.suspicionScore}%
-                                                            </span>
-                                                            <span className="px-2 py-0.5 rounded-full border border-white/10 bg-black/20 text-slate-300">
-                                                                Confirmation {effectiveSelectedFindingThread.confirmationProgress}%
-                                                            </span>
-                                                            {effectiveSelectedFindingThread.supportProvenance && (
-                                                                <span className={`px-2 py-0.5 rounded-full border ${getSupportProvenanceBadgeClassName(effectiveSelectedFindingThread.supportProvenance.rail)}`}>
-                                                                    {formatFocusedSupportProvenanceRail(effectiveSelectedFindingThread.supportProvenance.rail)}
-                                                                </span>
-                                                            )}
-                                                        </div>
-                                                        <div className="text-[11px] text-slate-200 leading-relaxed">
-                                                            Strongest signal: {effectiveSelectedFindingThread.strongestSuspiciousSignal || effectiveSelectedFindingThread.strongestSupportSummary || 'Signal still forming.'}
-                                                        </div>
-                                                        {effectiveSelectedFindingThread.supportProvenance && (
-                                                            <div className="text-[11px] text-slate-400 leading-relaxed">
-                                                                {formatFocusedSupportProvenanceSummary(effectiveSelectedFindingThread.supportProvenance)}
-                                                            </div>
-                                                        )}
-                                                        {effectiveSelectedFindingThread.strongestBlockerSummary && (
-                                                            <div className="text-[11px] text-red-200 leading-relaxed">
-                                                                Strongest blocker: {effectiveSelectedFindingThread.strongestBlockerSummary}
-                                                            </div>
-                                                        )}
-                                                        {effectiveSelectedFindingThread.confirmationState.nextKind && (
-                                                            <div className="text-[11px] text-cyan-100 leading-relaxed">
-                                                                Next bounded confirmation: {formatFocusedConfirmationKind(effectiveSelectedFindingThread.confirmationState.nextKind)}
-                                                            </div>
-                                                        )}
-                                                        {(effectiveSelectedFindingThread.nextStepSummary || effectiveSelectedFindingThread.confirmationState.stopReason) && (
-                                                            <div className="text-[11px] text-slate-400 leading-relaxed">
-                                                                {effectiveSelectedFindingThread.confirmationState.stopReason
-                                                                    ? `Stopped because ${effectiveSelectedFindingThread.confirmationState.stopReason}`
-                                                                    : `Next step: ${effectiveSelectedFindingThread.nextStepSummary}`}
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedCaseFindings.map((finding) => (
-                                                    <div
-                                                        key={finding.id}
-                                                        className={`rounded-2xl border p-3 space-y-2 ${
-                                                            finding.isPrimary
-                                                                ? 'border-amber-500/20 bg-black/20'
-                                                                : 'border-white/10 bg-black/10'
-                                                        }`}
-                                                    >
-                                                        <div className="flex flex-wrap items-center justify-between gap-2">
-                                                            <div className="min-w-0">
-                                                                <div className="text-sm font-semibold text-white">{finding.title}</div>
-                                                                <div className="text-[10px] text-slate-400">
-                                                                    {formatFocusedFindingFamily(finding.family)} · {formatFocusedFindingConfidenceBand(finding.confidenceBand)}
-                                                                </div>
-                                                            </div>
-                                                            <div className="flex flex-wrap gap-2">
-                                                                {finding.isPrimary && (
-                                                                    <span className="px-2 py-0.5 rounded-full border border-amber-500/20 bg-amber-500/10 text-[10px] text-amber-200">
-                                                                        Primary
-                                                                    </span>
-                                                                )}
-                                                                <span className={`px-2 py-0.5 rounded-full border text-[10px] font-semibold uppercase ${
-                                                                    finding.status === 'confirmed'
-                                                                        ? 'border-red-500/30 bg-red-500/10 text-red-300'
-                                                                        : finding.status === 'likely'
-                                                                            ? 'border-orange-500/30 bg-orange-500/10 text-orange-300'
-                                                                            : finding.status === 'suspicious'
-                                                                                ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-                                                                                : finding.status === 'inconclusive'
-                                                                                    ? 'border-slate-500/30 bg-slate-500/10 text-slate-300'
-                                                                                    : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                                                                }`}>
-                                                                    {formatFocusedFindingStatus(finding.status)}
-                                                                </span>
-                                                                {finding.supportProvenance && (
-                                                                    <span className={`px-2 py-0.5 rounded-full border text-[10px] ${getSupportProvenanceBadgeClassName(finding.supportProvenance.rail)}`}>
-                                                                        {formatFocusedSupportProvenanceRail(finding.supportProvenance.rail)}
-                                                                    </span>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                        <div className="grid gap-2 sm:grid-cols-2 text-xs text-slate-300">
-                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
-                                                                Suspicion {finding.suspicionScore}%
-                                                            </div>
-                                                            <div className="rounded-xl border border-white/10 bg-black/20 p-2">
-                                                                Confirmation {finding.confirmationProgress}%
-                                                            </div>
-                                                        </div>
-                                                        <div className="text-sm leading-7 text-slate-200">
-                                                            Strongest signal: {finding.strongestSupportSummary}
-                                                        </div>
-                                                        {finding.supportProvenance && (
-                                                            <div className="text-xs leading-6 text-slate-400">
-                                                                {formatFocusedSupportProvenanceSummary(finding.supportProvenance)}
-                                                            </div>
-                                                        )}
-                                                        {finding.blockingConstraintSummary && (
-                                                            <div className="text-xs leading-6 text-red-200">
-                                                                Blocker: {finding.blockingConstraintSummary}
-                                                            </div>
-                                                        )}
-                                                        {finding.nextStepSummary && (
-                                                            <div className="text-xs leading-6 text-cyan-100">
-                                                                Next step: {finding.nextStepSummary}
-                                                            </div>
-                                                        )}
-                                                        <div className="text-[10px] text-slate-500 leading-relaxed">
-                                                            Evidence refs: {finding.supportingEvidenceRefs.length} · Verdict refs: {finding.linkedVerdictIds.length} · Investigation refs: {finding.linkedInvestigationIds.length}
-                                                        </div>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-
-                                        {effectiveSelectedHypothesisVisibility && (
-                                            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200">Hypothesis</div>
-                                                <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
-                                                        {formatFocusedHypothesisStatus(effectiveSelectedHypothesisVisibility.currentStatus)}
-                                                    </span>
-                                                    <span className="text-slate-400">
-                                                        {effectiveSelectedHypothesisVisibility.caseFamily.replace(/_/g, ' ')}
-                                                    </span>
-                                                </div>
-                                                {effectiveSelectedHypothesisVisibility.initialSupport.length > 0 && (
-                                                    <div className="text-xs leading-6 text-slate-300">
-                                                        Initial support: {effectiveSelectedHypothesisVisibility.initialSupport.slice(0, 2).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedHypothesisVisibility.strengtheningSignals.length > 0 && (
-                                                    <div className="text-xs leading-6 text-emerald-200">
-                                                        Strengthened by: {effectiveSelectedHypothesisVisibility.strengtheningSignals.slice(0, 2).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedHypothesisVisibility.weakeningSignals.length > 0 && (
-                                                    <div className="text-xs leading-6 text-amber-200">
-                                                        Weakened by: {effectiveSelectedHypothesisVisibility.weakeningSignals.slice(0, 2).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedHypothesisVisibility.blockingConstraints.length > 0 && (
-                                                    <div className="text-xs leading-6 text-red-200">
-                                                        Bounded by: {effectiveSelectedHypothesisVisibility.blockingConstraints.slice(0, 2).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedHypothesisVisibility.latestConfidenceSummary && (
-                                                    <div className="text-xs leading-6 text-cyan-100">
-                                                        {effectiveSelectedHypothesisVisibility.latestConfidenceSummary}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        )}
-
-                                        {effectiveSelectedSuspicionExplanation && (
-                                            <div className="rounded-2xl border border-violet-500/20 bg-violet-950/10 p-4 space-y-3">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-violet-200">Why Suspicious?</div>
-                                                <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                    <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
-                                                        {formatFocusedSuspicionProofStatus(effectiveSelectedSuspicionExplanation.proofStatus)}
-                                                    </span>
-                                                    <span className="text-slate-400">
-                                                        Suspiciousness {effectiveSelectedSuspicionExplanation.suspiciousness}
-                                                    </span>
-                                                </div>
-                                                <div className="text-sm leading-7 text-slate-200">
-                                                    {effectiveSelectedSuspicionExplanation.whySuspicious}
-                                                </div>
-                                                {effectiveSelectedSuspicionExplanation.supportingSignals.length > 0 && (
-                                                    <div className="text-xs leading-6 text-violet-100">
-                                                        Supporting signals: {effectiveSelectedSuspicionExplanation.supportingSignals.slice(0, 3).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedSuspicionExplanation.weakeningSignals.length > 0 && (
-                                                    <div className="text-xs leading-6 text-amber-200">
-                                                        Weakening signals: {effectiveSelectedSuspicionExplanation.weakeningSignals.slice(0, 2).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedSuspicionExplanation.contradictorySignals.length > 0 && (
-                                                    <div className="text-xs leading-6 text-red-200">
-                                                        Contradictory signals: {effectiveSelectedSuspicionExplanation.contradictorySignals.slice(0, 2).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedSuspicionExplanation.boundedStopReason && (
-                                                    <div className="text-xs leading-6 text-red-100">
-                                                        Bounded stop: {effectiveSelectedSuspicionExplanation.boundedStopReason}
-                                                    </div>
-                                                )}
-                                                {(effectiveSelectedSuspicionExplanation.missingEvidence?.length || 0) > 0 && (
-                                                    <div className="text-xs leading-6 text-slate-400">
-                                                        Missing evidence: {effectiveSelectedSuspicionExplanation.missingEvidence?.slice(0, 3).join(', ')}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        )}
-
-                                        {effectiveSelectedContextInfluenceSummary && (
-                                            <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-3">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200">Request Context Used</div>
-                                                <div className="text-sm leading-7 text-slate-300">
-                                                    {effectiveSelectedContextInfluenceSummary.summary}
-                                                </div>
-                                                {effectiveSelectedContextInfluenceSummary.usedFields.length > 0 && (
-                                                    <div className="text-xs leading-6 text-amber-100">
-                                                        Used: {effectiveSelectedContextInfluenceSummary.usedFields.slice(0, 3).map((entry) => `${formatFocusedRequestContextField(entry.field)} - ${entry.summary}`).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedContextInfluenceSummary.insufficientFields.length > 0 && (
-                                                    <div className="text-xs leading-6 text-red-100">
-                                                        Insufficient: {effectiveSelectedContextInfluenceSummary.insufficientFields.slice(0, 2).map((entry) => `${formatFocusedRequestContextField(entry.field)} - ${entry.summary}`).join(' | ')}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedContextInfluenceSummary.ignoredFields.length > 0 && (
-                                                    <div className="text-xs leading-6 text-slate-400">
-                                                        Not used: {effectiveSelectedContextInfluenceSummary.ignoredFields.slice(0, 3).map((entry) => formatFocusedRequestContextField(entry.field)).join(', ')}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        )}
-
-                                        {effectiveSelectedCaseVerdict && (
-                                            <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
-                                                <div className="flex flex-wrap items-center gap-2">
-                                                    <span className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${getVerdictBadgeClassName(effectiveSelectedCaseVerdict.verdictState)}`}>
-                                                        {formatFocusedVerdictState(effectiveSelectedCaseVerdict.verdictState)}
-                                                    </span>
-                                                    <span className="text-xs text-slate-400">
-                                                        {formatFocusedEvidenceSufficiencyState(effectiveSelectedCaseVerdict.evidenceSufficiency.state)}
-                                                    </span>
-                                                    {effectiveSelectedCaseVerdict.supportProvenance && (
-                                                        <span className={`px-2.5 py-1 rounded-full border text-xs ${getSupportProvenanceBadgeClassName(effectiveSelectedCaseVerdict.supportProvenance.rail)}`}>
-                                                            {formatFocusedSupportProvenanceRail(effectiveSelectedCaseVerdict.supportProvenance.rail)}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                <div className="text-sm leading-7 text-slate-200">{effectiveSelectedCaseVerdict.verdictReason}</div>
-                                                <div className="text-xs leading-6 text-slate-400">
-                                                    {effectiveSelectedCaseVerdict.evidenceSufficiency.summary}
-                                                </div>
-                                                {effectiveSelectedCaseVerdict.supportProvenance && (
-                                                    <div className="text-xs leading-6 text-cyan-100">
-                                                        {formatFocusedSupportProvenanceSummary(effectiveSelectedCaseVerdict.supportProvenance)}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedCaseVerdict.scopeViolationImpact.reasons.length > 0 && (
-                                                    <div className="text-xs leading-6 text-red-200">
-                                                        {effectiveSelectedCaseVerdict.scopeViolationImpact.reasons[0]}
-                                                    </div>
-                                                )}
-                                                {effectiveSelectedCaseVerdict.assistanceNarrative && (
-                                                    <div className="text-xs leading-6 text-cyan-100">
-                                                        {effectiveSelectedCaseVerdict.assistanceNarrative}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        )}
-
-                                        {effectiveSelectedCaseHistoricalCompare && (
-                                            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
-                                                <div className="flex flex-wrap items-center gap-2">
-                                                    <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100 text-xs font-semibold">
-                                                        {formatFocusedHistoricalOutcome(effectiveSelectedCaseHistoricalCompare.historicalOutcome)}
-                                                    </span>
-                                                    <span className="text-xs text-slate-400">
-                                                        {formatFocusedHistoricalCompareStatus(focusedHistoricalCompareState?.comparisonStatus)}
-                                                    </span>
-                                                    {effectiveSelectedCaseHistoricalCompare.verdictTransition && (
-                                                        <span className="text-xs text-slate-300">
-                                                            {formatFocusedVerdictTransition(effectiveSelectedCaseHistoricalCompare.verdictTransition)}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                <div className="text-xs leading-6 text-slate-300">
-                                                    {effectiveSelectedCaseHistoricalCompare.compareNarrative
-                                                        || (effectiveSelectedCaseHistoricalCompare.compareStatus === 'baseline_only'
-                                                            ? 'This is the first observed case for this scoped lineage.'
-                                                            : 'Historical comparison is available for this case.')}
-                                                </div>
-                                                {effectiveSelectedCaseHistoricalCompare.evidenceDriftClassification && (
-                                                    <div className="text-xs leading-6 text-slate-400">
-                                                        Evidence drift: {formatFocusedEvidenceDriftClassification(effectiveSelectedCaseHistoricalCompare.evidenceDriftClassification)}
-                                                    </div>
-                                                )}
-                                                {formatFocusedBlockerRecurrence(effectiveSelectedCaseHistoricalCompare) && (
-                                                    <div className="text-xs leading-6 text-amber-200">
-                                                        {formatFocusedBlockerRecurrence(effectiveSelectedCaseHistoricalCompare)}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        )}
-
-                                        {selectedInvestigationIssues.length > 0 && (
-                                            <div className="rounded-2xl border border-red-500/20 bg-red-950/10 p-4 space-y-3">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-red-200">Investigation</div>
-                                                {selectedInvestigationIssues.map((issue) => (
-                                                    <div key={issue.id} className="rounded-2xl border border-white/10 bg-black/20 p-3 space-y-2">
-                                                        <div className="flex flex-wrap items-center gap-2">
-                                                            <span className={`px-2.5 py-1 rounded-full border text-xs ${
-                                                                issue.impact === 'blocking'
-                                                                    ? 'border-red-500/30 bg-red-500/10 text-red-200'
-                                                                    : issue.impact === 'degrading'
-                                                                        ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
-                                                                        : 'border-slate-600 bg-slate-800/60 text-slate-300'
-                                                            }`}>
-                                                                {formatFocusedInvestigationImpact(issue.impact)}
-                                                            </span>
-                                                            <span className="text-xs text-slate-400">
-                                                                {formatFocusedInvestigationStatus(issue.issueStatus)} | {formatFocusedInvestigationType(issue.issueType)}
-                                                            </span>
-                                                        </div>
-                                                        <div className="text-sm text-white leading-7">{issue.issueTitle}</div>
-                                                        {issue.issueDetails && (
-                                                            <div className="text-xs leading-6 text-slate-300">{issue.issueDetails}</div>
-                                                        )}
-                                                        {issue.expertFollowupHint && (
-                                                            <div className="text-xs leading-6 text-cyan-100">
-                                                                Expert follow-up: {issue.expertFollowupHint}
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-
-                                        {effectiveSelectedRequestEvidenceStory && (
-                                            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
-                                                <div className="flex flex-wrap items-center gap-2">
-                                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200">Request Evidence Story</div>
-                                                    {effectiveSelectedSupportProvenance && (
-                                                        <span className={`px-2.5 py-1 rounded-full border text-xs ${getSupportProvenanceBadgeClassName(effectiveSelectedSupportProvenance.rail)}`}>
-                                                            {formatFocusedSupportProvenanceRail(effectiveSelectedSupportProvenance.rail)}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                <div className="text-sm leading-7 text-slate-200">
-                                                    {effectiveSelectedRequestEvidenceStory.summary}
-                                                </div>
-                                                {effectiveSelectedRequestEvidenceStory.lowConfidenceReason && (
-                                                    <div className="text-xs leading-6 text-amber-200">
-                                                        {effectiveSelectedRequestEvidenceStory.lowConfidenceReason}
-                                                    </div>
-                                                )}
-                                                <div className="grid gap-3 md:grid-cols-2">
-                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-1">
-                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Baseline</div>
-                                                        <div className="text-xs text-slate-200 leading-6">
-                                                            {formatFocusedRequestEvidenceRef(effectiveSelectedRequestEvidenceStory.baselineRequestRef)}
-                                                        </div>
-                                                    </div>
-                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-1">
-                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Strongest Suspicious</div>
-                                                        <div className="text-xs text-slate-200 leading-6">
-                                                            {formatFocusedRequestEvidenceRef(effectiveSelectedRequestEvidenceStory.strongestSuspiciousRequestRef)}
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                                <div className="grid gap-3 md:grid-cols-3">
-                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2">
-                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-emerald-300">Supporting Requests</div>
-                                                        {effectiveSelectedRequestEvidenceStory.supportingRequestRefs.length === 0 ? (
-                                                            <div className="text-xs text-slate-500 leading-6">No request replay currently strengthens the hypothesis.</div>
-                                                        ) : (
-                                                            effectiveSelectedRequestEvidenceStory.supportingRequestRefs.map((ref) => (
-                                                                <div key={`support-${ref.evidenceId}`} className="text-xs text-slate-200 leading-6">
-                                                                    {formatFocusedRequestEvidenceRef(ref)}
-                                                                </div>
-                                                            ))
-                                                        )}
-                                                    </div>
-                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2">
-                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-amber-300">Contradicting Requests</div>
-                                                        {effectiveSelectedRequestEvidenceStory.contradictingRequestRefs.length === 0 ? (
-                                                            <div className="text-xs text-slate-500 leading-6">No request replay currently weakens the hypothesis.</div>
-                                                        ) : (
-                                                            effectiveSelectedRequestEvidenceStory.contradictingRequestRefs.map((ref) => (
-                                                                <div key={`contradict-${ref.evidenceId}`} className="text-xs text-slate-200 leading-6">
-                                                                    {formatFocusedRequestEvidenceRef(ref)}
-                                                                </div>
-                                                            ))
-                                                        )}
-                                                    </div>
-                                                    <div className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-2">
-                                                        <div className="text-[10px] uppercase tracking-[0.18em] text-cyan-300">Adaptive Confirmation</div>
-                                                        {effectiveSelectedRequestEvidenceStory.confirmationRequestRefs.length === 0 ? (
-                                                            <div className="text-xs text-slate-500 leading-6">No adaptive confirmation replay was captured.</div>
-                                                        ) : (
-                                                            effectiveSelectedRequestEvidenceStory.confirmationRequestRefs.map((ref) => (
-                                                                <div key={`confirm-${ref.evidenceId}`} className="text-xs text-slate-200 leading-6">
-                                                                    {formatFocusedRequestEvidenceRef(ref)}
-                                                                </div>
-                                                            ))
-                                                        )}
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        )}
-
-                                        {(selectedEvidenceReasoningLinks.length > 0 || selectedEvidenceBundles.length > 0) && (
-                                            <div className="rounded-2xl border border-emerald-500/20 bg-emerald-950/10 p-4 space-y-3">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-200">Evidence Links</div>
-                                                {selectedEvidenceReasoningLinks.length === 0 ? (
-                                                    <div className="text-sm leading-7 text-slate-400">
-                                                        Evidence was captured, but no explicit reasoning link was persisted for this case yet.
-                                                    </div>
-                                                ) : (
-                                                    selectedEvidenceReasoningLinks.map((link) => (
-                                                        <div key={link.evidenceId} className="rounded-2xl border border-white/10 bg-black/20 p-3 space-y-2">
-                                                            <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                                <span className="px-2.5 py-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 text-emerald-100">
-                                                                    {link.role.replace(/_/g, ' ')}
-                                                                </span>
-                                                                <span className="text-slate-400">
-                                                                    {link.effect}
-                                                                </span>
-                                                                <span className="text-slate-500">
-                                                                    {link.reasoningEntryIds.length} trace link{link.reasoningEntryIds.length === 1 ? '' : 's'}
-                                                                </span>
-                                                            </div>
-                                                            <div className="text-sm leading-7 text-slate-200">{link.whyItMatters}</div>
-                                                        </div>
-                                                    ))
-                                                )}
-                                            </div>
-                                        )}
-
-                                        <div className="rounded-2xl border border-violet-500/20 bg-violet-950/10 p-4 space-y-3">
-                                            <div className="flex flex-wrap items-center gap-2">
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-violet-200">Agent Reasoning</div>
-                                                <span className="text-xs text-slate-500">
-                                                    {effectiveSelectedReasoningTrace.length} step{effectiveSelectedReasoningTrace.length === 1 ? '' : 's'}
-                                                </span>
-                                            </div>
-                                            {effectiveSelectedReasoningTrace.length === 0 ? (
-                                                <div className="text-sm leading-7 text-slate-400">
-                                                    No bounded reasoning trace has been persisted for this case yet.
-                                                </div>
-                                            ) : (
-                                                <div className="space-y-3">
-                                                    {effectiveSelectedReasoningTrace.map((entry) => (
-                                                        <div key={entry.id} className="rounded-2xl border border-white/10 bg-black/20 p-3 space-y-2">
-                                                            <div className="flex flex-wrap items-center justify-between gap-2">
-                                                                <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                                    <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
-                                                                        {formatFocusedReasoningStage(entry.stage)}
-                                                                    </span>
-                                                                    <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-slate-300">
-                                                                        {formatFocusedReasoningEntryType(entry.entryType)}
-                                                                    </span>
-                                                                    <span className="text-slate-500">
-                                                                        {formatFocusedReasoningRail(entry.rail)}
-                                                                    </span>
-                                                                </div>
-                                                                <span className="text-[11px] text-slate-500">{new Date(entry.timestamp).toLocaleTimeString()}</span>
-                                                            </div>
-                                                            <div className="text-sm leading-7 text-slate-200">{entry.summary}</div>
-                                                            {entry.observationSummary && (
-                                                                <div className="text-xs leading-6 text-slate-300">Observed: {entry.observationSummary}</div>
-                                                            )}
-                                                            {entry.hypothesisRationaleSummary && (
-                                                                <div className="text-xs leading-6 text-cyan-100">Hypothesis: {entry.hypothesisRationaleSummary}</div>
-                                                            )}
-                                                            {entry.actionSelectionRationale && (
-                                                                <div className="text-xs leading-6 text-violet-100">Why this step: {entry.actionSelectionRationale}</div>
-                                                            )}
-                                                            {entry.requestResponseImpactSummary && (
-                                                                <div className="text-xs leading-6 text-amber-100">Request/response: {entry.requestResponseImpactSummary}</div>
-                                                            )}
-                                                            {entry.browserStateImpactSummary && (
-                                                                <div className="text-xs leading-6 text-emerald-100">Browser/state: {entry.browserStateImpactSummary}</div>
-                                                            )}
-                                                            {entry.confidenceShiftSummary && (
-                                                                <div className="text-xs leading-6 text-cyan-100">Confidence: {entry.confidenceShiftSummary}</div>
-                                                            )}
-                                                            {entry.stopRetryBlockRationale && (
-                                                                <div className="text-xs leading-6 text-red-100">Constraint: {entry.stopRetryBlockRationale}</div>
-                                                            )}
-                                                            {(entry.linkedEvidenceIds.length > 0 || entry.linkedRequestContextKeys.length > 0) && (
-                                                                <div className="text-xs leading-6 text-slate-500">
-                                                                    {[
-                                                                        entry.linkedEvidenceIds.length > 0 ? `${entry.linkedEvidenceIds.length} evidence link${entry.linkedEvidenceIds.length === 1 ? '' : 's'}` : null,
-                                                                        entry.linkedRequestContextKeys.length > 0
-                                                                            ? `context: ${entry.linkedRequestContextKeys.slice(0, 3).map((field) => formatFocusedRequestContextField(field)).join(', ')}`
-                                                                            : null,
-                                                                    ].filter(Boolean).join(' | ')}
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            )}
-                                        </div>
-
-                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
-                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Evidence Bundles</div>
-                                            {selectedEvidenceBundles.length === 0 ? (
-                                                <div className="text-sm leading-7 text-slate-400">
-                                                    No evidence has been captured for this case yet.
-                                                </div>
-                                            ) : (
-                                                <div className="space-y-3">
-                                                    {selectedEvidenceBundles.map((bundle) => (
-                                                        <div key={bundle.id} className="rounded-2xl border border-white/10 bg-white/5 p-3 space-y-2">
-                                                            <div className="flex items-center justify-between gap-3">
-                                                                <span className="text-xs font-semibold uppercase text-cyan-200">{bundle.source.replace(/_/g, ' ')}</span>
-                                                                <span className="text-[11px] text-slate-500">{new Date(bundle.capturedAt).toLocaleString()}</span>
-                                                            </div>
-                                                            <div className="flex flex-wrap gap-2 text-[10px]">
-                                                                <span className={`px-2 py-0.5 rounded border ${
-                                                                    bundle.requestRef || bundle.responseRef || bundle.source === 'comparison'
-                                                                        ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-100'
-                                                                        : bundle.browserState || bundle.screenshotRef
-                                                                            ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100'
-                                                                            : 'border-slate-600 bg-slate-800/60 text-slate-300'
-                                                                }`}>
-                                                                    {bundle.requestRef || bundle.responseRef || bundle.source === 'comparison'
-                                                                        ? 'Request-backed'
-                                                                        : bundle.browserState || bundle.screenshotRef
-                                                                            ? 'Browser-backed'
-                                                                            : 'System-only'}
-                                                                </span>
-                                                                {bundle.provenance?.executionPhase && (
-                                                                    <span className="px-2 py-0.5 rounded border border-white/10 bg-black/20 text-slate-300">
-                                                                        {bundle.provenance.executionPhase === 'adaptive_confirmation'
-                                                                            ? `Adaptive confirmation${typeof bundle.provenance.confirmationOrdinal === 'number' ? ` ${bundle.provenance.confirmationOrdinal}` : ''}`
-                                                                            : 'Planned execution'}
-                                                                    </span>
-                                                                )}
-                                                            </div>
-                                                            <div className="text-sm leading-7 text-slate-200">{bundle.summary}</div>
-                                                            {(bundle.requestRef || bundle.responseRef) && (
-                                                                <div className="rounded-xl border border-cyan-500/10 bg-slate-950/60 p-3 space-y-1">
-                                                                    {bundle.requestRef && (
-                                                                        <div className="text-xs leading-6 text-cyan-100">
-                                                                            Request: {[bundle.requestRef.method, bundle.requestRef.path || bundle.requestRef.url].filter(Boolean).join(' ')}
-                                                                        </div>
-                                                                    )}
-                                                                    {bundle.responseRef && (
-                                                                        <div className="text-xs leading-6 text-slate-300">
-                                                                            Response: {typeof bundle.responseRef.statusCode === 'number' ? `HTTP ${bundle.responseRef.statusCode}` : 'Captured'}{bundle.responseRef.path ? ` · ${bundle.responseRef.path}` : ''}
-                                                                        </div>
-                                                                    )}
-                                                                </div>
-                                                            )}
-                                                            {bundle.executionNotes && (
-                                                                <div className="text-xs leading-6 text-slate-400">{bundle.executionNotes}</div>
-                                                            )}
-                                                            {bundle.responseDiffSummary?.summary && (
-                                                                <div className="text-xs leading-6 text-amber-200">{bundle.responseDiffSummary.summary}</div>
-                                                            )}
-                                                            {bundle.browserState && (
-                                                                <div className="rounded-xl border border-cyan-500/10 bg-slate-950/60 p-3 space-y-2">
-                                                                    <div className="text-xs leading-6 text-cyan-100">{bundle.browserState.actionSummary}</div>
-                                                                    <div className="text-xs text-slate-500">
-                                                                        {formatExpectationSummary(bundle) || 'No browser checks recorded'}
-                                                                    </div>
-                                                                    {bundle.browserState.pageTitle && (
-                                                                        <div className="text-xs text-slate-400">Title: {bundle.browserState.pageTitle}</div>
-                                                                    )}
-                                                                </div>
-                                                            )}
-                                                            {bundle.screenshotRef && buildScreenshotDataUrl(bundle.screenshotRef) && (
-                                                                <img
-                                                                    src={buildScreenshotDataUrl(bundle.screenshotRef) || undefined}
-                                                                    alt="Evidence screenshot"
-                                                                    className="rounded-xl border border-white/10 max-h-56 w-full object-contain bg-black/40"
-                                                                />
-                                                            )}
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            )}
-                                        </div>
-                                    </>
-                                ) : (
-                                    <>
-                                        <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 p-5 text-center">
-                                            <Shield className="w-10 h-10 mx-auto text-slate-600 mb-3" />
-                                            <h3 className="text-lg font-semibold text-white">Inspect a case when you need detail</h3>
-                                            <p className="mt-2 text-sm leading-7 text-slate-400">
-                                                Choose <span className="text-slate-200">Inspect Evidence</span> on any focused case to open its evidence, verdict, history, and investigation notes here.
-                                            </p>
-                                        </div>
-
-                                        <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-3">
-                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Verdict Summary</div>
-                                            {focusedVerdictSummary ? (
-                                                <>
-                                                    <div className="flex flex-wrap gap-2 text-xs">
-                                                        <span className="px-2.5 py-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 text-emerald-200">Pass {focusedVerdictCounts.pass}</span>
-                                                        <span className="px-2.5 py-1 rounded-full border border-red-500/20 bg-red-500/10 text-red-200">Fail {focusedVerdictCounts.fail}</span>
-                                                        <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-200">Inconclusive {focusedVerdictCounts.inconclusive}</span>
-                                                        <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-200">Needs Review {focusedVerdictCounts.needs_review}</span>
-                                                    </div>
-                                                    <div className="text-sm leading-7 text-slate-300">
-                                                        Overall verdict: <span className="text-white">{formatFocusedVerdictState(focusedVerdictSummary.overallVerdict)}</span>
-                                                    </div>
-                                                    {focusedVerdictSummary.majorBlockers.length > 0 && (
-                                                        <div className="text-xs leading-6 text-slate-400">
-                                                            {focusedVerdictSummary.majorBlockers.slice(0, 2).join(' | ')}
-                                                        </div>
-                                                    )}
-                                                </>
-                                            ) : (
-                                                <div className="text-sm leading-7 text-slate-400">
-                                                    {isLegacyScopedReviewMode
-                                                        ? 'Verdicts will appear here after approved legacy cases have executed.'
-                                                        : 'Verdicts will appear here as the bounded mission finishes consolidating live findings.'}
-                                                </div>
-                                            )}
-                                        </div>
-
-                                        <div className="rounded-2xl border border-cyan-500/20 bg-cyan-950/10 p-4 space-y-3">
-                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Historical Compare</div>
-                                            {(focusedHistoricalCompareState || focusedHistoricalCompareSummary) ? (
-                                                <>
-                                                    <div className="flex flex-wrap gap-2 text-xs">
-                                                        <span className="px-2.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-100">
-                                                            {formatFocusedHistoricalCompareStatus(focusedHistoricalCompareState?.comparisonStatus)}
-                                                        </span>
-                                                        {focusedHistoricalCompareSummary && (
-                                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-slate-200">
-                                                                {formatFocusedOverallChangeClassification(focusedHistoricalCompareSummary.overallChangeClassification)}
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <div className="text-sm leading-7 text-slate-300">
-                                                        {focusedHistoricalCompareState?.statusReason
-                                                            || focusedHistoricalCompareSummary?.compareNarrative
-                                                            || 'Comparison detail will appear here when a comparable baseline exists.'}
-                                                    </div>
-                                                </>
-                                            ) : (
-                                                <div className="text-sm leading-7 text-slate-400">
-                                                    Historical comparison will appear once PenPard has a comparable scoped baseline.
-                                                </div>
-                                            )}
-                                        </div>
-
-                                        <div className="rounded-2xl border border-red-500/20 bg-red-950/10 p-4 space-y-3">
-                                            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Troubleshooting</div>
-                                            {focusedBlockerSummary ? (
-                                                <>
-                                                    <div className="flex flex-wrap gap-2 text-xs">
-                                                        <span className="px-2.5 py-1 rounded-full border border-red-500/20 bg-red-500/10 text-red-200">Blocking {blockerImpactCounts.blocking}</span>
-                                                        <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-200">Degrading {blockerImpactCounts.degrading}</span>
-                                                        <span className="px-2.5 py-1 rounded-full border border-slate-600 bg-slate-800/60 text-slate-300">Informational {blockerImpactCounts.informational}</span>
-                                                    </div>
-                                                    <div className="text-sm leading-7 text-slate-300">
-                                                        {focusedBlockerSummary.latestMajorBlockerSummary || 'No major blockers are currently summarised for this run.'}
-                                                    </div>
-                                                    {unresolvedBlockerTypes.length > 0 && (
-                                                        <div className="text-xs leading-6 text-slate-400">
-                                                            {unresolvedBlockerTypes.slice(0, 3).map(([issueType, count]) => (
-                                                                `${formatFocusedInvestigationType(issueType as any)} ${count}`
-                                                            )).join(' | ')}
-                                                        </div>
-                                                    )}
-                                                </>
-                                            ) : (
-                                                <div className="text-sm leading-7 text-slate-400">
-                                                    Any execution blockers or investigation issues will surface here.
-                                                </div>
-                                            )}
-                                        </div>
-                                    </>
-                                )}
-                            </div>
-                        </motion.aside>
-                    </section>
-
-                    <motion.section
-                        initial={{ opacity: 0, y: 16 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="card border-white/10 overflow-hidden"
-                    >
-                        <div className="p-5 border-b border-white/10 bg-white/5 flex items-center justify-between gap-3">
-                            <div>
-                                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Scoped Agent Trace</div>
-                                <h2 className="mt-2 text-lg font-semibold text-white">Execution reasoning</h2>
-                                <p className="mt-1 text-sm text-slate-400">
-                                    Follow the bounded observation, decision, action, and result trail for this scoped run.
-                                </p>
-                            </div>
-                            <span className="text-xs text-slate-500">{scopedAgentTracePreview.length} entries</span>
-                        </div>
-                        <div
-                            ref={systemLogsContainerRef}
-                            className="max-h-80 overflow-y-auto p-4 space-y-3 text-slate-300 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent"
-                        >
-                            {focusedRequestContextUsage && (
-                                <div className="rounded-2xl border border-amber-500/20 bg-amber-950/10 p-4 space-y-2">
-                                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                                        <span className="px-2.5 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-100">
-                                            Request context
-                                        </span>
-                                        <span className="text-slate-500">
-                                            {focusedRequestContextUsage.presentFields.length} optional field{focusedRequestContextUsage.presentFields.length === 1 ? '' : 's'}
-                                        </span>
-                                    </div>
-                                    <div className="text-sm leading-7 text-slate-300">
-                                        {focusedRequestContextUsage.summary}
-                                    </div>
-                                    {focusedRequestContextUsage.usedFields.length > 0 && (
-                                        <div className="text-xs leading-6 text-amber-100">
-                                            Used: {focusedRequestContextUsage.usedFields.slice(0, 3).map((entry) => `${formatFocusedRequestContextField(entry.field)} - ${entry.summary}`).join(' | ')}
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-                            {scopedAgentTracePreview.length === 0 ? (
-                                <div className="text-slate-600 italic">Reasoning entries will appear here as scoped intake, planning, execution, and verdicting progress.</div>
-                            ) : scopedAgentTracePreview.map((entry) => (
-                                <div key={entry.id} className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-2">
-                                    <div className="flex flex-wrap items-center justify-between gap-2">
-                                        <div className="flex flex-wrap items-center gap-2 text-xs">
-                                            <span className="px-2.5 py-1 rounded-full border border-violet-500/20 bg-violet-500/10 text-violet-100">
-                                                {formatFocusedReasoningStage(entry.stage)}
-                                            </span>
-                                            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-black/20 text-slate-300">
-                                                {formatFocusedReasoningEntryType(entry.entryType)}
-                                            </span>
-                                            <span className="text-slate-500">{formatFocusedReasoningRail(entry.rail)}</span>
-                                            {entry.caseId && (
-                                                <span className="text-slate-500">Case {entry.caseId.slice(0, 8)}</span>
-                                            )}
-                                        </div>
-                                        <span className="text-[11px] text-slate-500">{new Date(entry.timestamp).toLocaleTimeString()}</span>
-                                    </div>
-                                    <div className="text-sm leading-7 text-slate-200">{entry.summary}</div>
-                                    {entry.observationSummary && (
-                                        <div className="text-xs leading-6 text-slate-300">Observed: {entry.observationSummary}</div>
-                                    )}
-                                    {entry.hypothesisRationaleSummary && (
-                                        <div className="text-xs leading-6 text-cyan-100">Hypothesis: {entry.hypothesisRationaleSummary}</div>
-                                    )}
-                                    {entry.actionSelectionRationale && (
-                                        <div className="text-xs leading-6 text-violet-100">Why this step: {entry.actionSelectionRationale}</div>
-                                    )}
-                                    {entry.requestResponseImpactSummary && (
-                                        <div className="text-xs leading-6 text-amber-100">Request/response: {entry.requestResponseImpactSummary}</div>
-                                    )}
-                                    {entry.browserStateImpactSummary && (
-                                        <div className="text-xs leading-6 text-emerald-100">Browser/state: {entry.browserStateImpactSummary}</div>
-                                    )}
-                                    {entry.confidenceShiftSummary && (
-                                        <div className="text-xs leading-6 text-cyan-100">Confidence: {entry.confidenceShiftSummary}</div>
-                                    )}
-                                    {entry.stopRetryBlockRationale && (
-                                        <div className="text-xs leading-6 text-red-100">Constraint: {entry.stopRetryBlockRationale}</div>
-                                    )}
-                                    {(entry.linkedEvidenceIds.length > 0 || entry.linkedRequestContextKeys.length > 0) && (
-                                        <div className="text-xs leading-6 text-slate-500">
-                                            {[
-                                                entry.linkedEvidenceIds.length > 0 ? `${entry.linkedEvidenceIds.length} evidence link${entry.linkedEvidenceIds.length === 1 ? '' : 's'}` : null,
-                                                entry.linkedRequestContextKeys.length > 0
-                                                    ? `context: ${entry.linkedRequestContextKeys.slice(0, 3).map((field) => formatFocusedRequestContextField(field)).join(', ')}`
-                                                    : null,
-                                            ].filter(Boolean).join(' | ')}
-                                        </div>
-                                    )}
-                                </div>
-                            ))}
-                            <div ref={systemLogsEndRef} />
-                        </div>
-                    </motion.section>
-                </main>
-
-                {scanId && (
-                    <ReportOptionsModal
-                        isOpen={reportModalOpen}
-                        onClose={() => setReportModalOpen(false)}
-                        scanId={scanId}
-                    />
-                )}
             </div>
         );
     }
@@ -3093,19 +1427,6 @@ User Question: ${userQuestion}`;
             </header>
 
             <main className="pt-20 pb-8 px-4 max-w-[1600px] mx-auto space-y-4">
-                {showScopedSecondaryContext && (
-                    <MissionControlScopedSupportStrip
-                        liveRuntimeSummary={liveRuntimeSummary}
-                        focusedTestObjective={focusedTestObjective}
-                        scopeEnvelope={scopeEnvelope}
-                        scopedTestRequest={scopedTestRequest}
-                        featureDiscoveryState={featureDiscoveryState}
-                        isLegacyScopedRecoveryState={isLegacyScopedReviewMode}
-                        showLegacyRecoveryTools={showLegacyRecoveryPanel}
-                        onToggleLegacyRecovery={() => setShowLegacyRecovery((current) => !current)}
-                    />
-                )}
-
                 <div className="min-h-[calc(100vh-theme(spacing.10))] grid grid-cols-12 gap-6">
 
                 {/* Left: Agent Status & Logs */}
@@ -3114,7 +1435,7 @@ User Question: ${userQuestion}`;
                         <div className="absolute top-0 right-0 p-3 opacity-20">
                             <Eye className="w-12 h-12 text-cyan-500" />
                         </div>
-                        <h2 className="text-sm uppercase tracking-widest text-slate-400 mb-4 font-bold">{isScopedScan ? 'Scoped Mission Status' : 'Orchestrator Status'}</h2>
+                        <h2 className="text-sm uppercase tracking-widest text-slate-400 mb-4 font-bold">Orchestrator Status</h2>
                         <div className="space-y-4 relative z-10">
                             <div>
                                 <div className="flex justify-between text-xs mb-1">
@@ -3131,8 +1452,8 @@ User Question: ${userQuestion}`;
                             </div>
                                 <div className="grid grid-cols-2 gap-2 text-xs">
                                     <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                                    <div className="text-slate-500 mb-1">{isScopedScan ? 'Mission' : 'Phase'}</div>
-                                    <div className="text-white font-mono capitalize">{isScopedScan ? scopedStageLabel : status}</div>
+                                    <div className="text-slate-500 mb-1">Phase</div>
+                                    <div className="text-white font-mono capitalize">{status}</div>
                                     </div>
                                     <div className="p-3 bg-white/5 rounded-lg border border-white/5">
                                         <div className="text-slate-500 mb-1">Agents</div>
@@ -3143,26 +1464,6 @@ User Question: ${userQuestion}`;
                                         </div>
                                     </div>
                                 </div>
-                            {isScopedScan && (
-                                <div className="grid grid-cols-1 gap-2 text-xs">
-                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                                        <div className="text-slate-500 mb-1">Active Case</div>
-                                        <div className="text-white leading-relaxed">{scopedActiveCaseLabel || 'Waiting for bounded case selection'}</div>
-                                    </div>
-                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                                        <div className="text-slate-500 mb-1">Current Rail</div>
-                                        <div className="text-white">{scopedLiveRuntime?.currentRail ? formatFocusedExecutionRail(scopedLiveRuntime.currentRail) : 'System-only'}</div>
-                                    </div>
-                                    <div className="p-3 bg-white/5 rounded-lg border border-white/5">
-                                        <div className="text-slate-500 mb-1">Last Bounded Request</div>
-                                        <div className="text-white leading-relaxed">
-                                            {scopedRuntimeRequest?.summary
-                                                ? `${scopedRuntimeRequest.summary}${typeof scopedRuntimeRequest.statusCode === 'number' ? ` · HTTP ${scopedRuntimeRequest.statusCode}` : ''}`
-                                                : 'Waiting for request-backed evidence'}
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
                         </div>
                     </div>
 
@@ -3170,7 +1471,7 @@ User Question: ${userQuestion}`;
                         <div className="p-3 border-b border-white/10 flex items-center justify-between bg-white/5 flex-shrink-0">
                             <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
                                 <Terminal className="w-4 h-4" />
-                                {isScopedScan ? 'Live Mission Log' : 'Agent Logs'}
+                                Agent Logs
                             </div>
                             <span className="text-[10px] text-slate-600">{logs.length} entries</span>
                         </div>
@@ -3226,101 +1527,7 @@ User Question: ${userQuestion}`;
                                     </button>
                                 </div>
                             </div>
-                        ) : isScopedScan && status === 'scoped_discovering' ? (
-                            <div className="relative z-10 flex items-center gap-6">
-                                <div className="w-24 h-24 relative flex items-center justify-center">
-                                    <motion.div
-                                        animate={{ rotate: 360 }}
-                                        transition={{ duration: 10, repeat: Infinity, ease: 'linear' }}
-                                        className="absolute inset-0 border-2 border-dashed border-blue-500/30 rounded-full"
-                                    />
-                                    <motion.div
-                                        animate={{ rotate: -360 }}
-                                        transition={{ duration: 14, repeat: Infinity, ease: 'linear' }}
-                                        className="absolute inset-4 border border-cyan-500/20 rounded-full"
-                                    />
-                                    <Crosshair className="w-8 h-8 text-blue-300" />
-                                </div>
-                                <div className="text-left">
-                                    <h3 className="font-bold text-white text-lg">Anchoring Requested Feature</h3>
-                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
-                                        {featureDiscoveryState?.summary || 'PenPard is using the structured request URL and description to derive bounded feature anchors before entering the live scoped mission.'}
-                                    </p>
-                                </div>
-                            </div>
-                        ) : isScopedScan && status === 'planning' ? (
-                            <div className="relative z-10 flex items-center gap-6">
-                                <div className="w-24 h-24 relative flex items-center justify-center">
-                                    <motion.div
-                                        animate={{ rotate: 360 }}
-                                        transition={{ duration: 8, repeat: Infinity, ease: 'linear' }}
-                                        className="absolute inset-0 border-2 border-dashed border-cyan-500/30 rounded-full"
-                                    />
-                                    <motion.div
-                                        animate={{ rotate: -360 }}
-                                        transition={{ duration: 12, repeat: Infinity, ease: 'linear' }}
-                                        className="absolute inset-4 border border-violet-500/30 rounded-full"
-                                    />
-                                    <Route className="w-8 h-8 text-cyan-400" />
-                                </div>
-                                <div className="text-left">
-                                    <h3 className="font-bold text-white text-lg">Seeding Bounded Hypotheses</h3>
-                                    <p className="text-slate-400 text-xs max-w-[260px] leading-relaxed">
-                                        PenPard is turning the persisted objective and scope envelope into internal bounded test hints before immediate live execution.
-                                    </p>
-                                </div>
-                            </div>
-                        ) : isScopedScan && status === 'awaiting_review' ? (
-                            <div className="relative z-10 flex items-center gap-6">
-                                <div className="w-24 h-24 relative flex items-center justify-center">
-                                    <div className="absolute inset-0 border border-violet-500/30 rounded-full" />
-                                    <div className="absolute inset-4 border border-violet-500/20 rounded-full" />
-                                    <CheckCircle className="w-9 h-9 text-violet-300" />
-                                </div>
-                                <div className="text-left">
-                                    <h3 className="font-bold text-white text-lg">Legacy Review State</h3>
-                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
-                                        {focusedPlanSummary?.enabledCases ?? focusedTestCases.length} bounded case hint(s) are persisted for a legacy manual review flow. New scoped launches should move straight into live execution.
-                                    </p>
-                                </div>
-                            </div>
-                        ) : isScopedScan && status === 'scoped_executing' ? (
-                            <div className="relative z-10 flex items-center gap-6">
-                                <div className="w-24 h-24 relative flex items-center justify-center">
-                                    <motion.div
-                                        animate={{ rotate: 360 }}
-                                        transition={{ duration: 8, repeat: Infinity, ease: 'linear' }}
-                                        className="absolute inset-0 border-2 border-dashed border-emerald-500/30 rounded-full"
-                                    />
-                                    <motion.div
-                                        animate={{ rotate: -360 }}
-                                        transition={{ duration: 12, repeat: Infinity, ease: 'linear' }}
-                                        className="absolute inset-4 border border-cyan-500/30 rounded-full"
-                                    />
-                                    <Activity className="w-8 h-8 text-emerald-300" />
-                                </div>
-                                <div className="text-left">
-                                    <h3 className="font-bold text-white text-lg">Running Bounded Live Mission</h3>
-                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
-                                        Scoped execution is reasoning live inside the persisted mission boundary, following suspicious signals and updating findings as evidence lands.
-                                    </p>
-                                </div>
-                            </div>
-                        ) : isScopedScan && status === 'scoped_executed' ? (
-                            <div className="relative z-10 flex items-center gap-6">
-                                <div className="w-24 h-24 relative flex items-center justify-center">
-                                    <div className="absolute inset-0 border border-emerald-500/30 rounded-full" />
-                                    <div className="absolute inset-4 border border-emerald-500/20 rounded-full" />
-                                    <CheckCircle className="w-9 h-9 text-emerald-300" />
-                                </div>
-                                <div className="text-left">
-                                    <h3 className="font-bold text-white text-lg">Bounded Mission Complete</h3>
-                                    <p className="text-slate-400 text-xs max-w-[280px] leading-relaxed">
-                                        The bounded mission finished with persisted findings, verdict evidence, and request traces ready for operator review.
-                                    </p>
-                                </div>
-                            </div>
-                        ) : (status === 'scanning' || status === 'crawling' || status === 'testing') ? (
+                        ) : isPrimaryMissionActive ? (
                             <div className="relative z-10 flex items-center gap-6">
                                 <div className="w-24 h-24 relative">
                                     <motion.div
@@ -3339,8 +1546,8 @@ User Question: ${userQuestion}`;
                                 </div>
                                 <div className="text-left">
                                     <h3 className="font-bold text-white text-lg">Active Analysis</h3>
-                                    <p className="text-slate-400 text-xs max-w-[200px]">
-                                        Orchestrator is analyzing target topology...
+                                    <p className="text-slate-400 text-xs max-w-[260px] leading-relaxed">
+                                        {liveRuntimeSummary?.currentDecisionSummary || liveRuntimeSummary?.observationSummary || 'Orchestrator is analyzing target topology...'}
                                     </p>
                                 </div>
                             </div>
@@ -3360,15 +1567,9 @@ User Question: ${userQuestion}`;
                             {logs.filter(l => l.type === 'human' || (l.type === 'agent' && l.message.includes('[PENPARD]'))).length === 0 ? (
                                 <div className="text-center py-8 opacity-30 text-sm">
                                     <Terminal className="w-8 h-8 mx-auto mb-2" />
-                                    <p>{scopedControlMode ? (isScopedExecutionMode ? 'No scoped execution notes yet.' : isLegacyScopedReviewMode ? 'No legacy review notes yet.' : 'No scoped mission notes yet.') : 'No commands sent yet.'}</p>
+                                    <p>No commands sent yet.</p>
                                     <p className="text-xs mt-1">
-                                        {scopedControlMode
-                                            ? isScopedExecutionMode
-                                                ? 'Scoped execution is system-managed. Inspect live reasoning, requests, and evidence on the right.'
-                                                : isLegacyScopedReviewMode
-                                                    ? 'This scan is using the legacy manual review path. Review controls stay available on the right.'
-                                                    : 'Scoped mode now moves from discovery into live bounded execution without a review wall.'
-                                            : 'Type a message to ask PenPard about the scan...'}
+                                        Type a message to ask PenPard about the scan...
                                     </p>
                                 </div>
                             ) : (
@@ -3452,9 +1653,6 @@ User Question: ${userQuestion}`;
                                     value={command}
                                     onChange={e => setCommand(e.target.value)}
                                     onKeyDown={e => {
-                                        if (scopedControlMode) {
-                                            return;
-                                        }
                                         if (e.key === 'Enter') {
                                             if (showContinuePanel && scanCompleted) {
                                                 handleContinueScan();
@@ -3463,21 +1661,12 @@ User Question: ${userQuestion}`;
                                             }
                                         }
                                     }}
-                                    disabled={scopedControlMode}
-                                    placeholder={scopedControlMode
-                                        ? isScopedExecutionMode
-                                            ? 'Scoped execution is running. Inspect evidence and per-case state on the right.'
-                                            : isLegacyScopedReviewMode
-                                                ? 'Review approved legacy cases, then start bounded execution from the panel on the right.'
-                                                : 'Scoped mission is system-managed. Inspect live reasoning, requests, and findings on the right.'
-                                        : showContinuePanel && scanCompleted
+                                    placeholder={showContinuePanel && scanCompleted
                                             ? 'Enter instructions to continue scanning...'
                                             : 'Type instructions for PenPard...'
                                     }
                                     className={`w-full bg-slate-800/50 border rounded-xl px-4 py-3 text-white placeholder-slate-500 text-sm focus:ring-1 outline-none transition-all ${
-                                        scopedControlMode
-                                            ? 'border-slate-800 opacity-60 cursor-not-allowed pr-12'
-                                            : showContinuePanel && scanCompleted
+                                        showContinuePanel && scanCompleted
                                                 ? 'border-cyan-500/40 focus:border-cyan-500 focus:ring-cyan-500/50 pr-28'
                                                 : 'border-slate-700 focus:border-cyan-500/50 focus:ring-cyan-500/50 pr-12'
                                     }`}
@@ -3495,7 +1684,7 @@ User Question: ${userQuestion}`;
                                         </button>
                                     )}
                                     {/* Regular send button */}
-                                    {!scopedControlMode && (!showContinuePanel || !scanCompleted) && (
+                                    {(!showContinuePanel || !scanCompleted) && (
                                         <button
                                             onClick={handleSendCommand}
                                             disabled={!command.trim() || isSending}
@@ -3521,38 +1710,26 @@ User Question: ${userQuestion}`;
 
                     <div className="flex justify-between items-center px-1">
                         <div className="text-xs text-slate-500 flex gap-4">
-                            <span className="flex items-center gap-1">
-                                <div className={`w-1.5 h-1.5 rounded-full ${
-                                    scanCompleted || isScopedDiscoveryMode || isScopedReviewMode || isScopedExecutionMode ? 'bg-blue-500' :
-                                    isPaused ? 'bg-amber-500' : isAgentActive ? 'bg-green-500' : 'bg-slate-500'
-                                }`}></div>
-                                {scanCompleted
-                                    ? 'Scan Finished'
-                                    : isScopedDiscoveryMode
-                                        ? 'Feature Discovery'
-                                    : isScopedReviewMode
-                                        ? status === 'planning' ? 'Planner Running' : 'Plan Ready'
-                                        : isScopedExecutionMode
-                                            ? status === 'scoped_executing' ? 'Execution Running' : 'Execution Complete'
-                                        : isPaused
-                                            ? 'Paused (Monitoring)'
-                                            : isAgentActive ? 'Agent Online' : 'Agent Offline'}
-                            </span>
-                            <span className="flex items-center gap-1">
-                                <div className={`w-1.5 h-1.5 rounded-full ${
-                                    scanCompleted || isScopedDiscoveryMode || isScopedReviewMode || isScopedExecutionMode ? 'bg-blue-500' :
-                                    burpConnected === true ? 'bg-green-500' : burpConnected === false ? 'bg-red-500' : 'bg-slate-500'
-                                }`}></div>
-                                {scanCompleted
-                                    ? 'Burp Session Ended'
-                                    : isScopedDiscoveryMode
-                                        ? 'Anchors Pending'
-                                    : isScopedReviewMode
-                                        ? 'Legacy Review'
-                                    : isScopedExecutionMode
-                                        ? 'Evidence Capture Active'
-                                        : burpConnected === true ? 'Burp Connected' : 'Burp Disconnected'}
-                            </span>
+	                            <span className="flex items-center gap-1">
+	                                <div className={`w-1.5 h-1.5 rounded-full ${
+	                                    scanCompleted ? 'bg-blue-500' :
+	                                    isPaused ? 'bg-amber-500' : isAgentActive ? 'bg-green-500' : 'bg-slate-500'
+	                                }`}></div>
+	                                {scanCompleted
+	                                    ? 'Scan Finished'
+	                                    : isPaused
+	                                            ? 'Paused (Monitoring)'
+	                                            : isAgentActive ? 'Agent Online' : 'Agent Offline'}
+	                            </span>
+	                            <span className="flex items-center gap-1">
+	                                <div className={`w-1.5 h-1.5 rounded-full ${
+	                                    scanCompleted ? 'bg-blue-500' :
+	                                    burpConnected === true ? 'bg-green-500' : burpConnected === false ? 'bg-red-500' : 'bg-slate-500'
+	                                }`}></div>
+	                                {scanCompleted
+	                                    ? 'Burp Session Ended'
+	                                    : burpConnected === true ? 'Burp Connected' : 'Burp Disconnected'}
+	                            </span>
                             {/* Browser status indicator */}
                             {isAgentActive && supportsBrowserVisibility && browserSessionId && (
                                 <span className="flex items-center gap-1">
@@ -3609,10 +1786,10 @@ User Question: ${userQuestion}`;
                                     <Play className="w-3 h-3" /> RESUME
                                 </button>
                             )}
-                            {!isScopedScan && (
-                                <button onClick={handleStop} className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
-                                    <StopCircle className="w-3 h-3" /> STOP
-                                </button>
+	                            {status !== 'completed' && status !== 'failed' && status !== 'stopped' && status !== 'scoped_executed' && (
+	                                <button onClick={handleStop} className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
+	                                    <StopCircle className="w-3 h-3" /> STOP
+	                                </button>
                             )}
                         </div>
                     </div>
@@ -3678,7 +1855,7 @@ User Question: ${userQuestion}`;
                         </div>
                     </div>
 
-                    {isScopedScan ? (
+                    {isScopedScan && showLegacyRecoveryPanel ? (
                         <div className="flex-1 flex flex-col bg-white/5 rounded-xl border border-violet-500/20 overflow-hidden min-h-0">
                             <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 flex-shrink-0 gap-3">
                                 <div className="min-w-0">
@@ -4664,17 +2841,37 @@ User Question: ${userQuestion}`;
                             </div>
                         </div>
                     ) : (
-                        <MissionControlExploratoryFindings
-                            vulnerabilities={vulns}
+                        <MissionControlLiveFindings
+                            findings={liveFindingItems}
                             getSeverityColor={getSeverityColor}
-                            onSelectVulnerability={(vuln) => {
-                                setSelectedVuln(vuln);
+                            onSelectFinding={(finding) => {
+                                if (isScopedScan) {
+                                    const caseId = scopedFindingCaseMap.get(String(finding.id));
+                                    if (caseId) {
+                                        void handleInspectEvidence(caseId);
+                                        return;
+                                    }
+                                }
+                                setSelectedVuln(finding);
                                 setVulnChatHistory([]);
                             }}
                         />
                     )}
                 </div>
                 </div>
+
+                {showScopedSecondaryContext && (
+                    <MissionControlScopedSupportStrip
+                        liveRuntimeSummary={liveRuntimeSummary}
+                        focusedTestObjective={focusedTestObjective}
+                        scopeEnvelope={scopeEnvelope}
+                        scopedTestRequest={scopedTestRequest}
+                        featureDiscoveryState={featureDiscoveryState}
+                        isLegacyScopedRecoveryState={isLegacyScopedReviewMode}
+                        showLegacyRecoveryTools={showLegacyRecoveryPanel}
+                        onToggleLegacyRecovery={() => setShowLegacyRecovery((current) => !current)}
+                    />
+                )}
 
             </main>
 

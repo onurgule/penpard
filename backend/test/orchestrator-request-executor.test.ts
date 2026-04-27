@@ -43,6 +43,7 @@ async function createExecutor(overrides?: {
     burp?: FakeBurp;
     onRequestAftermath?: (event: { url: string; method: string; statusCode: number }) => void;
     setRateLimitPauseUntil?: (until: Date | null) => void;
+    disableDuplicateResponseCache?: boolean;
 }) {
     const burp = overrides?.burp || new FakeBurp();
     const authManager = new AuthStateManager('scan-executor-test', 'https://app.example.com');
@@ -55,6 +56,7 @@ async function createExecutor(overrides?: {
         log: () => {},
         delay: async () => {},
         maxSameRequest: 2,
+        disableDuplicateResponseCache: overrides?.disableDuplicateResponseCache,
         rateLimitPauseMs: 60_000,
         setRateLimitPauseUntil: overrides?.setRateLimitPauseUntil || (() => {}),
         onRequestAftermath: overrides?.onRequestAftermath,
@@ -108,6 +110,32 @@ test('request executor runs transport once per uncached request and records the 
     );
     assert.equal(lastExchange?.action?.args.url, 'https://app.example.com/api/me');
     assert.match(String(lastExchange?.rawRequest || ''), /GET \/api\/me HTTP\/1\.1/);
+});
+
+test('request executor can force every scoped replay through Burp instead of returning cached pseudo-traffic', async () => {
+    const burp = new FakeBurp();
+    const aftermath: Array<{ url: string; method: string; statusCode: number }> = [];
+    const executor = await createExecutor({
+        burp,
+        disableDuplicateResponseCache: true,
+        onRequestAftermath: (event) => aftermath.push(event),
+    });
+    const toolCall: ToolCall<'send_http_request'> = {
+        tool: 'send_http_request',
+        args: {
+            method: 'GET',
+            url: 'https://app.example.com/api/me',
+            headers: {},
+        },
+    };
+
+    await executor.execute(toolCall);
+    await executor.execute(toolCall);
+    const third = await executor.execute(toolCall);
+
+    assert.equal(third.cached, undefined);
+    assert.equal(burp.sent.length, 3);
+    assert.equal(aftermath.length, 3);
 });
 
 test('request executor raises the shared rate-limit pause when Burp returns 429', async () => {

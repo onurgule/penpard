@@ -23,7 +23,7 @@ export interface ScanChatResult {
 }
 
 interface ScanChatServiceOptions {
-    runtimeService?: Pick<ScanRuntimeService, 'getActiveAgent'>;
+    runtimeService?: Pick<ScanRuntimeService, 'getActiveAgent'> & Partial<Pick<ScanRuntimeService, 'sendCommandToActiveRuntime'>>;
     generate?: (request: GenerationRequest, metadata: { scanId: string; context: string; userId?: number }) => Promise<GenerationResponse>;
     persistChatMessage?: (scanId: string, role: 'human' | 'assistant', content: string) => void;
     loadFindings?: (scanId: string) => any[];
@@ -41,7 +41,7 @@ export class ScanChatServiceError extends Error {
 }
 
 export class ScanChatService {
-    private readonly runtimeService: Pick<ScanRuntimeService, 'getActiveAgent'>;
+    private readonly runtimeService: Pick<ScanRuntimeService, 'getActiveAgent'> & Partial<Pick<ScanRuntimeService, 'sendCommandToActiveRuntime'>>;
     private readonly generate: (request: GenerationRequest, metadata: { scanId: string; context: string; userId?: number }) => Promise<GenerationResponse>;
     private readonly persistChatMessage: (scanId: string, role: 'human' | 'assistant', content: string) => void;
     private readonly loadFindings: (scanId: string) => any[];
@@ -60,6 +60,13 @@ export class ScanChatService {
 
     public async handleCommand(scan: ScanChatContext, command: string): Promise<ScanChatResult> {
         this.persistChatMessage(scan.id, 'human', command);
+
+        if (this.runtimeService.sendCommandToActiveRuntime) {
+            const sent = await this.runtimeService.sendCommandToActiveRuntime(scan.id, command);
+            if (sent) {
+                return { message: 'Command sent to agent' };
+            }
+        }
 
         const agent = this.runtimeService.getActiveAgent(scan.id);
         if (agent) {

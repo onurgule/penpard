@@ -27,6 +27,7 @@ interface BurpToolClient {
 type LogFn = (channel: string, message: string) => void;
 
 export interface OrchestratorDomainCoordinatorOptions {
+    scanId?: string;
     targetUrl: string;
     burp: BurpToolClient;
     authManager: AuthStateManager;
@@ -239,6 +240,10 @@ export class OrchestratorDomainCoordinator {
                     url: mutatedUrl,
                     headers: preparedRequest.headers,
                     body: preparedRequest.body || '',
+                    use_proxy: true,
+                    penpard_source: this.options.scanId
+                        ? `Orchestrator/${this.options.scanId}/repeater_test`
+                        : 'Orchestrator/repeater_test',
                 });
 
                 const originalSnapshot: ResponseSnapshot = {
@@ -289,6 +294,8 @@ export class OrchestratorDomainCoordinator {
                     parameter: mutation.parameter,
                     originalValue: mutation.originalValue,
                     newValue: mutation.newValue,
+                    burpVisible: true,
+                    requestSummary: `${request.method} ${mutatedUrl}`,
                     diff: {
                         significant: diff.significant,
                         summary: diff.summary,

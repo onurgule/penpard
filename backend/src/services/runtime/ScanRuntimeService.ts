@@ -54,6 +54,28 @@ export class ScanRuntimeService {
         return this.registry.getAgent(scanId);
     }
 
+    public async sendCommandToActiveRuntime(scanId: string, command: string): Promise<boolean> {
+        const runtime = this.registry.getRuntime(scanId);
+        if (!runtime) {
+            return false;
+        }
+
+        if (runtime.kind === 'agent') {
+            await runtime.agent.handleUserCommand(command);
+            return true;
+        }
+
+        if (runtime.kind === 'runtime') {
+            const agent = runtime.runtime.getAgent?.();
+            if (typeof agent?.handleUserCommand === 'function') {
+                await agent.handleUserCommand(command);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public hasActiveRuntime(scanId: string): boolean {
         return this.registry.hasActiveRuntime(scanId);
     }
@@ -371,7 +393,10 @@ export class ScanRuntimeService {
 
         const cachedLogs = cached ? cached.logs.slice(since) : [];
         const cachedLogsCount = cached ? cached.logs.length : 0;
-        const isCompleted = scan.status === 'completed' || scan.status === 'stopped' || scan.status === 'failed';
+        const isCompleted = scan.status === 'completed'
+            || scan.status === 'scoped_executed'
+            || scan.status === 'stopped'
+            || scan.status === 'failed';
         const checkpoint = scanRuntimeCheckpointService.getCheckpoint(scanId);
 
         return {

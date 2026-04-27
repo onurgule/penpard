@@ -53,6 +53,7 @@ export interface OrchestratorRequestExecutorOptions {
     log: (channel: string, message: string) => void;
     delay?: (ms: number) => Promise<void>;
     maxSameRequest?: number;
+    disableDuplicateResponseCache?: boolean;
     rateLimitPauseMs: number;
     setRateLimitPauseUntil: (until: Date | null) => void;
     onRequestAftermath?: (aftermath: RequestExecutionAftermath) => Promise<void> | void;
@@ -211,6 +212,10 @@ export class OrchestratorRequestExecutor {
     }
 
     private getCachedDuplicateResponse(requestHistoryKey: string, context: RequestExecutionContext): any | null {
+        if (this.options.disableDuplicateResponseCache) {
+            return null;
+        }
+
         const existing = this.requestHistory.get(requestHistoryKey);
         if (!existing || existing.count < (this.options.maxSameRequest ?? 2)) {
             return null;
@@ -223,6 +228,9 @@ export class OrchestratorRequestExecutor {
         return {
             ...existing.lastResponse,
             cached: true,
+            skipped: true,
+            requestSent: false,
+            burpVisible: false,
             message: `Cached response. This exact request was sent ${existing.count} times already. Try different parameters or payloads.`,
         };
     }
