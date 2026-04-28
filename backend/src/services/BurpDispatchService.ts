@@ -7,6 +7,9 @@ export interface BurpDispatchInput {
     rawRequest?: string;
     vulnName?: string;
     url?: string;
+    method?: string;
+    headers?: Record<string, any>;
+    body?: string;
     target?: string;
 }
 
@@ -27,8 +30,8 @@ function normalizeTarget(target: string | undefined): BurpDispatchTarget {
 export class BurpDispatchService {
     public async dispatch(input: BurpDispatchInput): Promise<BurpDispatchResult> {
         const dispatchTarget = normalizeTarget(input.target);
-        if (!input.rawRequest && dispatchTarget !== 'scanner') {
-            throw new Error('rawRequest is required');
+        if (!input.rawRequest && !input.url) {
+            throw new Error('rawRequest or url is required');
         }
 
         const burp = new BurpMCPClient();
@@ -40,6 +43,9 @@ export class BurpDispatchService {
         const prepared = prepareBurpDispatchRequest({
             rawRequest: input.rawRequest,
             url: typeof input.url === 'string' ? input.url : undefined,
+            method: typeof input.method === 'string' ? input.method : undefined,
+            headers: input.headers && typeof input.headers === 'object' ? input.headers : undefined,
+            body: typeof input.body === 'string' ? input.body : undefined,
         });
 
         if (!prepared) {

@@ -27,6 +27,16 @@ export interface MissionControlVulnerability {
     remediation?: string;
     badgeLabel?: string;
     metadata?: string[];
+    actionRequest?: {
+        rawRequest?: string;
+        method?: string;
+        url?: string;
+        headers?: Record<string, string>;
+        body?: string;
+        host?: string;
+        evidenceId?: string;
+        source?: string;
+    };
 }
 
 interface MissionControlScopedSupportStripProps {

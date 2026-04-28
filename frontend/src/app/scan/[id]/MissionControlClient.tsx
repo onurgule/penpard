@@ -16,6 +16,7 @@ import {
     Lock,
     Eye,
     EyeOff,
+    Info,
     StopCircle,
     Download,
     Pause,
@@ -26,6 +27,7 @@ import {
     ScanSearch,
     Globe,
     Route,
+    X,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import toast from 'react-hot-toast';
@@ -90,6 +92,7 @@ import {
     type FocusedContextInfluenceSummary,
     type FocusedEvidenceReasoningLink,
     type FocusedFindingThread,
+    type FocusedRequestEvidenceRef,
     type FocusedInvestigationIssue,
     type FocusedHistoricalCompareState,
     type FocusedHistoricalCompareSummary,
@@ -122,6 +125,286 @@ interface LogEntry {
 }
 
 interface Vulnerability extends MissionControlVulnerability {}
+
+type ActionableBurpRequest = NonNullable<MissionControlVulnerability['actionRequest']>;
+
+interface FocusedEvidenceDetails {
+    focusedTestCase?: FocusedTestCase | null;
+    caseVerdict?: FocusedCaseVerdict | null;
+    findings?: FocusedCaseFinding[];
+    findingThreads?: FocusedFindingThread[];
+    primaryFinding?: FocusedCaseFinding | null;
+    primaryFindingThread?: FocusedFindingThread | null;
+    evidenceBundles?: EvidenceBundle[];
+}
+
+function normalizeOptionalString(value: unknown): string | undefined {
+    const normalized = String(value ?? '').trim();
+    return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeHeaderRecord(headers: unknown): Record<string, string> | undefined {
+    if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+        return undefined;
+    }
+
+    const normalized: Record<string, string> = {};
+    for (const [name, value] of Object.entries(headers)) {
+        const headerName = normalizeOptionalString(name);
+        if (!headerName || value === undefined || value === null) {
+            continue;
+        }
+        normalized[headerName] = String(value);
+    }
+
+    return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+function buildUrlFromEvidenceParts(host?: string | null, path?: string | null): string | undefined {
+    const cleanHost = normalizeOptionalString(host);
+    if (!cleanHost) {
+        return undefined;
+    }
+    const cleanPath = normalizeOptionalString(path) || '/';
+    if (/^https?:\/\//i.test(cleanPath)) {
+        return cleanPath;
+    }
+    return `https://${cleanHost}${cleanPath.startsWith('/') ? cleanPath : `/${cleanPath}`}`;
+}
+
+function getUrlHost(url?: string): string | undefined {
+    try {
+        return url ? new URL(url).host : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function getUrlPathWithQuery(url?: string): string | undefined {
+    try {
+        if (!url) return undefined;
+        const parsed = new URL(url);
+        return `${parsed.pathname || '/'}${parsed.search || ''}`;
+    } catch {
+        return undefined;
+    }
+}
+
+function normalizeActionableRequest(input: {
+    rawRequest?: string | null;
+    method?: string | null;
+    url?: string | null;
+    path?: string | null;
+    host?: string | null;
+    headers?: Record<string, string> | null;
+    body?: string | null;
+    evidenceId?: string | null;
+    source?: string | null;
+}): ActionableBurpRequest | null {
+    const url = normalizeOptionalString(input.url) || buildUrlFromEvidenceParts(input.host, input.path);
+    const rawRequest = normalizeOptionalString(input.rawRequest);
+    if (!rawRequest && !url) {
+        return null;
+    }
+
+    const actionRequest: ActionableBurpRequest = {};
+    if (rawRequest) actionRequest.rawRequest = rawRequest;
+    if (url) actionRequest.url = url;
+    actionRequest.method = normalizeOptionalString(input.method)?.toUpperCase() || 'GET';
+    const host = normalizeOptionalString(input.host) || getUrlHost(url);
+    if (host) actionRequest.host = host;
+    const headers = normalizeHeaderRecord(input.headers);
+    if (headers) actionRequest.headers = headers;
+    const body = normalizeOptionalString(input.body);
+    if (body) actionRequest.body = body;
+    const evidenceId = normalizeOptionalString(input.evidenceId);
+    if (evidenceId) actionRequest.evidenceId = evidenceId;
+    const source = normalizeOptionalString(input.source);
+    if (source) actionRequest.source = source;
+    return actionRequest;
+}
+
+function buildActionableRequestFromEvidenceRef(ref?: FocusedRequestEvidenceRef | null): ActionableBurpRequest | null {
+    if (!ref) {
+        return null;
+    }
+    return normalizeActionableRequest({
+        rawRequest: ref.rawRequest,
+        method: ref.method,
+        url: ref.url,
+        path: ref.path,
+        host: ref.host,
+        headers: ref.requestHeaders,
+        body: ref.requestBody,
+        evidenceId: ref.evidenceId,
+        source: ref.source,
+    });
+}
+
+function buildActionableRequestFromBundle(bundle?: EvidenceBundle | null, fallbackRef?: FocusedRequestEvidenceRef | null): ActionableBurpRequest | null {
+    const requestRef = bundle?.requestRef;
+    return normalizeActionableRequest({
+        rawRequest: requestRef?.raw || fallbackRef?.rawRequest,
+        method: requestRef?.method || fallbackRef?.method,
+        url: requestRef?.url || fallbackRef?.url,
+        path: requestRef?.path || fallbackRef?.path,
+        host: requestRef?.host || fallbackRef?.host,
+        headers: requestRef?.headers || fallbackRef?.requestHeaders || undefined,
+        body: requestRef?.body || fallbackRef?.requestBody,
+        evidenceId: bundle?.id || fallbackRef?.evidenceId,
+        source: bundle?.source || fallbackRef?.source,
+    });
+}
+
+function getPreferredRequestEvidenceRef(story?: FocusedCaseFinding['requestEvidenceStory'] | FocusedFindingThread['requestEvidenceStory'] | FocusedCaseVerdict['requestEvidenceStory'] | null): FocusedRequestEvidenceRef | null {
+    if (!story) {
+        return null;
+    }
+    return story.strongestSuspiciousRequestRef
+        || story.supportingRequestRefs[0]
+        || story.confirmationRequestRefs[0]
+        || story.baselineRequestRef
+        || null;
+}
+
+function buildRequestDisplayText(request: ActionableBurpRequest | null): string {
+    if (!request) {
+        return '';
+    }
+    if (request.rawRequest) {
+        return request.rawRequest;
+    }
+
+    const method = request.method || 'GET';
+    const path = getUrlPathWithQuery(request.url) || request.url || '/';
+    const host = request.host || getUrlHost(request.url);
+    const headers = {
+        ...(host ? { Host: host } : {}),
+        ...(request.headers || {}),
+    };
+    const headerLines = Object.entries(headers)
+        .filter(([name]) => name.trim().length > 0)
+        .map(([name, value]) => `${name}: ${value}`);
+    return [
+        `${method} ${path} HTTP/1.1`,
+        ...headerLines,
+        '',
+        request.body || '',
+    ].join('\n');
+}
+
+function buildResponseDisplayText(bundle?: EvidenceBundle | null, fallbackRef?: FocusedRequestEvidenceRef | null): string {
+    const rawResponse = normalizeOptionalString(bundle?.responseRef?.raw || fallbackRef?.rawResponse);
+    if (rawResponse) {
+        return rawResponse;
+    }
+    const statusCode = bundle?.responseRef?.statusCode ?? fallbackRef?.statusCode;
+    if (typeof statusCode === 'number') {
+        return `HTTP ${statusCode}\n\n${bundle?.summary || fallbackRef?.summary || ''}`.trim();
+    }
+    return bundle?.summary || fallbackRef?.summary || '';
+}
+
+function collectFocusedEvidenceIds(
+    finding?: FocusedCaseFinding | null,
+    thread?: FocusedFindingThread | null,
+    verdict?: FocusedCaseVerdict | null,
+): string[] {
+    const ordered: string[] = [];
+    const add = (id?: string | null) => {
+        const normalized = normalizeOptionalString(id);
+        if (normalized && !ordered.includes(normalized)) {
+            ordered.push(normalized);
+        }
+    };
+    const addStory = (story?: FocusedCaseFinding['requestEvidenceStory'] | FocusedFindingThread['requestEvidenceStory'] | FocusedCaseVerdict['requestEvidenceStory'] | null) => {
+        if (!story) return;
+        add(story.strongestSuspiciousRequestRef?.evidenceId);
+        story.supportingRequestRefs.forEach((ref) => add(ref.evidenceId));
+        story.confirmationRequestRefs.forEach((ref) => add(ref.evidenceId));
+        add(story.baselineRequestRef?.evidenceId);
+    };
+
+    addStory(finding?.requestEvidenceStory);
+    addStory(thread?.requestEvidenceStory);
+    addStory(verdict?.requestEvidenceStory);
+    finding?.supportingEvidenceRefs.forEach((ref) => add(ref.evidenceId));
+    thread?.supportingEvidenceRefs.forEach((ref) => add(ref.evidenceId));
+    verdict?.supportingEvidenceRefs.forEach((ref) => add(ref.evidenceId));
+    return ordered;
+}
+
+function pickActionableEvidenceBundle(
+    bundles: EvidenceBundle[],
+    finding?: FocusedCaseFinding | null,
+    thread?: FocusedFindingThread | null,
+    verdict?: FocusedCaseVerdict | null,
+): EvidenceBundle | null {
+    const bundleById = new Map(bundles.map((bundle) => [bundle.id, bundle]));
+    for (const evidenceId of collectFocusedEvidenceIds(finding, thread, verdict)) {
+        const bundle = bundleById.get(evidenceId);
+        if (bundle?.requestRef?.raw || bundle?.requestRef?.url) {
+            return bundle;
+        }
+    }
+
+    const requestBackedBundles = bundles.filter((bundle) => bundle.requestRef?.raw || bundle.requestRef?.url);
+    return [...requestBackedBundles].reverse().find((bundle) => bundle.source === 'mutated_replay')
+        || [...requestBackedBundles].reverse().find((bundle) => bundle.source === 'baseline_replay')
+        || requestBackedBundles[requestBackedBundles.length - 1]
+        || null;
+}
+
+function resolveScopedFindingVulnerability(
+    fallbackFinding: MissionControlVulnerability,
+    details: FocusedEvidenceDetails,
+): Vulnerability {
+    const findings = Array.isArray(details.findings) ? details.findings : [];
+    const threads = Array.isArray(details.findingThreads) ? details.findingThreads : [];
+    const focusedFinding = findings.find((entry) => String(entry.id) === String(fallbackFinding.id))
+        || details.primaryFinding
+        || details.focusedTestCase?.primaryFinding
+        || null;
+    const focusedThread = threads.find((entry) => String(entry.id) === String(fallbackFinding.id) || String(entry.publishedFindingId || '') === String(fallbackFinding.id))
+        || details.primaryFindingThread
+        || details.focusedTestCase?.activeFindingThread
+        || null;
+    const verdict = details.caseVerdict || details.focusedTestCase?.latestVerdict || null;
+    const preferredRef = getPreferredRequestEvidenceRef(
+        focusedFinding?.requestEvidenceStory
+        || focusedThread?.requestEvidenceStory
+        || verdict?.requestEvidenceStory
+        || null,
+    );
+    const bundle = pickActionableEvidenceBundle(Array.isArray(details.evidenceBundles) ? details.evidenceBundles : [], focusedFinding, focusedThread, verdict);
+    const actionRequest = buildActionableRequestFromBundle(bundle, preferredRef)
+        || buildActionableRequestFromEvidenceRef(preferredRef)
+        || fallbackFinding.actionRequest
+        || null;
+    const request = buildRequestDisplayText(actionRequest) || fallbackFinding.request || '';
+    const response = buildResponseDisplayText(bundle, preferredRef) || fallbackFinding.response || '';
+    const sourceSummary = bundle?.summary || preferredRef?.summary || focusedFinding?.strongestSupportSummary || focusedThread?.strongestSupportSummary || fallbackFinding.description;
+
+    return {
+        ...fallbackFinding,
+        name: focusedFinding?.title || focusedThread?.title || fallbackFinding.name,
+        description: sourceSummary,
+        request,
+        response,
+        actionRequest: actionRequest || undefined,
+    };
+}
+
+function hasActionableBurpRequest(vulnerability: Vulnerability | null): boolean {
+    if (!vulnerability) {
+        return false;
+    }
+    return Boolean(
+        vulnerability.actionRequest?.rawRequest
+        || vulnerability.actionRequest?.url
+        || normalizeOptionalString(vulnerability.request),
+    );
+}
 
 export default function MissionControlClient() {
     const params = useParams();
@@ -216,6 +499,7 @@ export default function MissionControlClient() {
     const [executePending, setExecutePending] = useState(false);
     const [verdictRefreshPending, setVerdictRefreshPending] = useState(false);
     const [showLegacyRecovery, setShowLegacyRecovery] = useState(false);
+    const [showScopedDetails, setShowScopedDetails] = useState(false);
     const [evidenceLoadingCaseId, setEvidenceLoadingCaseId] = useState<string | null>(null);
     const [selectedEvidenceCaseId, setSelectedEvidenceCaseId] = useState<string | null>(null);
     const [selectedExecution, setSelectedExecution] = useState<FocusedTestCaseExecution | null>(null);
@@ -644,19 +928,24 @@ User Question: ${userQuestion}`;
     };
 
     const handleSendToBurp = async (target: 'repeater' | 'intruder' | 'scanner') => {
-        if (!selectedVuln?.request || burpSending) return;
+        const vulnerability = selectedVuln;
+        if (!vulnerability || !hasActionableBurpRequest(vulnerability) || burpSending) return;
         setBurpSending(target);
         const labels: Record<string, string> = { repeater: 'Repeater', intruder: 'Intruder', scanner: 'Active Scan' };
-        const icons: Record<string, string> = { repeater: '🔁', intruder: '🎯', scanner: '🔍' };
+        const actionRequest = vulnerability.actionRequest;
         try {
             await axios.post(`${API_URL}/scans/burp/send`, {
-                rawRequest: selectedVuln.request,
-                vulnName: selectedVuln.name,
+                rawRequest: actionRequest?.rawRequest || vulnerability.request,
+                url: actionRequest?.url,
+                method: actionRequest?.method,
+                headers: actionRequest?.headers,
+                body: actionRequest?.body,
+                vulnName: vulnerability.name,
                 target
             }, {
                 headers: { Authorization: `Bearer ${token}` }
             });
-            toast.success(`Sent to Burp ${labels[target]}!`, { icon: icons[target] });
+            toast.success(`Sent to Burp ${labels[target]}!`);
         } catch (e: any) {
             const msg = e.response?.data?.message || `Failed to send to ${labels[target]}`;
             toast.error(msg);
@@ -984,6 +1273,38 @@ User Question: ${userQuestion}`;
         }
     };
 
+    const handleOpenScopedFinding = async (finding: MissionControlVulnerability, caseId: string) => {
+        if (!scanIdRef.current) return;
+        setEvidenceLoadingCaseId(caseId);
+
+        try {
+            const response = await axios.get(`${API_URL}/scans/${scanIdRef.current}/focused-test-cases/${caseId}/evidence`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            const details = response.data as FocusedEvidenceDetails;
+            setSelectedVuln(resolveScopedFindingVulnerability(finding, details));
+            setVulnChatHistory([]);
+            if (details.focusedTestCase?.id === caseId) {
+                setFocusedTestCases((prev) => prev.map((entry) => (
+                    entry.id === caseId ? details.focusedTestCase as FocusedTestCase : entry
+                )));
+            }
+        } catch (e: any) {
+            const fallback = {
+                ...finding,
+                actionRequest: finding.actionRequest,
+                request: finding.request || buildRequestDisplayText(finding.actionRequest || null),
+            };
+            if (hasActionableBurpRequest(fallback)) {
+                setSelectedVuln(fallback);
+                setVulnChatHistory([]);
+            }
+            toast.error(e.response?.data?.message || 'Failed to load scoped finding evidence');
+        } finally {
+            setEvidenceLoadingCaseId(null);
+        }
+    };
+
     const buildScreenshotDataUrl = (screenshotRef?: EvidenceBundle['screenshotRef'] | null) => {
         if (!screenshotRef?.value) {
             return null;
@@ -1009,19 +1330,27 @@ User Question: ${userQuestion}`;
     const focusedFindingRows = buildFocusedScanFindingRows(focusedFindings, focusedTestCases, focusedFindingThreads);
     const visibleFocusedFindingRows = focusedFindingRows.filter((entry) => entry.finding.status !== 'not_confirmed');
     const scopedFindingCaseMap = new Map(visibleFocusedFindingRows.map((entry) => [String(entry.finding.id), entry.caseId]));
-    const scopedLiveFindingItems: MissionControlVulnerability[] = visibleFocusedFindingRows.map(({ finding, source, caseTitle, targetLabel }) => ({
-        id: finding.id,
-        name: finding.title,
-        severity: finding.status === 'confirmed' ? 'high' : finding.status === 'likely' ? 'medium' : finding.status === 'suspicious' ? 'low' : 'info',
-        badgeLabel: formatFocusedFindingStatus(finding.status),
-        description: finding.strongestSupportSummary || finding.nextStepSummary || `${caseTitle} on ${targetLabel}`,
-        metadata: [
-            source === 'runtime_thread' ? 'Provisional live thread' : caseTitle,
-            targetLabel,
-            formatFocusedFindingFamily(finding.family),
-            `${finding.suspicionScore}% suspicion`,
-        ].filter(Boolean),
-    }));
+    const scopedLiveFindingItems: MissionControlVulnerability[] = visibleFocusedFindingRows.map(({ finding, source, caseTitle, targetLabel }) => {
+        const requestRef = getPreferredRequestEvidenceRef(finding.requestEvidenceStory);
+        const actionRequest = buildActionableRequestFromEvidenceRef(requestRef);
+        return {
+            id: finding.id,
+            name: finding.title,
+            severity: finding.status === 'confirmed' ? 'high' : finding.status === 'likely' ? 'medium' : finding.status === 'suspicious' ? 'low' : 'info',
+            badgeLabel: formatFocusedFindingStatus(finding.status),
+            description: finding.strongestSupportSummary || finding.nextStepSummary || `${caseTitle} on ${targetLabel}`,
+            request: buildRequestDisplayText(actionRequest),
+            response: requestRef?.rawResponse || (typeof requestRef?.statusCode === 'number' ? `HTTP ${requestRef.statusCode}` : ''),
+            actionRequest: actionRequest || undefined,
+            metadata: [
+                actionRequest ? 'Burp-visible request evidence' : 'Evidence pending request capture',
+                source === 'runtime_thread' ? 'Provisional live thread' : caseTitle,
+                targetLabel,
+                formatFocusedFindingFamily(finding.family),
+                `${finding.suspicionScore}% suspicion`,
+            ].filter(Boolean),
+        };
+    });
     const scopedStandardFindingItems: MissionControlVulnerability[] = vulns.map((vulnerability) => ({
         ...vulnerability,
         badgeLabel: vulnerability.severity,
@@ -1079,6 +1408,7 @@ User Question: ${userQuestion}`;
         scanMode,
         status,
         legacyRecoveryRequested: showLegacyRecovery,
+        scopedDetailsRequested: showScopedDetails,
     });
     const isLegacyScopedReviewMode = missionControlPolicy.isLegacyScopedRecoveryState;
     const showLegacyRecoveryPanel = missionControlPolicy.showLegacyRecoveryTools;
@@ -1228,6 +1558,7 @@ User Question: ${userQuestion}`;
             || browserLifecycleState === 'closed'
             ? 'bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20'
             : 'bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:bg-purple-500/20';
+    const selectedVulnCanSendToBurp = hasActionableBurpRequest(selectedVuln);
     const getCaseCardClassName = (row: typeof focusedCaseRows[number]) => {
         if (row.status === 'disabled') {
             return 'border-slate-800 bg-slate-950/60 opacity-80';
@@ -2848,7 +3179,7 @@ User Question: ${userQuestion}`;
                                 if (isScopedScan) {
                                     const caseId = scopedFindingCaseMap.get(String(finding.id));
                                     if (caseId) {
-                                        void handleInspectEvidence(caseId);
+                                        void handleOpenScopedFinding(finding, caseId);
                                         return;
                                     }
                                 }
@@ -2860,20 +3191,63 @@ User Question: ${userQuestion}`;
                 </div>
                 </div>
 
-                {showScopedSecondaryContext && (
-                    <MissionControlScopedSupportStrip
-                        liveRuntimeSummary={liveRuntimeSummary}
-                        focusedTestObjective={focusedTestObjective}
-                        scopeEnvelope={scopeEnvelope}
-                        scopedTestRequest={scopedTestRequest}
-                        featureDiscoveryState={featureDiscoveryState}
-                        isLegacyScopedRecoveryState={isLegacyScopedReviewMode}
-                        showLegacyRecoveryTools={showLegacyRecoveryPanel}
-                        onToggleLegacyRecovery={() => setShowLegacyRecovery((current) => !current)}
-                    />
-                )}
-
             </main>
+
+            {isScopedScan && (
+                <button
+                    onClick={() => setShowScopedDetails(true)}
+                    className="fixed bottom-5 right-5 z-40 w-11 h-11 rounded-full border border-cyan-500/30 bg-slate-950/95 text-cyan-200 shadow-xl shadow-black/30 hover:bg-cyan-500/10 hover:text-white transition-colors flex items-center justify-center"
+                    title="Mission details"
+                    aria-label="Open mission details"
+                >
+                    <Info className="w-5 h-5" />
+                </button>
+            )}
+
+            <AnimatePresence>
+                {showScopedSecondaryContext && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="fixed inset-0 z-[90] bg-black/70 backdrop-blur-sm flex justify-end"
+                        onClick={() => setShowScopedDetails(false)}
+                    >
+                        <motion.aside
+                            initial={{ x: 420 }}
+                            animate={{ x: 0 }}
+                            exit={{ x: 420 }}
+                            transition={{ type: 'spring', stiffness: 260, damping: 30 }}
+                            className="h-full w-full max-w-5xl bg-slate-950 border-l border-white/10 shadow-2xl overflow-y-auto p-5 space-y-4"
+                            onClick={(event) => event.stopPropagation()}
+                        >
+                            <div className="flex items-center justify-between gap-3">
+                                <div>
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">Mission Details</div>
+                                    <h2 className="mt-1 text-lg font-semibold text-white">Scoped mission context</h2>
+                                </div>
+                                <button
+                                    onClick={() => setShowScopedDetails(false)}
+                                    className="w-9 h-9 rounded-lg border border-white/10 bg-white/5 text-slate-300 hover:text-white hover:bg-white/10 flex items-center justify-center"
+                                    aria-label="Close mission details"
+                                >
+                                    <X className="w-4 h-4" />
+                                </button>
+                            </div>
+                            <MissionControlScopedSupportStrip
+                                liveRuntimeSummary={liveRuntimeSummary}
+                                focusedTestObjective={focusedTestObjective}
+                                scopeEnvelope={scopeEnvelope}
+                                scopedTestRequest={scopedTestRequest}
+                                featureDiscoveryState={featureDiscoveryState}
+                                isLegacyScopedRecoveryState={isLegacyScopedReviewMode}
+                                showLegacyRecoveryTools={showLegacyRecoveryPanel}
+                                onToggleLegacyRecovery={() => setShowLegacyRecovery((current) => !current)}
+                            />
+                        </motion.aside>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {/* VULNERABILITY DETAILS MODAL */}
             {selectedVuln && (
@@ -2918,7 +3292,7 @@ User Question: ${userQuestion}`;
                                     <label className="text-xs font-bold text-slate-500 uppercase flex items-center justify-between">
                                         Request
                                         <div className="flex items-center gap-1.5">
-                                            {selectedVuln.request && (
+                                            {selectedVulnCanSendToBurp && (
                                                 <>
                                                     <button
                                                         onClick={() => handleSendToBurp('repeater')}

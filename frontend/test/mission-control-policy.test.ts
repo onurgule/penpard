@@ -13,11 +13,12 @@ test('scoped scans stay on the shared Mission Control surface by default', () =>
         scanMode: 'scoped',
         status: 'scoped_executing',
         legacyRecoveryRequested: false,
+        scopedDetailsRequested: false,
     });
 
     assert.equal(policy.isLegacyScopedRecoveryState, false);
     assert.equal(policy.showLegacyRecoveryTools, false);
-    assert.equal(policy.showScopedSecondaryContext, true);
+    assert.equal(policy.showScopedSecondaryContext, false);
 });
 
 test('legacy scoped review states keep recovery tools secondary until requested', () => {
@@ -25,11 +26,12 @@ test('legacy scoped review states keep recovery tools secondary until requested'
         scanMode: 'scoped',
         status: 'awaiting_review',
         legacyRecoveryRequested: false,
+        scopedDetailsRequested: false,
     });
 
     assert.equal(policy.isLegacyScopedRecoveryState, true);
     assert.equal(policy.showLegacyRecoveryTools, false);
-    assert.equal(policy.showScopedSecondaryContext, true);
+    assert.equal(policy.showScopedSecondaryContext, false);
 });
 
 test('legacy scoped review states expose recovery tools when explicitly requested', () => {
@@ -37,6 +39,7 @@ test('legacy scoped review states expose recovery tools when explicitly requeste
         scanMode: 'scoped',
         status: 'awaiting_review',
         legacyRecoveryRequested: true,
+        scopedDetailsRequested: true,
     });
 
     assert.equal(policy.isLegacyScopedRecoveryState, true);
@@ -49,6 +52,7 @@ test('exploratory scans keep the shared Mission Control surface without scoped s
         scanMode: 'exploratory',
         status: 'testing',
         legacyRecoveryRequested: true,
+        scopedDetailsRequested: true,
     });
 
     assert.equal(policy.isLegacyScopedRecoveryState, false);
@@ -56,7 +60,7 @@ test('exploratory scans keep the shared Mission Control surface without scoped s
     assert.equal(policy.showScopedSecondaryContext, false);
 });
 
-test('scoped support context renders after the shared primary Mission Control grid', () => {
+test('scoped support context renders in a closed secondary drawer outside the primary grid', () => {
     const source = fs.readFileSync(path.join(__dirname, '../src/app/scan/[id]/MissionControlClient.tsx'), 'utf8');
     const primaryGridIndex = source.indexOf('className="min-h-[calc(100vh-theme(spacing.10))] grid grid-cols-12 gap-6"');
     const supportStripIndex = source.indexOf('<MissionControlScopedSupportStrip');
@@ -64,6 +68,8 @@ test('scoped support context renders after the shared primary Mission Control gr
 
     assert.ok(primaryGridIndex > 0, 'primary Mission Control grid should be present');
     assert.ok(supportStripIndex > primaryGridIndex, 'scoped support context must not precede the shared primary grid');
+    assert.match(source, /showScopedSecondaryContext && \(/);
+    assert.match(source, /fixed inset-0 z-\[90\]/);
     assert.equal(legacyAlternateIndex, -1, 'default scoped path must not branch into the old alternate scan surface');
 });
 
@@ -73,4 +79,5 @@ test('scoped live findings include the exploratory-core vulnerability stream', (
     assert.match(source, /const scopedStandardFindingItems[\s\S]*vulns\.map/);
     assert.match(source, /\[\.\.\.scopedStandardFindingItems,\s*\.\.\.scopedLiveFindingItems\]/);
     assert.match(source, /Burp-visible request evidence/);
+    assert.match(source, /handleOpenScopedFinding\(finding, caseId\)/);
 });

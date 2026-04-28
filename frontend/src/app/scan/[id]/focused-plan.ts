@@ -970,6 +970,10 @@ export interface FocusedRequestEvidenceRef {
     url?: string | null;
     path?: string | null;
     host?: string | null;
+    rawRequest?: string | null;
+    rawResponse?: string | null;
+    requestHeaders?: Record<string, string> | null;
+    requestBody?: string | null;
     statusCode?: number | null;
     executionPhase?: FocusedExecutionPhase | null;
     confirmationKind?: FocusedConfirmationKind | null;
@@ -1015,6 +1019,8 @@ export interface EvidenceBundle {
         url?: string;
         path?: string;
         host?: string;
+        headers?: Record<string, string>;
+        body?: string;
         statusCode?: number;
         raw?: string;
     } | null;
@@ -1023,6 +1029,8 @@ export interface EvidenceBundle {
         url?: string;
         path?: string;
         host?: string;
+        headers?: Record<string, string>;
+        body?: string;
         statusCode?: number;
         raw?: string;
     } | null;

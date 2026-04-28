@@ -33,3 +33,43 @@ test('burp dispatch service normalizes URL-only scanner requests through a singl
         BurpMCPClient.prototype.callTool = originalCallTool;
     }
 });
+
+test('burp dispatch service accepts structured scoped finding requests for Repeater', async () => {
+    const originalIsAvailable = BurpMCPClient.prototype.isAvailable;
+    const originalCallTool = BurpMCPClient.prototype.callTool;
+    const calls: Array<{ tool: string; args: any }> = [];
+
+    BurpMCPClient.prototype.isAvailable = async () => true;
+    BurpMCPClient.prototype.callTool = async function(tool: string, args: any) {
+        calls.push({ tool, args });
+        return {};
+    };
+
+    try {
+        const service = new BurpDispatchService();
+        const result = await service.dispatch({
+            target: 'repeater',
+            vulnName: 'Scoped access control finding',
+            method: 'POST',
+            url: 'https://app.example.com/api/orders/123?preview=true',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer test-token',
+            },
+            body: '{"role":"admin"}',
+        });
+
+        assert.equal(result.target, 'repeater');
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].tool, 'send_to_repeater');
+        assert.equal(calls[0].args.host, 'app.example.com');
+        assert.equal(calls[0].args.name, 'Scoped access control finding');
+        assert.match(calls[0].args.request, /^POST \/api\/orders\/123\?preview=true HTTP\/1\.1\r\nHost: app\.example\.com\r\n/);
+        assert.match(calls[0].args.request, /Content-Type: application\/json\r\n/);
+        assert.match(calls[0].args.request, /Authorization: Bearer test-token\r\n/);
+        assert.match(calls[0].args.request, /\r\n\r\n\{"role":"admin"\}$/);
+    } finally {
+        BurpMCPClient.prototype.isAvailable = originalIsAvailable;
+        BurpMCPClient.prototype.callTool = originalCallTool;
+    }
+});

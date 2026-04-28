@@ -4,6 +4,7 @@ export interface MissionControlPolicyInput {
     scanMode: ScanMode;
     status: string;
     legacyRecoveryRequested: boolean;
+    scopedDetailsRequested?: boolean;
 }
 
 export interface MissionControlPolicy {
@@ -19,6 +20,6 @@ export function deriveMissionControlPolicy(input: MissionControlPolicyInput): Mi
     return {
         isLegacyScopedRecoveryState,
         showLegacyRecoveryTools: isScopedScan && input.legacyRecoveryRequested,
-        showScopedSecondaryContext: isScopedScan,
+        showScopedSecondaryContext: isScopedScan && !!input.scopedDetailsRequested,
     };
 }

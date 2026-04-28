@@ -1626,18 +1626,21 @@ router.post('/:id/continue', authenticateToken, async (req: AuthRequest, res: Re
 // Send a request to Burp tools (Repeater / Intruder / Active Scan)
 router.post('/burp/send', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
-        const { rawRequest, vulnName, target, url } = req.body;
+        const { rawRequest, vulnName, target, url, method, headers, body: requestBody } = req.body;
         const result = await burpDispatchService.dispatch({
-            rawRequest,
-            vulnName,
+            rawRequest: typeof rawRequest === 'string' ? rawRequest : undefined,
+            vulnName: typeof vulnName === 'string' ? vulnName : undefined,
             target: typeof target === 'string' ? target : undefined,
             url: typeof url === 'string' ? url : undefined,
+            method: typeof method === 'string' ? method : undefined,
+            headers: headers && typeof headers === 'object' && !Array.isArray(headers) ? headers : undefined,
+            body: typeof requestBody === 'string' ? requestBody : undefined,
         });
         res.json({ success: true, message: result.message });
     } catch (error: any) {
         logger.error('Send to Burp error', { error: error.message });
         const message = error.message || 'Failed to send to Burp';
-        const statusCode = /rawRequest is required|Could not normalize/i.test(message)
+        const statusCode = /rawRequest or url is required|Could not normalize/i.test(message)
             ? 400
             : /Burp Suite is not connected/i.test(message)
                 ? 503
