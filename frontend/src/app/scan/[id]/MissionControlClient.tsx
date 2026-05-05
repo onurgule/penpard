@@ -28,12 +28,14 @@ import {
     Globe,
     Route,
     X,
+    ClipboardList,
 } from 'lucide-react';
 import { useAuthStore } from '@/lib/store/auth';
 import toast from 'react-hot-toast';
 import { MarkdownRenderer } from '@/components/MarkdownRenderer';
 import { API_URL } from '@/lib/api-config';
 import ReportOptionsModal from '@/components/modals/ReportOptionsModal';
+import PlanReviewModal from './PlanReviewModal';
 import { buildEndpointDisplayRows, EndpointInventorySnapshot } from './endpoint-intel';
 import {
     MissionControlLiveFindings,
@@ -487,6 +489,7 @@ export default function MissionControlClient() {
     const [focusedFindingSummary, setFocusedFindingSummary] = useState<FocusedScanFindingSummary | null>(null);
     const [focusedStorySummary, setFocusedStorySummary] = useState<FocusedStorySummary | null>(null);
     const [focusedPlanSummary, setFocusedPlanSummary] = useState<FocusedPlanSummary | null>(null);
+    const [planModalOpen, setPlanModalOpen] = useState(false);
     const [focusedVerdictSummary, setFocusedVerdictSummary] = useState<FocusedScanVerdictSummary | null>(null);
     const [focusedBlockerSummary, setFocusedBlockerSummary] = useState<FocusedScanBlockerSummary | null>(null);
     const [focusedHistoricalCompareState, setFocusedHistoricalCompareState] = useState<FocusedHistoricalCompareState | null>(null);
@@ -1426,6 +1429,7 @@ User Question: ${userQuestion}`;
     ].includes(status);
     const scopedReviewCounts = summarizeScopedPlanReviewCounts(focusedTestCases, focusedPlanSummary);
     const runnableFocusedCaseCount = scopedReviewCounts.approvedCount;
+    const canViewFocusedPlan = isScopedScan && focusedTestCases.length > 0;
     const scopedExecutionLabel = status === 'scoped_executing'
         ? 'Running'
         : status === 'scoped_executed'
@@ -1713,6 +1717,14 @@ User Question: ${userQuestion}`;
                                 {browserButtonLabel}
                             </button>
                         )}
+                        {canViewFocusedPlan && (
+                            <button
+                                onClick={() => setPlanModalOpen(true)}
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-500/10 border border-violet-500/30 text-violet-300 hover:bg-violet-500/20 transition-colors text-xs font-medium"
+                            >
+                                <ClipboardList className="w-3.5 h-3.5" /> View Plan
+                            </button>
+                        )}
                         {/* Pause / Resume Button */}
                         {isAgentActive && !isPaused && status !== 'completed' && status !== 'failed' && status !== 'stopped' && (
                             <button
@@ -1834,10 +1846,30 @@ User Question: ${userQuestion}`;
                 <div className="col-span-12 lg:col-span-6 flex flex-col gap-4 h-[calc(100vh-8rem)]">
                     {/* Visualizer (Compact) */}
                     <div className={`h-48 flex-shrink-0 card relative overflow-hidden flex items-center justify-center ${
-                        isPaused ? 'border-amber-500/30' : 'border-cyan-500/30'
+                        status === 'awaiting_review' ? 'border-amber-500/30' : isPaused ? 'border-amber-500/30' : 'border-cyan-500/30'
                     }`}>
                         <div className="absolute inset-0 bg-[url('/grid.svg')] opacity-10" />
-                        {isPaused ? (
+                        {status === 'awaiting_review' ? (
+                            <div className="relative z-10 flex items-center gap-6">
+                                <div className="w-24 h-24 relative flex items-center justify-center">
+                                    <div className="absolute inset-0 border-2 border-dashed border-amber-500/30 rounded-full" />
+                                    <div className="absolute inset-4 border-2 border-amber-500/20 rounded-full" />
+                                    <ClipboardList className="w-8 h-8 text-amber-300" />
+                                </div>
+                                <div className="text-left">
+                                    <h3 className="font-bold text-amber-300 text-lg">Plan Ready for Review</h3>
+                                    <p className="text-slate-400 text-xs max-w-[250px] leading-relaxed">
+                                        {focusedTestCases.length} test cases planned · Approve to begin testing.
+                                    </p>
+                                    <button
+                                        onClick={() => setPlanModalOpen(true)}
+                                        className="mt-2 flex items-center gap-1.5 px-3 py-1 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20 transition-colors text-xs font-medium"
+                                    >
+                                        <ClipboardList className="w-3 h-3" /> View Plan
+                                    </button>
+                                </div>
+                            </div>
+                        ) : isPaused ? (
                             <div className="relative z-10 flex items-center gap-6">
                                 <div className="w-24 h-24 relative flex items-center justify-center">
                                     <div className="absolute inset-0 border-2 border-dashed border-amber-500/30 rounded-full" />
@@ -2106,6 +2138,11 @@ User Question: ${userQuestion}`;
                             )}
                         </div>
                         <div className="flex items-center gap-3">
+                            {canViewFocusedPlan && (
+                                <button onClick={() => setPlanModalOpen(true)} className="text-xs text-violet-300 hover:text-violet-200 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
+                                    <ClipboardList className="w-3 h-3" /> VIEW PLAN
+                                </button>
+                            )}
                             {supportsPause && isAgentActive && !isPaused && status !== 'completed' && status !== 'failed' && (
                                 <button onClick={handlePause} className="text-xs text-amber-400 hover:text-amber-300 flex items-center gap-1 opacity-80 hover:opacity-100 transition-opacity">
                                     <Pause className="w-3 h-3" /> PAUSE
@@ -3407,6 +3444,16 @@ User Question: ${userQuestion}`;
                 isOpen={reportModalOpen}
                 onClose={() => setReportModalOpen(false)}
                 scanId={scanIdRef.current}
+            />
+            <PlanReviewModal
+                open={planModalOpen}
+                onClose={() => setPlanModalOpen(false)}
+                scanId={scanId}
+                scanStatus={status}
+                focusedTestCases={focusedTestCases}
+                token={token || ''}
+                onCasesUpdated={fetchScanState}
+                onStartRequested={fetchScanState}
             />
         </div>
     );

@@ -4,6 +4,7 @@ import {
     getScanConfig,
     getScopedTestRequest,
     getScopeEnvelope,
+    listFocusedTestCasesByScan,
     updateScanStatus,
 } from '../../db/init';
 import { browserService } from '../BrowserService';
@@ -24,6 +25,7 @@ import {
 } from './ScanRuntimeFactory';
 import { RuntimeLogLedger } from './RuntimeLogLedger';
 import { ScopedMissionPolicy } from './ScopedMissionPolicy';
+import { focusedPlanningService } from './FocusedPlanningService';
 import type {
     FocusedTestObjective,
     ScopeEnvelope,
@@ -32,10 +34,27 @@ import type {
 
 type ScopedMissionPhase =
     | 'scoped_discovering'
+    | 'awaiting_review'
     | 'scoped_executing'
     | 'scoped_executed'
     | 'failed'
     | 'stopped';
+
+function normalizeAutoAcceptPlans(value: unknown): boolean {
+    if (value === undefined || value === null) {
+        return true;
+    }
+    if (typeof value === 'boolean') {
+        return value;
+    }
+    if (typeof value === 'number') {
+        return value !== 0;
+    }
+    if (typeof value === 'string') {
+        return !['false', '0', 'no', 'off'].includes(value.trim().toLowerCase());
+    }
+    return Boolean(value);
+}
 
 export class ScopedMissionRuntime implements ActiveScanRuntime {
     public readonly runtimeKind = 'scoped_mission';
@@ -218,6 +237,9 @@ export class ScopedMissionRuntime implements ActiveScanRuntime {
             }
             this.throwIfStopped();
 
+            await this.runPlanningGate();
+            this.throwIfStopped();
+
             const request = getScopedTestRequest(this.scanId);
             if (!request) {
                 throw new Error(`Scoped mission request context is missing for scan ${this.scanId}.`);
@@ -270,6 +292,94 @@ export class ScopedMissionRuntime implements ActiveScanRuntime {
                 phase: this.phase,
             });
         }
+    }
+
+    private async runPlanningGate(): Promise<void> {
+        const persistedStatus = getScan(this.scanId)?.status as ScopedMissionPhase | undefined;
+        const existingCases = listFocusedTestCasesByScan(this.scanId);
+
+        if (existingCases.length > 0) {
+            if (persistedStatus === 'awaiting_review') {
+                this.phase = 'awaiting_review';
+                this.log('analysis', `Focused plan already exists with ${existingCases.length} test case(s). Waiting for operator approval.`);
+                await this.waitForPlanApproval();
+                return;
+            }
+
+            if (persistedStatus === 'scoped_executing' || persistedStatus === 'scoped_executed') {
+                this.log('analysis', `Focused plan gate already passed with ${existingCases.length} persisted test case(s). Continuing scoped execution.`);
+                return;
+            }
+
+            const approvedCount = existingCases.filter((testCase) => testCase.reviewState === 'approved').length;
+            if (approvedCount > 0) {
+                this.log('analysis', `Focused plan already has ${approvedCount} approved test case(s). Continuing without replanning.`);
+                return;
+            }
+
+            if (existingCases.every((testCase) => testCase.reviewState === 'rejected')) {
+                this.failAllCasesRejected();
+            }
+
+            this.phase = 'awaiting_review';
+            updateScanStatus(this.scanId, 'awaiting_review');
+            this.log('analysis', `Focused plan already exists with ${existingCases.length} test case(s). Waiting for approval before execution.`);
+            await this.waitForPlanApproval();
+            return;
+        }
+
+        const persistedConfig = getScanConfig(this.scanId) || {};
+        const autoAcceptPlans = normalizeAutoAcceptPlans(persistedConfig.autoAcceptPlans);
+        const reviewMode = autoAcceptPlans ? 'auto' : 'legacy';
+        const planningResult = await focusedPlanningService.planNow(this.scanId, { reviewMode });
+        const plannedCount = planningResult.focusedTestCases.length;
+        const approvedCount = planningResult.focusedTestCases.filter((testCase) => testCase.reviewState === 'approved').length;
+        this.log(
+            'analysis',
+            `Focused planning generated ${plannedCount} test case${plannedCount === 1 ? '' : 's'} with review mode "${reviewMode}".`,
+        );
+
+        if (autoAcceptPlans && approvedCount === 0) {
+            throw new Error('Focused planning did not produce an approved test case. Scan halted.');
+        }
+
+        if (!autoAcceptPlans) {
+            this.phase = 'awaiting_review';
+            updateScanStatus(this.scanId, 'awaiting_review');
+            await this.waitForPlanApproval();
+        }
+    }
+
+    private async waitForPlanApproval(): Promise<void> {
+        this.phase = 'awaiting_review';
+        this.log('analysis', 'Scoped execution is paused at the focused plan approval gate.');
+
+        while (true) {
+            this.throwIfStopped();
+
+            const currentCases = listFocusedTestCasesByScan(this.scanId);
+            const approvedCount = currentCases.filter((testCase) => testCase.reviewState === 'approved').length;
+            const allCasesRejected = currentCases.length > 0
+                && currentCases.every((testCase) => testCase.reviewState === 'rejected');
+            if (allCasesRejected) {
+                this.failAllCasesRejected();
+            }
+
+            const currentStatus = getScan(this.scanId)?.status;
+            if (approvedCount > 0 && currentStatus && currentStatus !== 'awaiting_review') {
+                this.log('analysis', `Plan approval gate released with ${approvedCount} approved test case(s).`);
+                return;
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
+    }
+
+    private failAllCasesRejected(): never {
+        const message = 'All planned test cases were rejected. Scan halted.';
+        this.phase = 'failed';
+        updateScanStatus(this.scanId, 'failed', message);
+        throw new Error(message);
     }
 
     private buildRuntimeConfig(

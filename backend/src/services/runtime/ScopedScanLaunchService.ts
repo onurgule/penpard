@@ -16,6 +16,22 @@ import { FocusedTestObjective, ScopeEnvelope, normalizeScanMode } from './Scoped
 import { WebScanRuntimeConfig } from './ScanRuntimeFactory';
 import { ScopedRequestIntakeService, scopedRequestIntakeService } from './ScopedRequestIntakeService';
 
+function normalizeAutoAcceptPlans(value: unknown): boolean {
+    if (value === undefined || value === null) {
+        return true;
+    }
+    if (typeof value === 'boolean') {
+        return value;
+    }
+    if (typeof value === 'number') {
+        return value !== 0;
+    }
+    if (typeof value === 'string') {
+        return !['false', '0', 'no', 'off'].includes(value.trim().toLowerCase());
+    }
+    return Boolean(value);
+}
+
 export interface ScopedScanLaunchInput {
     scanId: string;
     userId: number;
@@ -75,6 +91,7 @@ export class ScopedScanLaunchService {
         const persistedConfig = {
             ...input.persistedConfig,
             scanMode: 'scoped',
+            autoAcceptPlans: normalizeAutoAcceptPlans(input.requestBody.autoAcceptPlans),
             focusedTestObjectiveId: objective.id,
             scopeEnvelopeId: envelope.id,
             structuredSecurityTestRequestId: requestRecordId,

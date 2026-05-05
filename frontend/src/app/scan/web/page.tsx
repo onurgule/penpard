@@ -137,6 +137,7 @@ export default function WebScanPage() {
     const [parallelAgents, setParallelAgents] = useState(() => getDefaultScanOptions().parallelAgents);
     const [iterations, setIterations] = useState(() => getDefaultScanOptions().iterations);
     const [maxPlanRounds, setMaxPlanRounds] = useState(() => getDefaultScanOptions().maxPlanRounds);
+    const [autoAcceptPlans, setAutoAcceptPlans] = useState(true);
     const [sourcePackagePath, setSourcePackagePath] = useState('');
     const [sourceAnalysisMode, setSourceAnalysisMode] = useState<string | null>(null);
     const [sourceType, setSourceType] = useState<SourceType>('local');
@@ -274,6 +275,7 @@ export default function WebScanPage() {
             }
 
             if (scanMode === 'scoped') {
+                formData.append('autoAcceptPlans', String(autoAcceptPlans));
                 formData.append('securityTestRequest', JSON.stringify(
                     buildScopedSecurityTestRequest(normalizedTargetUrl, scopedRequest),
                 ));
@@ -720,6 +722,24 @@ export default function WebScanPage() {
                                         </label>
                                     </div>
                                 </div>
+                            )}
+
+                            {scanMode === 'scoped' && (
+                                <label className="flex items-start gap-3 rounded-xl border border-violet-500/20 bg-violet-500/5 px-4 py-3">
+                                    <input
+                                        type="checkbox"
+                                        checked={autoAcceptPlans}
+                                        onChange={(event) => setAutoAcceptPlans(event.target.checked)}
+                                        disabled={isScanning}
+                                        className="mt-1 accent-violet-500"
+                                    />
+                                    <span>
+                                        <span className="block text-sm font-medium text-gray-100">Auto-accept plans</span>
+                                        <span className="block text-xs text-gray-400 mt-1 leading-relaxed">
+                                            When checked, the AI&apos;s test plan is approved automatically and execution begins immediately. When unchecked, you&apos;ll review and approve the plan in Mission Control before testing starts.
+                                        </span>
+                                    </span>
+                                </label>
                             )}
 
                             <div className="grid gap-4 md:grid-cols-4">

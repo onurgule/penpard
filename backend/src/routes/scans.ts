@@ -46,6 +46,7 @@ import {
     getUserWhitelists,
     getChatMessages,
     saveScanConfig,
+    updateScanStatus,
     updateFocusedTestCase,
 } from '../db/init';
 import { AuthRequest, authenticateToken } from '../middleware/auth';
@@ -638,6 +639,7 @@ router.post('/web', authenticateToken, upload.single('sourceZip'), async (req: A
                 targetUrl,
                 requestBody: {
                     ...(req.body as Record<string, any>),
+                    autoAcceptPlans: req.body.autoAcceptPlans ?? true,
                     securityTestRequest: parseStructuredBodyField(req.body.securityTestRequest),
                 },
                 scanMetadata: launchPlan.scanMetadata,
@@ -779,6 +781,7 @@ router.post('/from-burp', authenticateToken, upload.single('sourceZip'), async (
                 targetUrl,
                 requestBody: {
                     ...(req.body as Record<string, any>),
+                    autoAcceptPlans: req.body.autoAcceptPlans ?? true,
                     securityTestRequest: parseStructuredBodyField(req.body.securityTestRequest),
                 },
                 scanMetadata: launchPlan.scanMetadata,
@@ -1016,6 +1019,39 @@ router.post('/:id/plan-focused-tests', authenticateToken, async (req: AuthReques
             return res.status(409).json({ error: true, message: error.message });
         }
         return res.status(500).json({ error: true, message: error.message || 'Failed to plan focused tests' });
+    }
+});
+
+router.post('/:id/plan/start', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        const user = req.user!;
+        const scan = getOwnedScanOrRespond(id, user.id, res);
+        if (!scan) return;
+
+        if (scan.scan_mode !== 'scoped') {
+            return res.status(400).json({ error: true, message: 'Plan start is only available for scoped scans.' });
+        }
+
+        if (scan.status !== 'awaiting_review') {
+            return res.status(409).json({ error: true, message: 'Plan is not awaiting review.' });
+        }
+
+        const approvedCases = listFocusedTestCasesByScan(id)
+            .filter((testCase) => testCase.reviewState === 'approved')
+            .length;
+        if (approvedCases === 0) {
+            return res.status(400).json({ error: true, message: 'Approve at least one test case before starting.' });
+        }
+
+        updateScanStatus(id, 'scoped_executing');
+        return res.json({
+            status: 'scoped_executing',
+            approvedCases,
+        });
+    } catch (error: any) {
+        logger.error('Start focused plan error', { error: error.message });
+        return res.status(500).json({ error: true, message: error.message || 'Failed to start focused plan' });
     }
 });
 
