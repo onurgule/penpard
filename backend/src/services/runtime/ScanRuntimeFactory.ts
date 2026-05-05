@@ -5,7 +5,6 @@ import type { AuthStartupConfig } from '../auth';
 import { logger } from '../../utils/logger';
 import { BurpMCPClient } from '../burp-mcp';
 import { defaultAuthStartupConfig } from '../web-auth-startup-config';
-import { buildFocusedScanPrompt, FocusedScanSuggestion, resolveFocusedScanTarget } from '../FocusedScanPresetCatalog';
 import { ScanRuntimeCheckpointService, scanRuntimeCheckpointService } from './ScanRuntimeCheckpointService';
 import type { FocusedTestObjective, ScopeEnvelope, ScanMode, StructuredSecurityTestRequest } from './ScopedScanTypes';
 import { normalizeScanMode } from './ScopedScanTypes';
@@ -161,32 +160,6 @@ export class ScanRuntimeFactory {
                 existingEndpoints: this.extractExistingEndpoints(existingFindings),
             },
         };
-    }
-
-    public async createAssistedScanRuntime(scanId: string, suggestion: FocusedScanSuggestion): Promise<PreparedAgentRuntime> {
-        const burp = await this.createConnectedBurpClient(
-            scanId,
-            'Burp MCP connection check failed',
-            'Burp MCP not available',
-        );
-
-        return this.createSingleAgentRuntime(
-            scanId,
-            resolveFocusedScanTarget(suggestion),
-            {
-                scanMode: 'exploratory',
-                rateLimit: 5,
-                useNuclei: false,
-                useFfuf: false,
-                idorUsers: [],
-                parallelAgents: 1,
-                customSystemPrompt: buildFocusedScanPrompt(suggestion),
-                maxIterations: 15,
-                authStartup: defaultAuthStartupConfig(),
-            },
-            burp,
-            'exploratory',
-        );
     }
 
     private createSingleAgentRuntime(

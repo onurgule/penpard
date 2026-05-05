@@ -6,7 +6,6 @@ import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { useShortcutsStore } from '@/lib/store/shortcuts';
 import { useTourStore } from '@/lib/store/tour';
 import { shouldInvalidateSession, useAuthStore } from '@/lib/store/auth';
-import SmartSuggestionAlert from '@/components/SmartSuggestionAlert';
 import { API_URL } from '@/lib/api-config';
 
 interface ClientProvidersProps {
@@ -17,7 +16,6 @@ export default function ClientProviders({ children }: ClientProvidersProps) {
     const router = useRouter();
     const { openHelpModal } = useShortcutsStore();
     const { startTour, hasCompletedTour } = useTourStore();
-    const { token, isAuthenticated } = useAuthStore();
 
     // Initialize keyboard shortcuts
     useKeyboardShortcuts();
@@ -103,29 +101,6 @@ export default function ClientProviders({ children }: ClientProvidersProps) {
         }
     }, [router, openHelpModal, startTour]);
 
-    // Auto-start Activity Monitor when user is authenticated and Burp is available
-    useEffect(() => {
-        if (!isAuthenticated || !token) return;
-
-        const startMonitor = async () => {
-            try {
-                await fetch(`${API_URL}/activity-monitor/start`, {
-                    method: 'POST',
-                    headers: { 
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/json'
-                    }
-                });
-            } catch (error) {
-                // Silently fail - Burp might not be available
-            }
-        };
-
-        // Start monitor after a delay to let everything initialize
-        const timeout = setTimeout(startMonitor, 5000);
-        return () => clearTimeout(timeout);
-    }, [isAuthenticated, token]);
-
     // Auto-start tour for first-time users after a short delay
     useEffect(() => {
         if (!hasCompletedTour && typeof window !== 'undefined') {
@@ -142,8 +117,6 @@ export default function ClientProviders({ children }: ClientProvidersProps) {
     return (
         <>
             {children}
-            {/* Smart Suggestion Alert - shows AI-detected testing patterns */}
-            <SmartSuggestionAlert />
         </>
     );
 }

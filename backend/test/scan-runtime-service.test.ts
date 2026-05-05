@@ -295,54 +295,6 @@ test('startScopedWebScan uses the dedicated scoped runtime factory path before l
     assert.deepEqual(callOrder, ['register', 'start', 'capture:completed', 'flush', 'unregister', 'disconnect']);
 });
 
-test('startAssistedScan launches the assisted runtime from the factory on the single-agent lifecycle path', async () => {
-    const callOrder: string[] = [];
-    const agent = {
-        start: async () => {
-            callOrder.push('start');
-        },
-        getState: () => ({ phase: 'completed' }),
-        flushLogsToDB: () => {
-            callOrder.push('flush');
-        },
-    };
-    const registry = {
-        registerAgent: () => {
-            callOrder.push('register');
-        },
-        captureAgentLogs: (_scanId: string, _agent: any, phase?: string) => {
-            callOrder.push(`capture:${phase}`);
-            return { logs: [], phase };
-        },
-        unregister: () => {
-            callOrder.push('unregister');
-        },
-    };
-    const runtimeFactory = {
-        createAssistedScanRuntime: async (_scanId: string, _suggestion: any) => ({
-            kind: 'agent',
-            scanId: 'scan-runtime-assisted-path',
-            scanMode: 'exploratory',
-            executionMode: 'single-agent',
-            agent,
-            burp: {
-                disconnect: () => {
-                    callOrder.push('disconnect');
-                },
-            },
-        }),
-    };
-
-    const service = new ScanRuntimeService(registry as any, runtimeFactory as any);
-    await service.startAssistedScan('scan-runtime-assisted-path', {
-        type: 'xss',
-        endpoints: ['GET https://app.example.com/search?q=test'],
-        targetHosts: ['https://app.example.com'],
-    });
-
-    assert.deepEqual(callOrder, ['register', 'start', 'capture:completed', 'flush', 'unregister', 'disconnect']);
-});
-
 test('getLiveStatus surfaces the persisted runtime checkpoint when no active runtime survives', async () => {
     await initDatabase();
 

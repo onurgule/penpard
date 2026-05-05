@@ -105,11 +105,7 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
             addTool(this, "check_authorization", "Test IDOR/Auth bypass by replaying request with different sessions", 
                 params("request" to "string", "sessions" to "string (JSON Array: [{name:'User1', headers:'Cookie: ...'}])", "host" to "string", "port" to "integer", "useHttps" to "boolean"))
             
-            // --- 6. ACTIVITY MONITORING ---
-            addTool(this, "get_user_activity", "Analyze recent USER-only activity for Smart Assist. Requests with X-PenPard-Agent header are always excluded — assist only on real user traffic. Detects SQLi, XSS, LFI patterns.", 
-                params("count" to "integer?", "sinceMinutes" to "integer?"))
-
-            // --- 7. CONFIGURATION ---
+            // --- 6. CONFIGURATION ---
             addTool(this, "get_burp_version", "Get Burp Suite Version", params())
             addTool(this, "enable_intercept", "Enable Proxy Intercept", params())
             addTool(this, "disable_intercept", "Disable Proxy Intercept", params())
@@ -178,9 +174,6 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
                 "extract_comments" -> extractComments(args)
                 "generate_payloads" -> generatePayloads(args)
                 "check_authorization" -> checkAuthorization(args)
-                
-                // Activity
-                "get_user_activity" -> getUserActivity(args)
                 
                 // Config
                 "get_burp_version" -> getBurpVersion()
@@ -981,8 +974,6 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
         return jsonResult(result)
     }
 
-    // --- ACTIVITY MONITORING ---
-    
     /**
      * True if this proxy history entry is a PenPard agent request. The proxy handler strips
      * X-PenPard-Agent before saving, so we identify by annotation notes ("[PenPard] Agent Request").
@@ -991,128 +982,6 @@ class ToolRegistry(private val api: MontoyaApi, private val server: McpServer) {
     private fun isPenPardHistoryItem(item: burp.api.montoya.proxy.ProxyHttpRequestResponse): Boolean {
         return item.annotations().notes()?.contains("PenPard") == true
     }
-    
-    /**
-     * Analyze only USER traffic for Smart Assist. PenPard agent requests (annotated in history) are
-     * always excluded — no point assisting on our own requests, and it reduces noise/load.
-     */
-    private fun getUserActivity(args: JsonObject?): JsonElement {
-        val count = args?.get("count")?.jsonPrimitive?.intOrNull ?: 50
-        
-        val allHistory = api.proxy().history()
-        val userHistory = allHistory.filter { !isPenPardHistoryItem(it) }
-        val recent = userHistory.takeLast(count)
-        
-        if (recent.isEmpty()) {
-            return jsonResult(buildJsonObject {
-                put("totalUserRequests", 0)
-                put("dominantActivity", "idle")
-                put("patterns", buildJsonObject {})
-                put("uniqueEndpoints", 0)
-                put("endpoints", buildJsonArray {})
-                put("payloadExamples", buildJsonArray {})
-                put("items", buildJsonArray {})
-            })
-        }
-        
-        // Pattern detection
-        val patterns = mutableMapOf<String, Int>()
-        val endpoints = mutableSetOf<String>()
-        val payloadExamples = mutableListOf<String>()
-        val targetHosts = mutableSetOf<String>()
-        
-        recent.forEach { item ->
-            val url = item.finalRequest().url()
-            val method = item.finalRequest().method()
-            val body = try { item.finalRequest().bodyToString() } catch (e: Exception) { "" }
-            val fullContent = "$url $body".lowercase()
-            
-            // Extract host
-            try {
-                val host = java.net.URL(if (url.startsWith("http")) url else "https://$url").host
-                targetHosts.add(host)
-            } catch (e: Exception) {}
-            
-            endpoints.add("$method $url")
-            
-            // SQLi patterns
-            val sqliPatterns = listOf("' or", "union select", "1=1", "sleep(", "waitfor", 
-                "order by", "group by", "having", "benchmark(", "extractvalue", "updatexml",
-                "' and '", "\" or \"", "' or '", "--", "/**/", "information_schema")
-            if (sqliPatterns.any { fullContent.contains(it) }) {
-                patterns["sqli"] = (patterns["sqli"] ?: 0) + 1
-                if (payloadExamples.size < 10) payloadExamples.add("SQLi: $method $url")
-            }
-            
-            // XSS patterns
-            val xssPatterns = listOf("<script", "alert(", "onerror=", "<img", "javascript:", 
-                "onload=", "<svg", "onfocus=", "onmouseover=", "document.cookie", "prompt(",
-                "confirm(", "<iframe", "eval(")
-            if (xssPatterns.any { fullContent.contains(it) }) {
-                patterns["xss"] = (patterns["xss"] ?: 0) + 1
-                if (payloadExamples.size < 10) payloadExamples.add("XSS: $method $url")
-            }
-            
-            // LFI / Path Traversal patterns
-            val lfiPatterns = listOf("../", "/etc/passwd", "/etc/shadow", "..%2f", 
-                "....//", "..\\", "/proc/self", "file:///", "php://filter")
-            if (lfiPatterns.any { fullContent.contains(it) }) {
-                patterns["lfi"] = (patterns["lfi"] ?: 0) + 1
-                if (payloadExamples.size < 10) payloadExamples.add("LFI: $method $url")
-            }
-            
-            // Command Injection patterns
-            val cmdiPatterns = listOf("; ls", "| cat", "`id`", "\$(", "; whoami", 
-                "| ping", "; sleep", "&& cat", "|| cat")
-            if (cmdiPatterns.any { fullContent.contains(it) }) {
-                patterns["cmdi"] = (patterns["cmdi"] ?: 0) + 1
-                if (payloadExamples.size < 10) payloadExamples.add("CMDi: $method $url")
-            }
-            
-            // SSRF patterns
-            val ssrfPatterns = listOf("127.0.0.1", "localhost", "169.254.169.254", 
-                "0.0.0.0", "[::", "metadata.google", "http://[")
-            if (ssrfPatterns.any { fullContent.contains(it) } && method == "POST") {
-                patterns["ssrf"] = (patterns["ssrf"] ?: 0) + 1
-                if (payloadExamples.size < 10) payloadExamples.add("SSRF: $method $url")
-            }
-        }
-        
-        // Determine dominant activity
-        val dominantActivity = if (patterns.isEmpty()) "browsing" 
-            else patterns.maxByOrNull { it.value }?.key ?: "browsing"
-        
-        val result = buildJsonObject {
-            put("totalUserRequests", recent.size)
-            put("totalPenPardRequests", allHistory.size - userHistory.size)
-            put("dominantActivity", dominantActivity)
-            put("patterns", buildJsonObject {
-                patterns.forEach { (k, v) -> put(k, v) }
-            })
-            put("uniqueEndpoints", endpoints.size)
-            put("targetHosts", buildJsonArray { targetHosts.forEach { add(it) } })
-            put("endpoints", buildJsonArray { endpoints.take(20).forEach { add(it) } })
-            put("payloadExamples", buildJsonArray { payloadExamples.forEach { add(it) } })
-            // Last 15 items for context
-            put("items", buildJsonArray {
-                recent.takeLast(15).reversed().forEach { item ->
-                    add(buildJsonObject {
-                        put("url", item.finalRequest().url())
-                        put("method", item.finalRequest().method())
-                        put("status", item.response()?.statusCode() ?: 0)
-                        put("time", item.time().toString())
-                        try {
-                            val bodyPreview = item.finalRequest().bodyToString().take(200)
-                            if (bodyPreview.isNotEmpty()) put("bodyPreview", bodyPreview)
-                        } catch (e: Exception) {}
-                    })
-                }
-            })
-        }
-        
-        return jsonResult(result)
-    }
-
     // --- Utils ---
     private fun urlEncode(args: JsonObject?) = success(URLEncoder.encode(args?.get("data")?.jsonPrimitive?.content ?: "", StandardCharsets.UTF_8))
     private fun urlDecode(args: JsonObject?) = success(URLDecoder.decode(args?.get("data")?.jsonPrimitive?.content ?: "", StandardCharsets.UTF_8))

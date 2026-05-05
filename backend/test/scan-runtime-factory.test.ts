@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 
 const { createScan, addVulnerability, getScan, initDatabase, setScanInitialRequest } = require('../src/db/init') as typeof import('../src/db/init');
 const { BurpMCPClient } = require('../src/services/burp-mcp') as typeof import('../src/services/burp-mcp');
-const { buildFocusedScanPrompt } = require('../src/services/FocusedScanPresetCatalog') as typeof import('../src/services/FocusedScanPresetCatalog');
 const { ScanRuntimeFactory } = require('../src/services/runtime/ScanRuntimeFactory') as typeof import('../src/services/runtime/ScanRuntimeFactory');
 
 async function withAvailableBurp<T>(run: () => Promise<T>): Promise<T> {
@@ -134,25 +133,4 @@ test('createWebRuntime disconnects the Burp client when availability checks fail
     }
 
     assert.equal(disconnectCalls, 1);
-});
-
-test('createAssistedScanRuntime composes the single-agent runtime from the focused preset catalog', async () => {
-    await initDatabase();
-
-    const suggestion = {
-        type: 'xss',
-        endpoints: ['GET https://app.example.com/search?q=test'],
-        targetHosts: ['https://app.example.com'],
-    };
-
-    await withAvailableBurp(async () => {
-        const factory = new ScanRuntimeFactory();
-        const runtime = await factory.createAssistedScanRuntime('scan-runtime-factory-assisted', suggestion);
-
-        assert.equal(runtime.kind, 'agent');
-        assert.equal(runtime.executionMode, 'single-agent');
-        assert.equal((runtime.agent as any).targetUrl, 'https://app.example.com');
-        assert.equal((runtime.agent as any).config.customSystemPrompt, buildFocusedScanPrompt(suggestion));
-        runtime.burp.disconnect();
-    });
 });

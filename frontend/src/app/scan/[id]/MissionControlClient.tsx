@@ -808,7 +808,7 @@ export default function MissionControlClient() {
             await axios.post(`${API_URL}/scans/${scanIdRef.current}/pause`, {}, {
                 headers: { Authorization: `Bearer ${token}` }
             });
-            toast.success('Scan paused. You can now test manually — PenPard is watching.');
+            toast.success('Scan paused. You can now test manually in Burp.');
             setIsPaused(true);
             setStatus('paused');
         } catch (e: any) {
@@ -1847,8 +1847,7 @@ User Question: ${userQuestion}`;
                                 <div className="text-left">
                                     <h3 className="font-bold text-amber-400 text-lg">Scan Paused</h3>
                                     <p className="text-slate-400 text-xs max-w-[250px] leading-relaxed">
-                                        Manual testing mode active. PenPard is monitoring your Burp proxy traffic. 
-                                        If it detects you testing a vulnerability, it will offer to assist.
+                                        Scan paused. You can test manually in Burp; click Resume to continue the scan.
                                     </p>
                                     <button
                                         onClick={handleResume}

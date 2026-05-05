@@ -52,7 +52,6 @@ import { AuthRequest, authenticateToken } from '../middleware/auth';
 import { logger, logApiUsage } from '../utils/logger';
 import { burpDispatchService } from '../services/BurpDispatchService';
 import { mobileScanService } from '../services/MobileScanService';
-import { activityMonitor } from '../services/ActivityMonitorService';
 import { peekPendingRequest, takePendingRequest } from './penpard';
 import { selectLocalDirectory, extractZipArchive, cloneGitRepository } from '../utils/source-fetcher';
 import { extractRoutes } from '../services/source-analysis/utils/route-extractor';
@@ -1546,13 +1545,6 @@ router.post('/:id/pause', authenticateToken, async (req: AuthRequest, res: Respo
         if (!scan) return;
 
         const result = await scanRuntimeService.pauseScan(id, user.id);
-
-        // Auto-start activity monitor when scan is paused so it can detect user's manual testing
-        if (!activityMonitor.getStatus().running) {
-            activityMonitor.start().catch(() => {
-                logger.warn('Failed to auto-start activity monitor on pause');
-            });
-        }
 
         res.json(result);
 

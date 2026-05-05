@@ -12,7 +12,6 @@ import reportsRoutes from './routes/reports';
 import configRoutes from './routes/config';
 import statusRoutes from './routes/status';
 import analyticsRoutes from './routes/analytics';
-import activityMonitorRoutes from './routes/activity-monitor';
 import tokenUsageRoutes from './routes/token-usage';
 import penpardRoutes from './routes/penpard';
 import reportAnalysisRoutes from './routes/report-analysis';
@@ -64,7 +63,6 @@ export function createApp() {
     app.use('/api/config', configRoutes);
     app.use('/api/status', statusRoutes);
     app.use('/api/analytics', analyticsRoutes);
-    app.use('/api/activity-monitor', activityMonitorRoutes);
     app.use('/api/token-usage', tokenUsageRoutes);
     app.use('/api/penpard', penpardRoutes);
     app.use('/api/report-analysis', reportAnalysisRoutes);

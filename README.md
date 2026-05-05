@@ -230,7 +230,6 @@ With token usage tracking built in, you always know exactly what you're spending
 - **Source-Aware Scanning (New in v1.1.0)** — Upload full codebase context (2GB+ ZIP, Git Repo with Private Tokens, or Native Local Directory Picker for Win/Mac/Linux). Includes `VersionAware` and `FullSourceAware` AI engines that analyze the app's backend source code to find hidden endpoints and vulnerabilities. Extends to Burp Suite requests and generates Docx/PPTX reports enriched with exact code evidence.
 - **Agent Pool** — Parallel scanning with specialized workers (crawler, scanner, fuzzer, analyzer)
 - **Recheck Agent** — Validates findings with additional payloads to reduce false positives
-- **Smart Assist** — Detects your manual testing patterns and offers to help automatically
 - **Instruction-Aware Scope Engine** — See below
 
 ### Instruction-Aware Scope Engine
@@ -280,7 +279,6 @@ For full-site scans (no specific instructions), the agent follows the standard m
 - **PenPard MCP Connect** — Custom Burp extension providing 20+ tools via Model Context Protocol
 - Full proxy history access, site map, scanner, repeater, intruder integration
 - AI agents craft and send HTTP requests through Burp's proxy engine
-- Real-time activity monitoring of your Burp traffic
 
 <p align="center">
   <img src="docs/screenshots/burp-proxy.png" alt="Burp Suite Proxy — AI agent requests highlighted alongside manual testing" width="800" />
@@ -348,18 +346,6 @@ PenPard allows you to send specific, raw HTTP requests directly from Burp Suite 
   <img src="docs/screenshots/prompt-templates.png" alt="PenPard Prompt Templates — Customize AI agent behavior with editable system prompts" width="800" />
   <br/>
   <em>Prompt Templates — Choose a pre-built template or write your own. The AI agent follows these instructions during the scan. Upload your company logo for branded reports.</em>
-</p>
-
-### Pause & Assist Workflow
-- Pause the autonomous scan at any time
-- Manually test in Burp while PenPard monitors your traffic
-- PenPard detects what you're testing (SQLi? XSS? LFI?) and offers focused assistance
-- Accept the suggestion → PenPard runs a targeted automated scan on that endpoint
-
-<p align="center">
-  <img src="docs/screenshots/smart-assist-alert.png" alt="PenPard Smart Assist — AI detects your manual testing and offers to help" width="500" />
-  <br/>
-  <em>Smart Assist detects you're testing SQL Injection manually in Burp and offers to run a comprehensive automated scan on the same endpoints. Click "Assist" to let the AI take over.</em>
 </p>
 
 ---
@@ -475,13 +461,12 @@ PenPard uses a lock screen to protect access. There are no traditional username/
 │  │  Reports                 │  │  └────────────────────────┘  │  │
 │  │  Token Usage             │  │  ┌─ AgentPool ───────────┐  │  │
 │  │                          │  │  │  Crawler Workers       │  │  │
-│  │  Smart Suggestion Alert  │  │  │  Scanner Workers       │  │  │
+│  │                          │  │  │  Scanner Workers       │  │  │
 │  │                          │  │  │  Fuzzer Workers        │  │  │
 │  └──────────┬───────────────┘  │  │  Analyzer Workers      │  │  │
 │             │ REST API          │  └────────────────────────┘  │  │
 │             └───────────────────┤                             │  │
 │                                 │  LLMProviderService         │  │
-│                                 │  ActivityMonitorService     │  │
 │                                 │  BurpMCPClient              │  │
 │                                 │  ReportService              │  │
 │                                 └──────────┬──────────────────┘  │
@@ -513,7 +498,7 @@ penpard/
 ├── backend/                  # Express.js API server
 │   └── src/
 │       ├── agents/           # AI agents (Orchestrator, Pool, Workers, Recheck)
-│       ├── services/         # LLM, Burp MCP, Activity Monitor, Reports
+│       ├── services/         # LLM, Burp MCP, Reports
 │       ├── routes/           # REST API endpoints
 │       ├── db/               # SQLite schema & init
 │       └── middleware/       # JWT auth
@@ -555,17 +540,6 @@ Here's what this looks like in practice — the Agent Logs panel shows every dec
   Right: A confirmed SQL Injection finding (HIGH, CVSS 8.0). The AI sent <code>' OR '1'='1</code> to the login endpoint, got a valid JWT back, and flagged it as an authentication bypass. You can chat with the AI Security Analyst to understand the vulnerability deeper — here it explains in Turkish why <code>1=1</code> works.</em>
 </p>
 
-### Pause & Assist Flow
-
-```
-1. User pauses the scan → Agent loop suspends (stays alive)
-2. Activity Monitor auto-starts → Watches Burp proxy history
-3. User tests manually in Burp (e.g., tries SQLi payloads)
-4. Monitor detects the pattern → Shows "SQL Injection Testing Detected" alert
-5. User clicks "Assist" → Focused scan on that endpoint
-6. User clicks "Resume" → Main scan continues from where it left off
-```
-
 ### Mission Control
 
 The real-time scan dashboard shows:
@@ -605,7 +579,6 @@ The custom Burp Suite extension exposes 20+ tools via the Model Context Protocol
 | **Encoding** | `url_encode`, `url_decode`, `base64_encode`, `base64_decode`, `hash_data` |
 | **Analysis** | `extract_links`, `extract_comments`, `generate_payloads` |
 | **Control** | `enable_intercept`, `disable_intercept`, `get_burp_version` |
-| **Monitor** | `get_user_activity` |
 
 ### Building the Extension
 

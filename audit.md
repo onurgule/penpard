@@ -686,7 +686,6 @@ Important confirmed persistence gaps:
 ### Pause/resume
 - Pause sets `isPaused` and scan status `paused`.
 - Resume clears pause and sets status `testing`.
-- The advertised `ActivityMonitorService` is effectively disabled because `ASSIST_ENABLED = false`; pause messaging implies more protection than actually exists.
 
 ### Lost-state conditions
 - Process restart triggers `recoverOrphanedScans()`, which marks in-progress scans as `interrupted`.
@@ -787,8 +786,7 @@ Important hidden assumptions in the URL-only path:
 9. Automatic auth capture from Burp history appears unreliable because parser expectations do not match the current Burp MCP response envelope.
 10. Findings dedupe is heuristic and can still allow duplicates or near-duplicates.
 11. Screenshot tooling does not persist useful screenshot evidence through the normal finding path.
-12. Pause-mode messaging overstates protection because `ActivityMonitorService` is effectively disabled.
-13. Token usage accounting exists but current LLM calls are not cleanly tied back to scan-level context.
+12. Token usage accounting exists but current LLM calls are not cleanly tied back to scan-level context.
 
 ## 20. Final Lifecycle Summary
 The default URL-only Web Application Scan starts in the `/scan/web` frontend form, sends a multipart `POST /api/scans/web`, creates a `queued` scan row, and asynchronously launches `startWebScan`. The launcher verifies Burp MCP, chooses the single-agent path by default, and runs `OrchestratorAgent`. The agent initializes Burp scope, checks LLM configuration, initializes auth state, assembles the system prompt, launches a Burp-proxied Playwright browser, harvests initial browser intelligence, and then enters an LLM-driven plan/execute/replan loop. During that loop it dispatches Burp tools, browser tools, and PenPard’s harvest/hypothesis/coverage helpers, writing findings and logs as it goes. The run ends in a reporting phase that summarizes saved findings, closes the browser, flushes logs, and persists a terminal scan state, though current status-handling bugs and Burp parsing mismatches materially affect correctness and fidelity.
@@ -820,7 +818,6 @@ The default URL-only Web Application Scan starts in the `/scan/web` frontend for
 | [`/Users/tcegerede/Desktop/penpard/backend/src/services/PromptLibraryService.ts`](/Users/tcegerede/Desktop/penpard/backend/src/services/PromptLibraryService.ts) | Loads active prompt templates |
 | [`/Users/tcegerede/Desktop/penpard/backend/src/services/llmQueue.ts`](/Users/tcegerede/Desktop/penpard/backend/src/services/llmQueue.ts) | Serializes and rate-limits LLM calls |
 | [`/Users/tcegerede/Desktop/penpard/backend/src/services/llmProvider.ts`](/Users/tcegerede/Desktop/penpard/backend/src/services/llmProvider.ts) | Model/provider abstraction used by orchestrator calls |
-| [`/Users/tcegerede/Desktop/penpard/backend/src/services/activityMonitor.ts`](/Users/tcegerede/Desktop/penpard/backend/src/services/activityMonitor.ts) | Advertised pause assistance; effectively disabled in current configuration |
 | [`/Users/tcegerede/Desktop/penpard/backend/src/routes/reports.ts`](/Users/tcegerede/Desktop/penpard/backend/src/routes/reports.ts) | Separate report export/generation flow after scans complete |
 | [`/Users/tcegerede/Desktop/penpard/burp-mcp-extension/src/main/kotlin/com/penpard/mcp/ToolRegistry.kt`](/Users/tcegerede/Desktop/penpard/burp-mcp-extension/src/main/kotlin/com/penpard/mcp/ToolRegistry.kt) | Burp-side tool definitions and registration |
 | [`/Users/tcegerede/Desktop/penpard/burp-mcp-extension/src/main/kotlin/com/penpard/mcp/handlers/ProxyRequestHandler.kt`](/Users/tcegerede/Desktop/penpard/burp-mcp-extension/src/main/kotlin/com/penpard/mcp/handlers/ProxyRequestHandler.kt) | PenPard request tagging/highlighting and proxy interception behavior |

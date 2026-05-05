@@ -207,7 +207,7 @@ export class ScanRuntimeService {
         }
 
         updateScanStatus(scanId, 'paused');
-        return { message: 'Scan paused. Activity monitor is watching your manual testing.' };
+        return { message: 'Scan paused.' };
     }
 
     public async resumeScan(scanId: string, userId: number): Promise<{ message: string }> {
@@ -483,13 +483,6 @@ export class ScanRuntimeService {
 
         const visibility = await browserService.hideBrowser(browserSessionId);
         return { ...visibility, browserSessionId };
-    }
-
-    public async startAssistedScan(scanId: string, suggestion: any): Promise<void> {
-        updateScanStatus(scanId, 'scanning');
-        const runtime = await this.runtimeFactory.createAssistedScanRuntime(scanId, suggestion);
-        const finalPhase = await this.runPreparedRuntime(runtime);
-        logger.info('Assisted scan completed', { scanId, executionMode: runtime.executionMode, finalPhase });
     }
 
     private async runPreparedRuntime(runtime: PreparedScanRuntime): Promise<string> {
