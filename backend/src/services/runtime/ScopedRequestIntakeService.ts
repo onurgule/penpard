@@ -17,12 +17,12 @@ export interface PreparedScopedRequestIntake {
 type LooseRecord = Record<string, any>;
 
 const DEFAULT_DISCOVERY_BUDGET = {
-    maxRequests: 6,
-    maxRouteVariants: 2,
-    maxBrowserActions: 4,
-    maxNavigationDepth: 1,
-    maxVerificationRetries: 1,
-    notes: 'Bounded feature discovery from structured security test request intake.',
+    maxRequests: 25,
+    maxRouteVariants: 8,
+    maxBrowserActions: 12,
+    maxNavigationDepth: 3,
+    maxVerificationRetries: 3,
+    notes: 'Bounded feature discovery from structured security test request intake. Host-scoped by default; route restrictions are advisory unless operator-supplied.',
 } as const;
 
 export class ScopedRequestIntakeService {
@@ -162,10 +162,6 @@ export class ScopedRequestIntakeService {
         const explicitAllowedRoutes = normalizeStringList(input.parsedScopeEnvelope?.allowedRoutes || [])
             .map((entry) => normalizeRoutePath(entry))
             .filter(Boolean);
-        const explicitSelectedEndpoints = Array.isArray(input.parsedScopeEnvelope?.selectedEndpoints)
-            ? input.parsedScopeEnvelope.selectedEndpoints.length
-            : 0;
-        const targetRoute = normalizeRoutePath(input.targetUrl);
         const boundaryHints = [
             ...normalizeStringList(input.parsedScopeEnvelope?.boundaryHints || []),
             input.structuredRequest.description,
@@ -180,13 +176,7 @@ export class ScopedRequestIntakeService {
 
         return {
             ...input.parsedScopeEnvelope,
-            allowedRoutes: dedupeStrings([
-                (targetRoute && targetRoute !== '/')
-                    || (!input.hasBaselineAnchor && explicitSelectedEndpoints === 0)
-                    ? targetRoute
-                    : undefined,
-                ...explicitAllowedRoutes,
-            ]),
+            allowedRoutes: dedupeStrings([...explicitAllowedRoutes]),
             boundaryHints: dedupeStrings(boundaryHints),
             outOfScopeNotes: dedupeStrings(outOfScopeNotes),
             explorationBudget: {

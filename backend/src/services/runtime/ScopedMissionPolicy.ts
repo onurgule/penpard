@@ -55,8 +55,11 @@ export interface ScopedMissionGuardInput {
     useInitialRequestBaseline?: boolean;
 }
 
+export type ScopedMissionGuardSeverity = 'hard' | 'advisory';
+
 export interface ScopedMissionGuardDecision {
     allowed: boolean;
+    severity?: ScopedMissionGuardSeverity;
     normalizedHost?: string;
     normalizedPath?: string;
     reason?: string;
@@ -363,7 +366,7 @@ export class ScopedMissionPolicy {
         if (requestBudget !== null && this.requestActionsUsed >= requestBudget) {
             const reason = `Scoped request budget of ${requestBudget} has been exhausted.`;
             this.recordBoundaryBlock(reason);
-            return { allowed: false, reason };
+            return { allowed: false, severity: 'hard', reason };
         }
 
         const decision = this.evaluateRouteAndHost({
@@ -416,14 +419,14 @@ export class ScopedMissionPolicy {
         if (browserBudget !== null && this.browserActionsUsed >= browserBudget) {
             const reason = `Scoped browser action budget of ${browserBudget} has been exhausted.`;
             this.recordBoundaryBlock(reason);
-            return { allowed: false, reason };
+            return { allowed: false, severity: 'hard', reason };
         }
 
         const maxNavigationDepth = this.options.envelope.explorationBudget?.maxNavigationDepth ?? null;
         if (toolName === 'browser_navigate' && maxNavigationDepth !== null && this.navigationDepth >= maxNavigationDepth) {
             const reason = `Browser navigation depth exceeded the scoped limit of ${maxNavigationDepth}.`;
             this.recordBoundaryBlock(reason);
-            return { allowed: false, reason };
+            return { allowed: false, severity: 'hard', reason };
         }
 
         const maxVerificationRetries = this.options.envelope.explorationBudget?.maxVerificationRetries ?? null;
@@ -434,7 +437,7 @@ export class ScopedMissionPolicy {
         ) {
             const reason = `Browser verification retry budget of ${maxVerificationRetries} has been exhausted.`;
             this.recordBoundaryBlock(reason);
-            return { allowed: false, reason };
+            return { allowed: false, severity: 'hard', reason };
         }
 
         this.browserActionsUsed += 1;
@@ -462,6 +465,7 @@ export class ScopedMissionPolicy {
             this.recordBoundaryBlock(reason);
             return {
                 allowed: false,
+                severity: 'hard',
                 normalizedHost,
                 normalizedPath,
                 reason,
@@ -476,6 +480,7 @@ export class ScopedMissionPolicy {
             this.recordBoundaryBlock(reason);
             return {
                 allowed: false,
+                severity: 'advisory',
                 normalizedHost,
                 normalizedPath,
                 reason,
@@ -493,6 +498,7 @@ export class ScopedMissionPolicy {
             this.recordBoundaryBlock(reason);
             return {
                 allowed: false,
+                severity: 'advisory',
                 normalizedHost,
                 normalizedPath,
                 reason,
@@ -507,6 +513,7 @@ export class ScopedMissionPolicy {
                     this.recordBoundaryBlock(reason);
                     return {
                         allowed: false,
+                        severity: 'advisory',
                         normalizedHost,
                         normalizedPath,
                         reason,

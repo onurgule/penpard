@@ -1,5 +1,5 @@
 import { IdentityRegistry, RequestAuthIntent } from '../../services/auth';
-import { ScopedMissionPolicy } from '../../services/runtime/ScopedMissionPolicy';
+import { ScopedMissionGuardSeverity, ScopedMissionPolicy } from '../../services/runtime/ScopedMissionPolicy';
 
 const ENUMERATION_TOOLS = new Set(['spider_url', 'get_sitemap', 'extract_links']);
 
@@ -14,6 +14,7 @@ export interface ToolExecutionGuardInput {
 
 export interface ToolExecutionGuardResult {
     allowed: boolean;
+    severity?: ScopedMissionGuardSeverity;
     logMessage?: string;
     response?: any;
 }
@@ -26,6 +27,7 @@ export function evaluateToolExecutionGuard(input: ToolExecutionGuardInput): Tool
         const remainingMin = Math.ceil(remainingMs / 60000);
         return {
             allowed: false,
+            severity: 'hard',
             logMessage: `Rate limited - waiting ${remainingMin} more minutes`,
             response: { error: `Rate limited. Waiting ${remainingMin} minutes.`, skipped: true },
         };
@@ -35,6 +37,7 @@ export function evaluateToolExecutionGuard(input: ToolExecutionGuardInput): Tool
         input.scopePolicy?.recordBoundaryBlock(`Blocked "${input.toolName}" because the scoped mission does not allow broad enumeration.`);
         return {
             allowed: false,
+            severity: 'hard',
             logMessage: `Blocked "${input.toolName}" because operator instructions define a focused scope.`,
             response: {
                 error: `Tool "${input.toolName}" is blocked because operator instructions define a specific scope. Do NOT enumerate. Go directly to the target endpoint and test for the specified vulnerability type.`,
@@ -52,13 +55,16 @@ export function evaluateToolExecutionGuard(input: ToolExecutionGuardInput): Tool
         });
         if (!decision.allowed) {
             const reason = decision.reason || `Blocked "${input.toolName}" because it would leave the active scoped mission boundary.`;
+            const severity = decision.severity ?? 'hard';
             return {
                 allowed: false,
+                severity,
                 logMessage: reason,
                 response: {
                     error: reason,
                     blocked: true,
                     boundaryReason: reason,
+                    boundarySeverity: severity,
                 },
             };
         }

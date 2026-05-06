@@ -52,11 +52,18 @@ export class OrchestratorToolHost {
                     rateLimitPauseUntil: options.getRateLimitPauseUntil(),
                 });
 
-                if (!guardResult.allowed && guardResult.logMessage) {
+                if (guardResult.allowed) {
+                    return null;
+                }
+
+                if (guardResult.logMessage) {
                     options.log('tool', guardResult.logMessage);
                 }
 
-                return guardResult.allowed ? null : guardResult.response;
+                return {
+                    response: guardResult.response,
+                    severity: guardResult.severity ?? 'hard',
+                };
             },
             handlers: this.registry.getHandlers(),
         });

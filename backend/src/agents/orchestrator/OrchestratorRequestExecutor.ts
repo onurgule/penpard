@@ -121,6 +121,9 @@ export class OrchestratorRequestExecutor {
     private buildExecutionContext(toolCall: ToolCall<'send_http_request'>): RequestExecutionContext {
         const preserveExplicitAuth = toolCall.args?.preserveExplicitAuth === true;
         const useInitialRequestBaseline = toolCall.args?.useInitialRequestBaseline === true && !!this.initialRequestProfile;
+        const advisoryReason = typeof (toolCall.args as Record<string, any> | undefined)?.__advisoryReason === 'string'
+            ? (toolCall.args as Record<string, any>).__advisoryReason as string
+            : undefined;
         const explicitHeaders = this.normalizeRequestHeaders(toolCall.args.headers as Record<string, string> | undefined);
         const hasExplicitBody = Object.prototype.hasOwnProperty.call(toolCall.args, 'body')
             || Object.prototype.hasOwnProperty.call(toolCall.args, 'data');
@@ -171,6 +174,7 @@ export class OrchestratorRequestExecutor {
             },
             requestDiagnostics: null,
             requestArgs: {},
+            advisoryReason,
             result: null,
             statusCode: 0,
             responseHeaders: {},
@@ -251,15 +255,20 @@ export class OrchestratorRequestExecutor {
         delete requestArgs.queryMutations;
         delete requestArgs.bodyMutations;
         delete requestArgs.useInitialRequestBaseline;
+        delete requestArgs.__advisoryReason;
 
         context.preparedRequest = preparedRequest;
         context.requestArgs = requestArgs;
+
+        const advisorySource = context.advisoryReason
+            ? `/advisory:${encodeURIComponent(context.advisoryReason).slice(0, 64)}`
+            : '';
 
         const normalizedResult = this.normalizeBurpHttpResult(
             await this.options.burp.callTool('send_http_request', {
                 ...requestArgs,
                 use_proxy: true,
-                penpard_source: `Orchestrator/${this.options.scanId}`,
+                penpard_source: `Orchestrator/${this.options.scanId}${advisorySource}`,
             }),
         );
 

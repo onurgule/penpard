@@ -575,11 +575,22 @@ export class OrchestratorAgent {
                     rateLimitPauseUntil: this.state.rateLimitPauseUntil,
                 });
 
-                if (!guardResult.allowed && guardResult.logMessage) {
-                    this.log('tool', guardResult.logMessage);
+                if (guardResult.allowed) {
+                    return null;
                 }
 
-                return guardResult.allowed ? null : guardResult.response;
+                const severity = guardResult.severity ?? 'hard';
+                if (guardResult.logMessage) {
+                    this.log(severity === 'advisory' ? 'advisory' : 'tool', guardResult.logMessage);
+                }
+
+                return {
+                    response: guardResult.response,
+                    severity,
+                    advisoryReason: severity === 'advisory'
+                        ? (guardResult.response?.boundaryReason || guardResult.logMessage)
+                        : undefined,
+                };
             },
             handlers: this.toolRegistry.getHandlers(),
         });

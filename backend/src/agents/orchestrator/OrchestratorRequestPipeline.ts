@@ -37,6 +37,7 @@ export interface RequestExecutionContext {
     preparedRequest: RequestPreparedState;
     requestDiagnostics: RequestAuthDiagnostics | null;
     requestArgs: Record<string, any>;
+    advisoryReason?: string;
     result: any;
     statusCode: number;
     responseHeaders: Record<string, any> | Array<string>;

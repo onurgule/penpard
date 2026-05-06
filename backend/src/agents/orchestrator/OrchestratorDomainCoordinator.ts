@@ -223,7 +223,10 @@ export class OrchestratorDomainCoordinator {
                     url: mutatedUrl,
                     useInitialRequestBaseline: false,
                 });
-                if (scopeDecision && !scopeDecision.allowed) {
+                const advisoryDecision = scopeDecision && !scopeDecision.allowed && scopeDecision.severity === 'advisory'
+                    ? scopeDecision
+                    : null;
+                if (scopeDecision && !scopeDecision.allowed && !advisoryDecision) {
                     results.push({
                         mutation: mutation.description,
                         parameter: mutation.parameter,
@@ -235,15 +238,19 @@ export class OrchestratorDomainCoordinator {
                     continue;
                 }
 
+                const baseSource = this.options.scanId
+                    ? `Orchestrator/${this.options.scanId}/repeater_test`
+                    : 'Orchestrator/repeater_test';
+                const advisorySourceSuffix = advisoryDecision?.reason
+                    ? `/advisory:${encodeURIComponent(advisoryDecision.reason).slice(0, 64)}`
+                    : '';
                 const response = await this.options.burp.callTool('send_http_request', {
                     method: request.method,
                     url: mutatedUrl,
                     headers: preparedRequest.headers,
                     body: preparedRequest.body || '',
                     use_proxy: true,
-                    penpard_source: this.options.scanId
-                        ? `Orchestrator/${this.options.scanId}/repeater_test`
-                        : 'Orchestrator/repeater_test',
+                    penpard_source: `${baseSource}${advisorySourceSuffix}`,
                 });
 
                 const originalSnapshot: ResponseSnapshot = {
@@ -295,6 +302,8 @@ export class OrchestratorDomainCoordinator {
                     originalValue: mutation.originalValue,
                     newValue: mutation.newValue,
                     burpVisible: true,
+                    advisory: advisoryDecision ? true : undefined,
+                    advisoryReason: advisoryDecision?.reason,
                     requestSummary: `${request.method} ${mutatedUrl}`,
                     diff: {
                         significant: diff.significant,
